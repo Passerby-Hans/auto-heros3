@@ -1,0 +1,15 @@
+doc/
+__pycache__/
+*.pyc
+.venv/
+CLAUDE.md
+
+# local agent tooling config (ZCode sub-agent prompts; machine-specific)
+.zcode/
+
+# VCMI track: third-party runtime/source, build trees, logs, imported game data
+vendor/
+
+# local runtime state, evidence, screenshots and recordings (never part of the repo)
+var/
+

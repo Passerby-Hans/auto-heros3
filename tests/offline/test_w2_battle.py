@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_server_v2 as M  # noqa: E402
 from test_action_contract import (  # noqa: E402
-    Env, FakeAgent, bridge_err, bridge_ok, state,
+    Env, FakeAgent, bridge_err, bridge_ok, bridge_unknown, state,
 )
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -180,14 +180,82 @@ def test_battle_actions_tool() -> None:
         check('A1b legal attack-from hex is reported',
               (res.get('targets') or [{}])[0].get('attack_from') == [2, 1],
               str(res.get('targets')))
+        check('A1c the refreshed cache is reported as a successful query', res.get('ok') is True
+              and res.get('bridge_status') == 'COMPLETED', str(res.get('bridge_status')))
+        check('A1d the cache path is not misreported as stale on a normal refresh',
+              res.get('status') != 'stale_cache', str(res.get('status')))
+    # A stale cache must never be returned when the bridge rejects or times out the query, and a
+    # COMPLETED reply that did not rewrite the cache must be rejected as stale.
+    old_payload = {'active': 99, 'targets': [{'id': 99, 'creature': 99, 'count': 99,
+                                              'hex': [9, 9]}], 'round': 99}
+    with Env() as env:
+        state_dir = env.root / 'state'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        cache = state_dir / 'battle_actions.json'
+        cache.write_text(json.dumps(old_payload), encoding='utf-8')
+        env.agent(FakeAgent([battle_state()], results=[bridge_err(1, 'no_active_stack')]))
+        res = M.battle_actions()
+        check('A2a rejected/deployment round never falls back to the old cache',
+              res.get('ok') is False and res.get('status') == 'deployment'
+              and 'no active stack' in str(res.get('error')),
+              str(res)[:200])
+        check('A2b rejected/deployment reply does not leak old targets',
+              'OLD' not in str(res) and res.get('targets') is None,
+              str(res.get('targets')))
+    with Env() as env:
+        state_dir = env.root / 'state'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / 'battle_actions.json').write_text(json.dumps(old_payload), encoding='utf-8')
+        env.agent(FakeAgent([battle_state()], results=[bridge_unknown(1)]))
+        res = M.battle_actions()
+        check('A2c UNKNOWN bridge reply never falls back to the old cache',
+              res.get('ok') is False and res.get('status') == 'unknown'
+              and res.get('targets') is None, str(res)[:200])
+    with Env() as env:
+        state_dir = env.root / 'state'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / 'battle_actions.json').write_text(json.dumps(old_payload), encoding='utf-8')
+        env.agent(FakeAgent([battle_state()]))  # bridge says COMPLETED but writes nothing
+        res = M.battle_actions()
+        check('A2d COMPLETED without a refreshed cache is rejected as stale',
+              res.get('ok') is False and res.get('status') == 'stale_cache'
+              and res.get('targets') is None, str(res)[:200])
+    with Env() as env:
+        env.agent(FakeAgent([battle_state()]))  # no cache file at all
+        res = M.battle_actions()
+        check('A2e missing cache after a COMPLETED reply is an explicit error',
+              res.get('ok') is False and res.get('status') == 'missing'
+              and 'unreadable' in str(res.get('error')), str(res)[:200])
     with Env() as env:
         env.agent(FakeAgent([state()]))
         res = M.battle_actions()
-        check('A1c no battle -> explicit error', res.get('ok') is False
+        check('A1e no battle -> explicit error', res.get('ok') is False
               and 'no active battle' in str(res.get('error')), str(res.get('error')))
 
 
 # ------------------------------------------------------------------ S: bridge source guards
+def test_end_turn_battle_gate() -> None:
+    """A battle (incl. the round0 deployment phase) must reject end_turn BEFORE sending."""
+    with Env() as env:
+        fake = env.agent(FakeAgent([battle_state()]))
+        res = M.game_act('end_turn', {})
+        evidence = str(res.get('evidence') or res.get('detail') or '')
+        check('A3a end_turn during a battle is rejected without a bridge command',
+              res.get('ok') is False and res.get('status') == 'rejected'
+              and res.get('sent') is False and fake.sent == [],
+              f"status={res.get('status')} sent={fake.sent}")
+        check('A3b the battle gate names the battle and points at the battle tools',
+              'battle is still active' in evidence and 'battle_round' in evidence,
+              evidence[:200])
+    with Env() as env:
+        fake = env.agent(FakeAgent([battle_state(active_stack=-1)]))
+        res = M.game_act('end_turn', {})
+        evidence = str(res.get('evidence') or res.get('detail') or '')
+        check('A3c the deployment phase (active_stack=-1) is covered by the same gate',
+              res.get('ok') is False and res.get('sent') is False and fake.sent == []
+              and 'deployment phase' in evidence, evidence[:200])
+
+
 def test_bridge_source_guards() -> None:
     text = (ROOT / 'platform' / 'vcmi-patch' / 'client' / 'AgentBridge.cpp').read_text(
         encoding='utf-8')
@@ -228,6 +296,7 @@ def main() -> int:
     test_approach_verifier()
     test_battle_round_refusal()
     test_battle_actions_tool()
+    test_end_turn_battle_gate()
     test_bridge_source_guards()
     failed = [item for item in RESULTS if not item[1]]
     print(f'\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed')

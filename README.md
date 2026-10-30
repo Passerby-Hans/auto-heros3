@@ -282,7 +282,7 @@ tools/vcmi_overlay_recorder.py  离屏录屏兼容壳（→ src/auto_heros3/reco
 tools/fog_path.py               黑幕边界 BFS 探索器兼容壳（→ src/auto_heros3/exploration/fog_path.py）
 tools/fog_path_live.py          实机黑幕探索演示 CLI
 tools/fog_battle.py             战斗机械执行器（演示/诊断用；正式对局由 LLM 决策）
-tests/offline/                  离线回归套件（26 套，统一入口 tools/run_offline_suite.py）
+tests/offline/                  离线回归套件（27 套，统一入口 tools/run_offline_suite.py）
 tests/live/                     隔离 live 套件（7 套；tools/test_*.py 保留兼容入口）
 tools/bridge_contract.json      锁定客户端 sha256 / protocol / 冻结行为
 agent/h3/                       Track A 零售版逆向（历史保留，当前主轨不使用）
@@ -294,8 +294,8 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 
 - MCP 自检：`.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   （打印能力清单并做一次租约 acquire/release；不会启动游戏）。
-- 离线回归：`tests/offline/` 共 **26 套 / 819 项断言**，统一入口一次跑完（显式白名单，7 个 live
-  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-10-30 复核 **819/819 PASS**）：
+- 离线回归：`tests/offline/` 共 **27 套 / 834 项断言**，统一入口一次跑完（显式白名单，7 个 live
+  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-10-30 复核 **834/834 PASS**）：
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
@@ -680,9 +680,9 @@ doc/                            engineering docs / handover / log (kept locally,
 
 - MCP self-test: `.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   (prints the capability list and does one lease acquire/release; it does not start the game).
-- Offline regression: **26 suites / 819 assertions** under `tests/offline/`, run through the explicit
+- Offline regression: **27 suites / 834 assertions** under `tests/offline/`, run through the explicit
   whitelist entry (7 live suites are skipped by default); it prints `N/N checks passed` and exits 0 on
-  success (re-checked 2026-10-30: **819/819 PASS**):
+  success (re-checked 2026-10-30: **834/834 PASS**):
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py

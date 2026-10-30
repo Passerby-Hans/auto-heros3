@@ -48,9 +48,9 @@ def explore_state() -> dict:
         {'id': 1, 'kind': 'creature', 'type': 'monster', 'name': 'Wolf',
          'pos': [6, 5, 1], 'visitable': [5, 5, 1], 'hover': '很少（1~2）'},
         {'id': 2, 'kind': 'hero', 'type': 'hero', 'name': 'EnemyHero',
-         'pos': [8, 7, 0], 'visitable': [7, 7, 0], 'owner': 1},
+         'pos': [8, 7, 0], 'visitable': [7, 7, 0], 'tile': [7, 7, 0], 'owner': 1},
         {'id': 3, 'kind': 'town', 'type': 'town', 'name': 'EnemyTown',
-         'pos': [9, 9, 0], 'visitable': [9, 8, 0], 'owner': 1},
+         'pos': [9, 9, 0], 'visitable': [9, 8, 0], 'tile': [9, 8, 0], 'owner': 1},
         {'id': 4, 'kind': 'object', 'type': 'resource', 'name': 'Gold',
          'pos': [20, 19, 0], 'visitable': [20, 20, 0]},
     ]
@@ -79,6 +79,14 @@ def test_brief_observation() -> None:
               enemy_names == {'EnemyHero', 'EnemyTown'}
               and all(len(enemy['pos']) == 3 for enemy in brief.get('enemies') or [])
               and {e['name']: e['pos'] for e in brief.get('enemies') or []}.get('EnemyHero')
+              == [8, 7, 0],
+              str(brief.get('enemies')))
+        check('W4-1c2 enemy entries carry the interaction tile, pos stays the anchor',
+              {e['name']: e.get('tile') for e in brief.get('enemies') or []}.get('EnemyHero')
+              == [7, 7, 0]
+              and {e['name']: e.get('tile') for e in brief.get('enemies') or []}.get('EnemyTown')
+              == [9, 8, 0]
+              and {e['name']: e.get('pos') for e in brief.get('enemies') or []}.get('EnemyHero')
               == [8, 7, 0],
               str(brief.get('enemies')))
         check('W4-1d observation timestamp/age are reported',

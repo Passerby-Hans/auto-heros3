@@ -2218,8 +2218,14 @@ def game_brief(hero: int | None = None, radius: int | None = None, limit: int = 
         dist = abs(int(v[0]) - int(origin_pos[0])) + abs(int(v[1]) - int(origin_pos[1]))
         if (kind in ('hero', 'town') and player is not None
                 and o.get('owner') is not None and o.get('owner') != player):
-            out['enemies'].append({'kind': kind, 'name': o.get('name'),
-                                   'owner': o.get('owner'), 'pos': v[:3], 'dist': dist})
+            enemy = {'kind': kind, 'name': o.get('name'),
+                     'owner': o.get('owner'), 'pos': v[:3], 'dist': dist}
+            # T40/C11: enemies are moved-to, not merely located.  Pass the engine's canonical
+            # interaction tile through when the client provides it, so callers do not have to
+            # move onto the anchor `pos` (which may be non-visitable and fails with no_path).
+            if isinstance(o.get('tile'), list) and o.get('tile'):
+                enemy['tile'] = list(o['tile'])[:3]
+            out['enemies'].append(enemy)
         if kind_filter and kind not in kind_filter and otype not in kind_filter:
             continue
         if radius is not None and dist > radius:
@@ -2851,6 +2857,14 @@ def _precondition_error(cmd: str, args: dict, before: dict) -> str | None:
     Prevents pointless bridge commands (and 6 s of verification) when the after-state could
     never show the effect, e.g. transfer town garrison -> hero while the hero is not in town.
     """
+    if cmd == 'end_turn':
+        battle = before.get('battle') or {}
+        if battle.get('active'):
+            active = battle.get('active_stack')
+            phase = 'deployment phase' if active == -1 else f'active stack {active}'
+            return (f'a battle is still active ({phase}): finish the battle before end_turn; '
+                    f'use battle_round/battle_actions (nothing was sent)')
+        return None
     if cmd == 'cast_spell':
         hero = _hero_entry(before, args.get('hero'))
         if hero is None:
@@ -3796,8 +3810,14 @@ _UI_TREE_REFRESH_WAIT = 2.0
 _UI_TREE_REFRESH_SLEEP = 0.1
 
 
-def _file_signature(path: Path):
-    """(mtime_ns, size, sha256) for freshness binding, or None when the file is absent."""
+def _ui_tree_signature(path: Path):
+    """(mtime_ns, size, full sha256) for UI-dump freshness, or None when the file is absent.
+
+    B0.5 reliability: this used to share the name `_file_signature` with the save-file helper
+    below; the later (64 KiB head-hash dict) definition silently shadowed it.  UI dumps are
+    normally small, but a large dump could keep a head hash while changing later content, so
+    this helper hashes the WHOLE file and is explicitly named.
+    """
     try:
         stat = path.stat()
     except OSError:
@@ -3817,7 +3837,7 @@ def _ui_tree_window_classes() -> tuple[list[str], str]:
     action at `unknown` - an old file can never upgrade the result to `completed`.
     """
     path = _dir() / 'ui_tree.json'
-    before = _file_signature(path)
+    before = _ui_tree_signature(path)
     try:
         res = _agent().execute('ui_tree', verify=None, result_timeout=10)
     except Exception as exc:  # noqa: BLE001 - report, never crash the action
@@ -3828,11 +3848,11 @@ def _ui_tree_window_classes() -> tuple[list[str], str]:
         return [], f'ui_tree outcome {status} (no fresh observation): {line or "no reply"}'
     if status == 'REJECTED':
         return [], f'ui_tree rejected by the bridge: {line or "no bridge line"}'
-    after = _file_signature(path)
+    after = _ui_tree_signature(path)
     deadline = time.time() + _UI_TREE_REFRESH_WAIT
     while after == before and time.time() < deadline:
         time.sleep(_UI_TREE_REFRESH_SLEEP)
-        after = _file_signature(path)
+        after = _ui_tree_signature(path)
     if after is None:
         return [], f'ui_tree file missing after a {status} query ({path.name})'
     if after == before:
@@ -4498,6 +4518,15 @@ def battle_round(target: int | None = None, allow_auto_answer: bool = False,
     return result
 
 
+def _battle_cache_stamp(path: Path):
+    """mtime/size identity of the bridge's battle_actions cache (None when absent)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 @mcp.tool()
 def battle_actions() -> dict:
     """Report the currently legal battle options for the active stack (read-only).
@@ -4519,18 +4548,55 @@ def battle_actions() -> dict:
     if not (st.get('battle') or {}).get('active'):
         return {'ok': False, 'error': 'no active battle'}
     agent = _agent()
+    path = _dir() / 'battle_actions.json'
+    before = _battle_cache_stamp(path)
     try:
-        agent.execute('battle_actions', verify=None, result_timeout=10)
+        res = agent.execute('battle_actions', verify=None, result_timeout=10)
     except Exception as exc:
         return {'ok': False, 'error': f'battle_actions failed: {exc}'}
-    path = _dir() / 'battle_actions.json'
+    line = str(getattr(res, 'line', '') or '')
+    detail = str(getattr(res, 'detail', '') or '')
+    bridge_status = str(getattr(res, 'status', '') or '').upper() or 'UNKNOWN'
+    # A bridge REJECTED/UNKNOWN reply is terminal: never fall through to a (possibly stale)
+    # cache file.  This is the round0/deployment case (bridge refuses with no_active_stack and
+    # writes nothing) as well as any timed-out query.
+    if _bridge_rejected(res):
+        deployment = 'no_active_stack' in line.lower() or 'no active stack' in line.lower()
+        return {
+            'ok': False,
+            'error': ('no active stack (deployment phase or no stack to act)' if deployment
+                      else f'bridge rejected: {line[:200]}'),
+            'status': 'deployment' if deployment else 'rejected',
+            'bridge_status': bridge_status,
+            'bridge_line': (line or detail)[:300],
+        }
+    if bridge_status in ('UNKNOWN', 'NOT_SENT'):
+        return {'ok': False, 'error': f'battle_actions outcome {bridge_status}',
+                'status': bridge_status.lower(), 'bridge_status': bridge_status,
+                'bridge_line': (line or detail)[:300]}
+    after = _battle_cache_stamp(path)
+    # The cache is a side effect of THIS command: if it did not change, the payload belongs to
+    # an older query/round and must never be reported as the current legal-action dump.
+    if after is None:
+        return {'ok': False, 'error': 'battle_actions.json unreadable after bridge reply',
+                'status': 'missing', 'bridge_status': bridge_status,
+                'bridge_line': (line or detail)[:300]}
+    if before == after:
+        return {'ok': False,
+                'error': 'battle_actions.json was not refreshed by this query (stale cache)',
+                'status': 'stale_cache', 'bridge_status': bridge_status,
+                'bridge_line': (line or detail)[:300]}
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError) as exc:
-        return {'ok': False, 'error': f'battle_actions.json unreadable: {exc}'}
+        return {'ok': False, 'error': f'battle_actions.json unreadable: {exc}',
+                'status': 'unreadable', 'bridge_status': bridge_status,
+                'bridge_line': (line or detail)[:300]}
     if not isinstance(data, dict):
-        return {'ok': False, 'error': 'battle_actions.json has unexpected shape'}
+        return {'ok': False, 'error': 'battle_actions.json has unexpected shape',
+                'status': 'invalid', 'bridge_status': bridge_status}
     data['ok'] = True
+    data['bridge_status'] = bridge_status
     return data
 
 
@@ -5100,9 +5166,14 @@ def _video_record(out: Path, meta: dict) -> dict:
     """video.mp4 identity for the segment: path/bytes/full sha256 + the recorder meta fields."""
     video_path = Path(str(meta.get('video') or (Path(out) / 'video.mp4')))
     exists = video_path.exists()
-    signature = _file_signature(video_path) if exists else None
+    video_bytes = None
+    if exists:
+        try:
+            video_bytes = video_path.stat().st_size
+        except OSError:
+            video_bytes = None
     record = {'path': str(video_path), 'exists': exists,
-              'bytes': signature.get('size') if signature else None,
+              'bytes': video_bytes,
               'sha256': _file_sha256(video_path) if exists else None,
               'meta': {key: meta.get(key) for key in
                        ('ok', 'frames', 'fps_target', 'fps_actual', 'height', 'canvas', 'crf',
@@ -5649,8 +5720,13 @@ def _save_path(safe: str) -> Path:
     return _RUNTIME.paths.saves_dir / _RUNTIME.paths.save_subdir / f'{safe}.vsgm1'
 
 
-def _file_signature(path: Path) -> dict | None:
-    """(exists, size, mtime_ns, sha256 of the first 64 KiB) or None for a missing file."""
+def _save_file_signature(path: Path) -> dict | None:
+    """(exists, size, mtime_ns, sha256 of the first 64 KiB) for engine save files.
+
+    B0.5 reliability: explicitly separate from :func:`_ui_tree_signature` (full-file).  Save
+    files are large and the engine writes them in place, so the stability poll only needs a
+    cheap (size/mtime/head) identity; the canonical full hash is computed separately.
+    """
     try:
         info = path.stat()
     except OSError:
@@ -5701,7 +5777,7 @@ def _await_save_file(path: Path, before: dict | None,
     deadline = started + timeout
     stable_seconds = max(0.0, float(_SAVE_STABLE_SECONDS))
     poll = max(0.01, float(_SAVE_POLL_SECONDS))
-    signature = _file_signature(path)
+    signature = _save_file_signature(path)
     previous: dict | None = None
     stable_since: float | None = None
     empty_observed = bool(signature and int(signature.get('size') or 0) <= 0)
@@ -5725,7 +5801,7 @@ def _await_save_file(path: Path, before: dict | None,
         if now >= deadline:
             break
         time.sleep(min(poll, max(0.0, deadline - now)))
-        signature = _file_signature(path)
+        signature = _save_file_signature(path)
         if signature and int(signature.get('size') or 0) <= 0:
             empty_observed = True
     waited = round(time.time() - started, 2)
@@ -5804,7 +5880,7 @@ def save_game(name: str) -> dict:
     save_settle: dict | None = None
     st: dict = {}
     try:
-        before_file = _file_signature(path)
+        before_file = _save_file_signature(path)
         agent = _agent()
         try:
             before_state = agent.state(timeout=10)

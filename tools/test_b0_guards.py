@@ -45,6 +45,7 @@ from auto_heros3.exploration import fog_path as fog_impl  # noqa: E402
 from auto_heros3.observation import digest as digest_impl  # noqa: E402
 from auto_heros3.runtime import vcmi_agent as agent_impl  # noqa: E402
 from auto_heros3.runtime import vcmi_shot as shot_impl  # noqa: E402
+from auto_heros3.runtime.context import RuntimeContext  # noqa: E402
 from auto_heros3.recording import overlay_recorder as recorder_impl  # noqa: E402
 
 BASELINE_FILE = ROOT / "tools" / "tool_surface_baseline.json"
@@ -261,6 +262,68 @@ def main() -> int:
     check("B0-M14 the recorder entry is a thin shim and the implementation is the large file",
           recorder_entry_size < 5_000 and recorder_impl_size > 20_000,
           f"entry={recorder_entry_size} impl={recorder_impl_size}")
+
+    # ---------------------------------------------------------------- S: runtime state ownership
+    # B0.4c: the mutable runtime state has exactly one owner (RuntimeContext).  The historical
+    # module attributes are served by a module-class bridge, so the offline fixtures patch the
+    # very state the implementation reads - and no duplicate mutable copy may remain.
+    context = getattr(mcp_entry, "_RUNTIME", None)
+    check("B0-S1 the server exposes one RuntimeContext owner",
+          context is not None and isinstance(context, RuntimeContext), type(context).__name__)
+    state_names = ("STATE_DIR", "SAVES_DIR", "SAVE_SUBDIR", "MEMORY_ROOT", "RECORDINGS_DIR",
+                   "_RECORDINGS_ENV", "_lease_token", "_MUTATION_LOCK", "_MUTATION_OWNER",
+                   "_MUTATION_LOCAL", "_EVENTS_LOCK", "_recorder")
+    duplicated = sorted(name for name in state_names if name in vars(mcp_entry))
+    check("B0-S2 no mutable state duplicate remains in the module dict", not duplicated, duplicated)
+    check("B0-S3 module attributes are the context objects (lock/local/recorder identities)",
+          mcp_entry._MUTATION_LOCK is context.mutation_lock
+          and mcp_entry._MUTATION_LOCAL is context.mutation_local
+          and mcp_entry._EVENTS_LOCK is context.events_lock
+          and mcp_entry._recorder is context.recorder)
+    saved_token = mcp_entry._lease_token
+    saved_owner = mcp_entry._MUTATION_OWNER
+    try:
+        mcp_entry._lease_token = "guard-token"
+        mcp_entry._MUTATION_OWNER = {"tool": "guard"}
+        check("B0-S4 bridge writes reach the context (lease token / mutation owner)",
+              context.lease_token == "guard-token"
+              and context.mutation_owner == {"tool": "guard"})
+    finally:
+        mcp_entry._lease_token = saved_token
+        mcp_entry._MUTATION_OWNER = saved_owner
+    saved_paths = {name: getattr(mcp_entry, name) for name in
+                   ("STATE_DIR", "SAVES_DIR", "SAVE_SUBDIR", "MEMORY_ROOT", "RECORDINGS_DIR")}
+    saved_recording_override = context.paths.recordings_override
+    with tempfile.TemporaryDirectory(prefix="b0-context-paths-") as tmp:
+        tmp_path = Path(tmp)
+        try:
+            mcp_entry.STATE_DIR = tmp_path / "state"
+            mcp_entry.SAVES_DIR = tmp_path / "saves"
+            mcp_entry.SAVE_SUBDIR = "guard"
+            mcp_entry.MEMORY_ROOT = tmp_path / "player"
+            mcp_entry._RECORDINGS_ENV = str(tmp_path / "recordings")
+            check("B0-S5 the path bridge redirects the paths the implementation reads",
+                  context.paths.state_dir == tmp_path / "state"
+                  and mcp_entry._dir() == tmp_path / "state"
+                  and context.paths.saves_dir == tmp_path / "saves"
+                  and context.paths.save_subdir == "guard"
+                  and context.paths.memory_root == tmp_path / "player"
+                  and mcp_entry._recordings_root() == tmp_path / "recordings",
+                  str(context.paths))
+        finally:
+            for name, value in saved_paths.items():
+                setattr(mcp_entry, name, value)
+            context.paths.recordings_override = saved_recording_override
+    # the legacy Env fixture (test_action_contract) must keep isolating the read state
+    from test_action_contract import Env
+
+    state_before = mcp_entry.STATE_DIR
+    with Env() as env:
+        env_ok = (mcp_entry.STATE_DIR == env.root / "state"
+                  and mcp_entry.SAVES_DIR == env.root / "saves"
+                  and mcp_entry._lease_token is None)
+    check("B0-S6 the legacy Env fixture patches the state the implementation reads",
+          env_ok and mcp_entry.STATE_DIR == state_before)
 
     # ---------------------------------------------------------------- C: engine contract
     try:

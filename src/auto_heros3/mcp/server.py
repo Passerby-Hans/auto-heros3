@@ -70,19 +70,18 @@ ROOT = repo_root(_HERE)
 if ROOT != _REPO:  # pragma: no cover - a layout/resolver disagreement must fail loudly
     raise RuntimeError(f'repository root disagreement: bootstrap={_REPO} paths={ROOT}')
 
+from auto_heros3.paths import runtime_paths_from_env  # noqa: E402
+from auto_heros3.runtime.context import RuntimeContext  # noqa: E402
 
-# ---------------------------------------------------------------- test-isolation path injection
-# The AUTO_HEROS3_*_DIR / AUTO_HEROS3_SAVE_SUBDIR variables below are a TEST-ONLY escape hatch:
-# a live/debug test must redirect every writable path BEFORE importing this module, because the
-# path constants are resolved at import time (see the N0 guard in tools/test_session_memory.py).
-# Formal runs never set them; with no env variable each default below is exactly the path this
-# server has always used.
-def _env_path(name: str, default: Path) -> Path:
-    """Path from a test-isolation env var, or `default` when the variable is unset/empty."""
-    raw = os.environ.get(name)
-    return Path(raw) if raw else default
+# B0.4c: single owner for the mutable runtime state (lease token / mutation gate / events lock /
+# recorder process handle / writable paths).  The historical module attributes are served by the
+# _ServerModule bridge at the bottom of this file, so fixtures patch the state that is read.
+_RUNTIME = RuntimeContext(paths=runtime_paths_from_env(ROOT))
 
 
+# ---------------------------------------------------------------- runtime paths (B0.4c)
+# Writable state paths are resolved once from the TEST-ONLY AUTO_HEROS3_* overrides by
+# auto_heros3.paths.runtime_paths_from_env() and owned by the RuntimeContext (_RUNTIME.paths).
 # MCP Python SDK v2 renamed FastMCP to MCPServer; keep a v1 fallback for older installs.
 try:  # pragma: no cover - depends on the installed SDK
     from mcp.server.mcpserver import MCPServer
@@ -100,11 +99,9 @@ except Exception:  # pragma: no cover
         Image = None  # type: ignore
 
 from vcmi_agent import VcmiAgent  # noqa: E402
-STATE_DIR = _env_path('AUTO_HEROS3_STATE_DIR', ROOT / 'var' / 'agent_mcp_v2')
 # action -> (bridge command, ordered argument names).  B0.3: the table lives in
 # auto_heros3.domain.action_specs and is re-exported here for call sites and tests.
 from auto_heros3.domain.action_specs import ACTION_SPECS, ACTIONS  # noqa: E402
-_recorder = {'proc': None, 'dir': None, 'started': 0.0}
 _OVERLAY_MAX = 600
 # N5: the on-video panel must keep the model's reasoning.  A plain "last N lines" trim evicted
 # thoughts almost immediately (they are the most frequent line kind), so the panel keeps the last
@@ -113,28 +110,10 @@ _OVERLAY_MAX = 600
 _OVERLAY_THOUGHT_KEEP = 120
 _OVERLAY_TRIM_BYTES = 512 * 1024
 _OVERLAY_HISTORY_MAX_BYTES = 4 * 1024 * 1024
-# Save slots written by save_game live under <Documents>/My Games/vcmi/Saves/<SAVE_SUBDIR>.
-# AUTO_HEROS3_SAVES_DIR / AUTO_HEROS3_SAVE_SUBDIR are test-isolation overrides (formal runs do
-# not set them).  The subdir must be a plain directory name ([A-Za-z0-9_-]+): an absolute path or
-# a value containing separators would escape the saves root, so it is rejected at import time.
-SAVES_DIR = _env_path('AUTO_HEROS3_SAVES_DIR',
-                      Path.home() / 'Documents' / 'My Games' / 'vcmi' / 'Saves')
-_SAVE_SUBDIR_ENV = os.environ.get('AUTO_HEROS3_SAVE_SUBDIR')
-if _SAVE_SUBDIR_ENV is not None and not re.fullmatch(r'[A-Za-z0-9_-]+', _SAVE_SUBDIR_ENV):
-    raise RuntimeError(
-        'AUTO_HEROS3_SAVE_SUBDIR must match [A-Za-z0-9_-]+ (a plain save directory name; '
-        f'empty values, absolute paths and path separators are refused); got {_SAVE_SUBDIR_ENV!r}')
-SAVE_SUBDIR = _SAVE_SUBDIR_ENV if _SAVE_SUBDIR_ENV is not None else 'agent'
-# Recorder clips land under ROOT/'var'/'recordings' by default.  AUTO_HEROS3_RECORDINGS_DIR is a
-# test-isolation override; recording_start() keeps following ROOT when no override is set so the
-# existing offline tests that monkeypatch ROOT stay isolated.
-_RECORDINGS_ENV = os.environ.get('AUTO_HEROS3_RECORDINGS_DIR')
-RECORDINGS_DIR = Path(_RECORDINGS_ENV) if _RECORDINGS_ENV else ROOT / 'var' / 'recordings'
-
-
 def _recordings_root() -> Path:
     """Recorder output root: env override for isolated live tests, else follow (patched) ROOT."""
-    return RECORDINGS_DIR if _RECORDINGS_ENV else ROOT / 'var' / 'recordings'
+    override = _RUNTIME.paths.recordings_override
+    return override if override is not None else ROOT / 'var' / 'recordings'
 
 
 def _safe_save_name(name: str) -> str:
@@ -154,8 +133,8 @@ def _load_saves_meta() -> dict:
 
 
 def _dir() -> Path:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    return STATE_DIR
+    _RUNTIME.paths.state_dir.mkdir(parents=True, exist_ok=True)
+    return _RUNTIME.paths.state_dir
 
 
 def _agent() -> VcmiAgent:
@@ -172,10 +151,9 @@ def _agent() -> VcmiAgent:
 
 
 LEASE_TTL = 600.0        # seconds; every accepted action renews the lease
-# The lease token lives in module memory and is mirrored to <dir>/lease.json.  Writing the lease
-# file alone is not enough: a server restart loses the in-memory token, so a stale lease file can
-# never be used by a new process - it must call lease_acquire() again.
-_lease_token: str | None = None
+# The lease token is owned by _RUNTIME.lease_token (RuntimeContext) and mirrored to
+# <dir>/lease.json.  A server restart loses the in-memory token, so a stale lease file can never
+# be used by a new process - it must call lease_acquire() again.
 
 
 def _lease_record(token: str) -> dict:
@@ -183,8 +161,7 @@ def _lease_record(token: str) -> dict:
 
 
 def _require_lease() -> None:
-    global _lease_token
-    if not _lease_token:
+    if not _RUNTIME.lease_token:
         raise RuntimeError('no lease: call lease_acquire first '
                            '(lease tokens do not survive a server restart)')
     path = _dir() / 'lease.json'
@@ -194,7 +171,7 @@ def _require_lease() -> None:
         raise RuntimeError('no lease: call lease_acquire first')
     if not isinstance(lease, dict) or lease.get('owner') != 'llm':
         raise RuntimeError('lease not held by this session')
-    if lease.get('token') != _lease_token:
+    if lease.get('token') != _RUNTIME.lease_token:
         raise RuntimeError('lease token mismatch: call lease_acquire again')
     try:
         expired = float(lease.get('expires_at') or 0) < time.time()
@@ -204,7 +181,7 @@ def _require_lease() -> None:
         raise RuntimeError('lease expired: call lease_acquire again')
     # renew on every accepted action so long play sessions do not lose control mid-turn
     try:
-        path.write_text(json.dumps(_lease_record(_lease_token)), encoding='utf-8')
+        path.write_text(json.dumps(_lease_record(_RUNTIME.lease_token)), encoding='utf-8')
     except OSError:
         pass
 
@@ -256,14 +233,11 @@ def _unresolved_error(request: str | None = None) -> dict | None:
 # Same-thread re-entry is allowed because composite tools (move_near -> game_act) call the inner
 # action themselves.  The lease remains the cross-process single-writer guard; this gate covers
 # concurrent calls inside one MCP process.
-_MUTATION_LOCK = threading.Lock()
-_MUTATION_LOCAL = threading.local()
-_MUTATION_OWNER: dict | None = None
 
 
 def _mutation_owner_snapshot() -> dict | None:
     """Read-only view of the mutation currently in flight (None when the slot is free)."""
-    owner = _MUTATION_OWNER
+    owner = _RUNTIME.mutation_owner
     if not owner:
         return None
     snapshot = dict(owner)
@@ -284,28 +258,27 @@ def _in_flight_error(tool: str) -> dict:
 @contextmanager
 def _mutation_slot(tool: str):
     """Own the single mutation slot for `tool`; yields an in_flight error dict when it is taken."""
-    global _MUTATION_OWNER
-    depth = int(getattr(_MUTATION_LOCAL, 'depth', 0) or 0)
+    depth = int(getattr(_RUNTIME.mutation_local, 'depth', 0) or 0)
     if depth:
-        _MUTATION_LOCAL.depth = depth + 1
+        _RUNTIME.mutation_local.depth = depth + 1
         try:
             yield None
         finally:
-            _MUTATION_LOCAL.depth -= 1
+            _RUNTIME.mutation_local.depth -= 1
         return
-    if not _MUTATION_LOCK.acquire(blocking=False):
+    if not _RUNTIME.mutation_lock.acquire(blocking=False):
         yield _in_flight_error(tool)
         return
-    _MUTATION_LOCAL.depth = 1
-    _MUTATION_OWNER = {'tool': tool, 'pid': os.getpid(),
+    _RUNTIME.mutation_local.depth = 1
+    _RUNTIME.mutation_owner = {'tool': tool, 'pid': os.getpid(),
                        'thread': threading.current_thread().name,
                        'started_at': time.time()}
     try:
         yield None
     finally:
-        _MUTATION_OWNER = None
-        _MUTATION_LOCAL.depth = 0
-        _MUTATION_LOCK.release()
+        _RUNTIME.mutation_owner = None
+        _RUNTIME.mutation_local.depth = 0
+        _RUNTIME.mutation_lock.release()
 
 
 def _serialized_mutation(tool: str):
@@ -436,7 +409,6 @@ from auto_heros3.observation.digest import (  # noqa: E402
 # compaction and server restarts.  <dir>/events_cursor.json remembers which ids the client has
 # already read; game_events() returns the last 20 events plus everything unread.  There is no
 # in-memory battle edge any more: transitions are diffed against <dir>/events_state.json.
-_EVENTS_LOCK = threading.Lock()
 _EVENT_MAX_ENTRIES = 500
 
 
@@ -544,7 +516,7 @@ def _record_events(st: dict) -> list:
     if not st:
         return []
     stamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    with _EVENTS_LOCK, _file_lock('events_state'):
+    with _RUNTIME.events_lock, _file_lock('events_state'):
         state = _json_load(_events_state_path(), _event_state_default())
         try:
             state['next_id'] = int(state.get('next_id') or 1)
@@ -669,7 +641,6 @@ def lease_acquire(force: bool = False, reason: str | None = None) -> dict:
     short reason) for an explicit, ledger-recorded takeover after the holder is known to be gone.
     Expired leases are re-acquirable without force.
     """
-    global _lease_token
     path = _dir() / 'lease.json'
     try:
         existing = json.loads(path.read_text(encoding='utf-8'))
@@ -680,14 +651,14 @@ def lease_acquire(force: bool = False, reason: str | None = None) -> dict:
             expires = float(existing.get('expires_at') or 0)
         except (TypeError, ValueError):
             expires = 0.0
-        other_writer_holds = expires > time.time() and existing.get('token') != _lease_token
+        other_writer_holds = expires > time.time() and existing.get('token') != _RUNTIME.lease_token
         if other_writer_holds and not force:
             return {'ok': False, 'error': 'lease_held',
                     'lease': {key: existing.get(key) for key in ('owner', 'expires_at')},
                     'hint': 'a valid lease is held by another writer; wait for expiry or call '
                             'lease_acquire(force=True, reason=...) explicitly (ledger-recorded)'}
     new_token = uuid.uuid4().hex
-    _lease_token = new_token
+    _RUNTIME.lease_token = new_token
     lease = _lease_record(new_token)
     _atomic_write_json(path, lease)
     if force and isinstance(existing, dict) and existing.get('token') != new_token:
@@ -705,18 +676,17 @@ def lease_release() -> dict:
     Only the writer that currently holds the lease may release it: a stale owner cannot delete
     a newer writer's lease file.
     """
-    global _lease_token
     path = _dir() / 'lease.json'
     try:
         existing = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         existing = None
     if isinstance(existing, dict) and existing.get('owner') == 'llm':
-        if not _lease_token or existing.get('token') != _lease_token:
+        if not _RUNTIME.lease_token or existing.get('token') != _RUNTIME.lease_token:
             return {'ok': False, 'error': 'lease_not_held',
                     'detail': 'the lease file belongs to another writer; it cannot be '
                               'released by this session'}
-    _lease_token = None
+    _RUNTIME.lease_token = None
     try:
         path.unlink()
     except OSError:
@@ -1324,12 +1294,12 @@ def _resolve_save_target(target: str) -> dict | None:
         if not parts:
             return None
         name = parts[-1]
-        subdir = parts[0] if len(parts) > 1 else SAVE_SUBDIR
+        subdir = parts[0] if len(parts) > 1 else _RUNTIME.paths.save_subdir
         safe = _safe_save_name(name)
         if not safe or not re.fullmatch(r'[A-Za-z0-9_-]+', subdir):
             return None
         return {'slot': f'Saves/{subdir}/{safe}', 'subdir': subdir, 'name': safe,
-                'safe': safe, 'path': SAVES_DIR / subdir / f'{safe}.vsgm1'}
+                'safe': safe, 'path': _RUNTIME.paths.saves_dir / subdir / f'{safe}.vsgm1'}
     if text.lower().endswith('.vsgm1'):
         path = Path(text)
         safe = _safe_save_name(path.stem)
@@ -2322,7 +2292,6 @@ def game_brief(hero: int | None = None, radius: int | None = None, limit: int = 
 # The program only validates/stores/indexes; the player writes the content and sources.
 # AUTO_HEROS3_MEMORY_ROOT is a test-isolation override (formal runs do not set it); it must be
 # resolved before _ensure_memory_defaults() runs at the bottom of this import.
-MEMORY_ROOT = _env_path('AUTO_HEROS3_MEMORY_ROOT', ROOT / 'doc' / 'player')
 SAFE_KEY = re.compile(r'^[a-z0-9][a-z0-9_\-]{0,47}$')
 
 
@@ -2356,14 +2325,14 @@ def _run_identity() -> dict:
 def _memory_path(scope: str, key: str | None) -> Path:
     run = _run_identity()
     if scope == 'player':
-        return MEMORY_ROOT / 'PLAYER.md'
+        return _RUNTIME.paths.memory_root / 'PLAYER.md'
     if scope == 'long_term':
         name = key or 'index'
         if not SAFE_KEY.match(name):
             raise ValueError('invalid long_term key (use [a-z0-9_-])')
-        return MEMORY_ROOT / 'long_term' / f'{name}.md'
+        return _RUNTIME.paths.memory_root / 'long_term' / f'{name}.md'
     if scope == 'game':
-        base = MEMORY_ROOT / 'games' / run['run_id'] / 'branches' / run['branch_id']
+        base = _RUNTIME.paths.memory_root / 'games' / run['run_id'] / 'branches' / run['branch_id']
         if key in (None, '', 'current'):
             return base / 'CURRENT.md'
         if key.startswith('battle:'):
@@ -2401,8 +2370,8 @@ def _ensure_memory_defaults() -> None:
     platform/memory_templates/ so a fresh checkout still gets the read/write discipline text.
     """
     templates = ROOT / 'platform' / 'memory_templates'
-    pairs = [(templates / 'PLAYER.md', MEMORY_ROOT / 'PLAYER.md'),
-             (templates / 'long_term_INDEX.md', MEMORY_ROOT / 'long_term' / 'INDEX.md')]
+    pairs = [(templates / 'PLAYER.md', _RUNTIME.paths.memory_root / 'PLAYER.md'),
+             (templates / 'long_term_INDEX.md', _RUNTIME.paths.memory_root / 'long_term' / 'INDEX.md')]
     for source, target in pairs:
         if target.exists() or not source.exists():
             continue
@@ -2431,7 +2400,7 @@ def _memory_index() -> dict:
         pass
     topics = []
     try:
-        for path in sorted((MEMORY_ROOT / 'long_term').glob('*.md')):
+        for path in sorted((_RUNTIME.paths.memory_root / 'long_term').glob('*.md')):
             if path.stem != 'INDEX':
                 topics.append(path.stem)
     except OSError:
@@ -5404,11 +5373,11 @@ def recording_start(fps: int = 60, height: int = 768, crf: int = 10) -> dict:
     # Singleton: the recorder writes frames into one encoder, so a second instance corrupts the
     # clip (seen in practice: two recorders -> 0-byte video).  The state file survives an MCP
     # restart, so a recorder started by a previous process is recognised too.
-    proc = _recorder.get('proc')
+    proc = _RUNTIME.recorder.get('proc')
     record = _read_recording_state()
     active_dir = None
     if proc is not None and proc.poll() is None:
-        active_dir = _recorder.get('dir')
+        active_dir = _RUNTIME.recorder.get('dir')
     elif record.get('dir') and _pid_alive(record.get('pid')):
         active_dir = record.get('dir')
     if active_dir is not None:
@@ -5448,7 +5417,7 @@ def recording_start(fps: int = 60, height: int = 768, crf: int = 10) -> dict:
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                             stdout=log, stderr=subprocess.STDOUT)
     started_at = time.time()
-    _recorder.update({'proc': proc, 'dir': out, 'started': started_at})
+    _RUNTIME.recorder.update({'proc': proc, 'dir': out, 'started': started_at})
     canvas_w = round(int(height) * 16 / 9)
     if canvas_w % 2:
         canvas_w += 1
@@ -5491,19 +5460,19 @@ def recording_stop() -> dict:
     state file exists, the recorder is stopped through its STOP file / process identity instead
     of failing, so a long recording is never orphaned.
     """
-    proc = _recorder.get('proc')
+    proc = _RUNTIME.recorder.get('proc')
     record = _read_recording_state()
     recovered = proc is None
     out: Path | None = None
-    if proc is not None and _recorder.get('dir'):
-        out = Path(_recorder['dir'])
+    if proc is not None and _RUNTIME.recorder.get('dir'):
+        out = Path(_RUNTIME.recorder['dir'])
     elif record.get('dir'):
         out = Path(record['dir'])
     if out is None:
         _release_recording_lock()
         return {'ok': False, 'error': 'not recording'}
     if not out.exists():
-        _recorder.update({'proc': None, 'dir': None})
+        _RUNTIME.recorder.update({'proc': None, 'dir': None})
         try:
             _recording_state_path().unlink()
         except OSError:
@@ -5541,8 +5510,8 @@ def recording_stop() -> dict:
         meta = json.loads((out / 'meta.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         pass
-    started_at = record.get('started') or _recorder.get('started')
-    _recorder.update({'proc': None, 'dir': None})
+    started_at = record.get('started') or _RUNTIME.recorder.get('started')
+    _RUNTIME.recorder.update({'proc': None, 'dir': None})
     try:
         _recording_state_path().unlink()
     except OSError:
@@ -5567,11 +5536,11 @@ def recording_stop() -> dict:
 @mcp.tool()
 def recording_status() -> dict:
     """Report the recorder state (works after an MCP restart via <dir>/recording.json)."""
-    proc = _recorder.get('proc')
+    proc = _RUNTIME.recorder.get('proc')
     in_memory = proc is not None and proc.poll() is None
     record = _read_recording_state()
     alive = in_memory or _pid_alive(record.get('pid'))
-    out = _recorder.get('dir') if in_memory else record.get('dir')
+    out = _RUNTIME.recorder.get('dir') if in_memory else record.get('dir')
     current = _evidence_identity()
     bound = record.get('identity') or {}
     lock = {}
@@ -5615,7 +5584,7 @@ def game_note(text: str, kind: str = 'thought') -> dict:
     _overlay(kind, text)
     _ledger({'action': 'game_note', 'args': {'kind': kind, 'text': text}, 'seq': None,
              'status': 'OK', 'detail': kind})
-    return {'ok': True, 'kind': kind, 'recording': bool(_recorder['proc'])}
+    return {'ok': True, 'kind': kind, 'recording': bool(_RUNTIME.recorder['proc'])}
 
 
 @mcp.tool()
@@ -5677,7 +5646,7 @@ _LOAD_FRESH_SECONDS = 120.0
 
 
 def _save_path(safe: str) -> Path:
-    return SAVES_DIR / SAVE_SUBDIR / f'{safe}.vsgm1'
+    return _RUNTIME.paths.saves_dir / _RUNTIME.paths.save_subdir / f'{safe}.vsgm1'
 
 
 def _file_signature(path: Path) -> dict | None:
@@ -5822,7 +5791,7 @@ def save_game(name: str) -> dict:
         return {'ok': False, 'status': 'unknown', 'error': unresolved_error['error'],
                 'unresolved': unresolved_error.get('unresolved'),
                 'hint': unresolved_error.get('hint')}
-    slot = f'Saves/{SAVE_SUBDIR}/{safe}'
+    slot = f'Saves/{_RUNTIME.paths.save_subdir}/{safe}'
     path = _save_path(safe)
     status = 'unknown'
     evidence = 'not sent'
@@ -5958,7 +5927,7 @@ def load_game(name: str) -> dict:
     if not safe:
         return {'ok': False, 'status': 'rejected', 'error': 'invalid save name'}
     meta = _load_saves_meta().get(safe) or {}
-    slot = meta.get('slot') or f'Saves/{SAVE_SUBDIR}/{safe}'
+    slot = meta.get('slot') or f'Saves/{_RUNTIME.paths.save_subdir}/{safe}'
     path = _save_path(safe)
     if not path.exists():
         return {'ok': False, 'accepted': False, 'status': 'rejected', 'name': safe,
@@ -6134,8 +6103,8 @@ def load_game(name: str) -> dict:
 def list_saves() -> dict:
     """List save slots written by save_game (plus the raw files on disk)."""
     meta = _load_saves_meta()
-    disk = sorted(str(p.relative_to(SAVES_DIR)) for p in SAVES_DIR.glob(f'{SAVE_SUBDIR}/*.vsgm1')) \
-        if SAVES_DIR.exists() else []
+    disk = sorted(str(p.relative_to(_RUNTIME.paths.saves_dir)) for p in _RUNTIME.paths.saves_dir.glob(f'{_RUNTIME.paths.save_subdir}/*.vsgm1')) \
+        if _RUNTIME.paths.saves_dir.exists() else []
     return {'ok': True, 'saves': meta, 'files': disk}
 
 
@@ -6152,6 +6121,67 @@ def selftest() -> int:
     print('lease:', lease_acquire())
     print('lease_release:', lease_release())
     return 0
+
+
+# ---------------------------------------------------------------- runtime state ownership (B0.4c)
+# GPT6 review guidance: exactly one owner for lease token, mutation gate, events lock, recorder
+# process handle and writable paths.  These names are intentionally NOT module globals any more:
+# attribute access on this module (including the historical test fixtures) is served from
+# _RUNTIME, so there is only one mutable copy in the process.  The tools/ shim aliases the module
+# object, so `M._lease_token = ...` / `M._recorder.update(...)` in the offline suites keep
+# patching the state the implementation actually reads.
+import types as _types
+
+_CONTEXT_BRIDGE = {
+    'STATE_DIR': ('paths', 'state_dir'),
+    'SAVES_DIR': ('paths', 'saves_dir'),
+    'SAVE_SUBDIR': ('paths', 'save_subdir'),
+    'MEMORY_ROOT': ('paths', 'memory_root'),
+    'RECORDINGS_DIR': ('recording', None),
+    '_RECORDINGS_ENV': ('recording_env', None),
+    '_lease_token': ('ctx', 'lease_token'),
+    '_MUTATION_LOCK': ('ctx', 'mutation_lock'),
+    '_MUTATION_OWNER': ('ctx', 'mutation_owner'),
+    '_MUTATION_LOCAL': ('ctx', 'mutation_local'),
+    '_EVENTS_LOCK': ('ctx', 'events_lock'),
+    '_recorder': ('ctx', 'recorder'),
+}
+
+
+class _ServerModule(_types.ModuleType):
+    """Serve the historical state attribute names from the single RuntimeContext owner."""
+
+    def __getattr__(self, name):
+        target = _CONTEXT_BRIDGE.get(name)
+        if target is None:
+            raise AttributeError(f'module {self.__name__!r} has no attribute {name!r}')
+        kind, field_name = target
+        if kind == 'recording':
+            override = _RUNTIME.paths.recordings_override
+            return override if override is not None else ROOT / 'var' / 'recordings'
+        if kind == 'recording_env':
+            override = _RUNTIME.paths.recordings_override
+            return str(override) if override is not None else None
+        obj = _RUNTIME.paths if kind == 'paths' else _RUNTIME
+        return getattr(obj, field_name)
+
+    def __setattr__(self, name, value):
+        target = _CONTEXT_BRIDGE.get(name)
+        if target is None:
+            super().__setattr__(name, value)
+            return
+        kind, field_name = target
+        if kind == 'recording':
+            _RUNTIME.paths.recordings_override = Path(value) if value else None
+            return
+        if kind == 'recording_env':
+            _RUNTIME.paths.recordings_override = Path(str(value)) if value else None
+            return
+        obj = _RUNTIME.paths if kind == 'paths' else _RUNTIME
+        setattr(obj, field_name, value)
+
+
+sys.modules[__name__].__class__ = _ServerModule
 
 
 def main(argv: list[str] | None = None) -> int:

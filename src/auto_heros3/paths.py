@@ -17,6 +17,10 @@ The MCP server implementation resolves ROOT through :func:`repo_root` instead of
 This module is read-only (it never creates directories) and importable without side effects.
 The CLI behaviour is unchanged.
 
+B0.4c: :func:`runtime_paths_from_env` resolves the writable runtime paths (state/saves/memory/
+recordings) exactly once, from the TEST-ONLY ``AUTO_HEROS3_*`` overrides; the MCP server's
+``RuntimeContext`` then owns those values (single owner, no duplicate module globals).
+
 Usage
 -----
     python -X utf8 tools/paths_check.py        # human-readable summary, exit 1 on error
@@ -26,7 +30,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -148,6 +155,51 @@ def check_paths(start: Path | None = None) -> dict:
             result["warnings"].append(f"{name}: optional local path is absent: {rel}")
     result["ok"] = not result["errors"]
     return result
+
+
+# ------------------------------------------------------------------ runtime state paths (B0.4c)
+# The MCP server resolves its writable state paths exactly once, at import time, from the
+# TEST-ONLY AUTO_HEROS3_* overrides; RuntimeContext owns these values afterwards (single owner,
+# no duplicate module globals).  The historical env names/validation are preserved so the N0
+# isolation guard and the live test redirects keep working unchanged.
+@dataclass
+class RuntimePaths:
+    state_dir: Path
+    saves_dir: Path
+    save_subdir: str
+    memory_root: Path
+    recordings_override: Path | None
+
+
+_SAVE_SUBDIR_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _env_path(name: str, default: Path) -> Path:
+    """Path from a test-isolation env var, or *default* when the variable is unset/empty."""
+    raw = os.environ.get(name)
+    return Path(raw) if raw else default
+
+
+def runtime_paths_from_env(root: Path) -> RuntimePaths:
+    """Resolve the writable runtime paths from the environment (test-isolation escape hatch).
+
+    Raises RuntimeError for an invalid AUTO_HEROS3_SAVE_SUBDIR - same contract as before the
+    B0.4c refactor (empty values, absolute paths and separators are refused).
+    """
+    override = os.environ.get("AUTO_HEROS3_SAVE_SUBDIR")
+    if override is not None and not _SAVE_SUBDIR_RE.fullmatch(override):
+        raise RuntimeError(
+            "AUTO_HEROS3_SAVE_SUBDIR must match [A-Za-z0-9_-]+ (a plain save directory name; "
+            f"empty values, absolute paths and path separators are refused); got {override!r}")
+    recordings_raw = os.environ.get("AUTO_HEROS3_RECORDINGS_DIR")
+    return RuntimePaths(
+        state_dir=_env_path("AUTO_HEROS3_STATE_DIR", root / "var" / "agent_mcp_v2"),
+        saves_dir=_env_path("AUTO_HEROS3_SAVES_DIR",
+                            Path.home() / "Documents" / "My Games" / "vcmi" / "Saves"),
+        save_subdir=override if override is not None else "agent",
+        memory_root=_env_path("AUTO_HEROS3_MEMORY_ROOT", root / "doc" / "player"),
+        recordings_override=Path(recordings_raw) if recordings_raw else None,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

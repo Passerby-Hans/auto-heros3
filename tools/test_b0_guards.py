@@ -36,6 +36,7 @@ import mcp_server_v2 as mcp_entry  # noqa: E402  (tools/mcp_server_v2.py -> alia
 import fog_path as fog_entry  # noqa: E402  (tools/fog_path.py -> alias of the impl)
 import vcmi_agent as agent_entry  # noqa: E402  (tools/vcmi_agent.py -> alias of the impl)
 import vcmi_shot as shot_entry  # noqa: E402  (tools/vcmi_shot.py -> alias of the impl)
+import vcmi_overlay_recorder as recorder_entry  # noqa: E402  (tools/... -> alias of the impl)
 
 from auto_heros3 import paths as paths_impl  # noqa: E402
 from auto_heros3.mcp import server as server_impl  # noqa: E402
@@ -44,6 +45,7 @@ from auto_heros3.exploration import fog_path as fog_impl  # noqa: E402
 from auto_heros3.observation import digest as digest_impl  # noqa: E402
 from auto_heros3.runtime import vcmi_agent as agent_impl  # noqa: E402
 from auto_heros3.runtime import vcmi_shot as shot_impl  # noqa: E402
+from auto_heros3.recording import overlay_recorder as recorder_impl  # noqa: E402
 
 BASELINE_FILE = ROOT / "tools" / "tool_surface_baseline.json"
 CONTRACT_FILE = ROOT / "tools" / "bridge_contract.json"
@@ -54,6 +56,8 @@ FOG_ENTRY = ROOT / "tools" / "fog_path.py"
 FOG_IMPL = ROOT / "src" / "auto_heros3" / "exploration" / "fog_path.py"
 AGENT_ENTRY = ROOT / "tools" / "vcmi_agent.py"
 AGENT_IMPL = ROOT / "src" / "auto_heros3" / "runtime" / "vcmi_agent.py"
+RECORDER_ENTRY = ROOT / "tools" / "vcmi_overlay_recorder.py"
+RECORDER_IMPL = ROOT / "src" / "auto_heros3" / "recording" / "overlay_recorder.py"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -241,6 +245,22 @@ def main() -> int:
         agent_file = None
     check("B0-M11 the imported driver resolves to src/auto_heros3/runtime/vcmi_agent.py",
           agent_file == AGENT_IMPL.resolve(), agent_file)
+    # B0.4b recorder alias contract: the MCP server spawns tools/vcmi_overlay_recorder.py as a
+    # separate process, and the recording suites import it; both must reach the implementation.
+    check("B0-M12 tools/vcmi_overlay_recorder.py is a module alias of the recorder implementation",
+          recorder_entry is recorder_impl,
+          f"{recorder_entry.__name__} != {recorder_impl.__name__}")
+    try:
+        recorder_file = Path(recorder_entry.__file__).resolve()
+    except (OSError, TypeError):  # pragma: no cover
+        recorder_file = None
+    check("B0-M13 the imported recorder resolves to src/auto_heros3/recording/overlay_recorder.py",
+          recorder_file == RECORDER_IMPL.resolve(), recorder_file)
+    recorder_entry_size = RECORDER_ENTRY.stat().st_size if RECORDER_ENTRY.exists() else 0
+    recorder_impl_size = RECORDER_IMPL.stat().st_size if RECORDER_IMPL.exists() else 0
+    check("B0-M14 the recorder entry is a thin shim and the implementation is the large file",
+          recorder_entry_size < 5_000 and recorder_impl_size > 20_000,
+          f"entry={recorder_entry_size} impl={recorder_impl_size}")
 
     # ---------------------------------------------------------------- C: engine contract
     try:

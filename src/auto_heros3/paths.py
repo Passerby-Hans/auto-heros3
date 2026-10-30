@@ -52,6 +52,7 @@ ROOT_MARKERS = (
     "src/auto_heros3/exploration/fog_path.py",
     "src/auto_heros3/runtime/vcmi_agent.py",
     "src/auto_heros3/runtime/vcmi_shot.py",
+    "src/auto_heros3/recording/overlay_recorder.py",
 )
 
 # Every path the runtime resolves from ROOT.  ``tracked=True`` means it must exist in a
@@ -75,6 +76,8 @@ KEY_PATHS = {
     "runtime_dir": ("src/auto_heros3/runtime", True),
     "vcmi_agent_impl": ("src/auto_heros3/runtime/vcmi_agent.py", True),
     "vcmi_shot_impl": ("src/auto_heros3/runtime/vcmi_shot.py", True),
+    "recording_dir": ("src/auto_heros3/recording", True),
+    "overlay_recorder_impl": ("src/auto_heros3/recording/overlay_recorder.py", True),
     "agent_pkg": ("agent", True),
     "agent_h3": ("agent/h3", True),
     "knowledge_module": ("agent/knowledge/manual.py", True),

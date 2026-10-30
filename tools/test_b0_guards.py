@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -324,6 +325,35 @@ def main() -> int:
                   and mcp_entry._lease_token is None)
     check("B0-S6 the legacy Env fixture patches the state the implementation reads",
           env_ok and mcp_entry.STATE_DIR == state_before)
+
+    # GPT6 B0.4c review P2: standard unittest.mock.patch.object treats an attribute absent from
+    # vars() as "created by the patch" and calls delattr() on exit.  The bridge must round-trip.
+    saved_state = mcp_entry.STATE_DIR
+    saved_token = mcp_entry._lease_token
+    mock_ok = False
+    mock_detail = ""
+    try:
+        with mock.patch.object(mcp_entry, "STATE_DIR", Path("/tmp/guard-state")):
+            inside_state = mcp_entry.STATE_DIR == Path("/tmp/guard-state")
+        with mock.patch.object(mcp_entry, "_lease_token", "guard-mock-token"):
+            inside_token = mcp_entry._lease_token == "guard-mock-token"
+        mock_ok = (inside_state and inside_token
+                   and mcp_entry.STATE_DIR == saved_state
+                   and mcp_entry._lease_token == saved_token)
+    except AttributeError as exc:  # pragma: no cover - this is the regression being guarded
+        mock_detail = f"{type(exc).__name__}: {exc}"
+    check("B0-S7 unittest.mock.patch.object round-trips on bridged attributes",
+          mock_ok, mock_detail)
+    delete_ok = False
+    delete_detail = ""
+    try:
+        mcp_entry._lease_token = "guard-del-token"
+        del mcp_entry._lease_token
+        delete_ok = mcp_entry._lease_token == saved_token and mcp_entry.STATE_DIR == saved_state
+    except AttributeError as exc:  # pragma: no cover
+        delete_detail = f"{type(exc).__name__}: {exc}"
+    check("B0-S8 deleting a bridged attribute restores its previous owner value",
+          delete_ok, delete_detail)
 
     # ---------------------------------------------------------------- C: engine contract
     try:

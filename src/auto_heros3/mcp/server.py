@@ -6148,14 +6148,21 @@ _CONTEXT_BRIDGE = {
 }
 
 
+# mock.patch.object compatibility: the standard library treats an attribute that is absent from
+# vars(M) as "created by the patch" and calls delattr() on exit instead of restoring the old
+# value.  The bridge therefore keeps a small undo stack per bridged name: every bridge write
+# records the previous owner value, and a delete restores it.  Standard unittest.mock.patch /
+# patch.object round-trips keep working without reintroducing a second mutable copy (GPT6 B0.4c
+# review, P2 compatibility regression).
+_BRIDGE_UNDO: dict[str, list] = {}
+
+
 class _ServerModule(_types.ModuleType):
     """Serve the historical state attribute names from the single RuntimeContext owner."""
 
-    def __getattr__(self, name):
-        target = _CONTEXT_BRIDGE.get(name)
-        if target is None:
-            raise AttributeError(f'module {self.__name__!r} has no attribute {name!r}')
-        kind, field_name = target
+    @staticmethod
+    def _read(name):
+        kind, field_name = _CONTEXT_BRIDGE[name]
         if kind == 'recording':
             override = _RUNTIME.paths.recordings_override
             return override if override is not None else ROOT / 'var' / 'recordings'
@@ -6165,12 +6172,18 @@ class _ServerModule(_types.ModuleType):
         obj = _RUNTIME.paths if kind == 'paths' else _RUNTIME
         return getattr(obj, field_name)
 
-    def __setattr__(self, name, value):
-        target = _CONTEXT_BRIDGE.get(name)
-        if target is None:
-            super().__setattr__(name, value)
-            return
-        kind, field_name = target
+    @staticmethod
+    def _snapshot(name):
+        """Owner-backed value to restore later (recording names snapshot the override itself)."""
+        kind, field_name = _CONTEXT_BRIDGE[name]
+        if kind in ('recording', 'recording_env'):
+            return _RUNTIME.paths.recordings_override
+        obj = _RUNTIME.paths if kind == 'paths' else _RUNTIME
+        return getattr(obj, field_name)
+
+    @staticmethod
+    def _write(name, value):
+        kind, field_name = _CONTEXT_BRIDGE[name]
         if kind == 'recording':
             _RUNTIME.paths.recordings_override = Path(value) if value else None
             return
@@ -6179,6 +6192,35 @@ class _ServerModule(_types.ModuleType):
             return
         obj = _RUNTIME.paths if kind == 'paths' else _RUNTIME
         setattr(obj, field_name, value)
+
+    @staticmethod
+    def _restore(name, previous):
+        kind, _field = _CONTEXT_BRIDGE[name]
+        if kind in ('recording', 'recording_env'):
+            _RUNTIME.paths.recordings_override = previous
+            return
+        _ServerModule._write(name, previous)
+
+    def __getattr__(self, name):
+        if name not in _CONTEXT_BRIDGE:
+            raise AttributeError(f'module {self.__name__!r} has no attribute {name!r}')
+        return self._read(name)
+
+    def __setattr__(self, name, value):
+        if name not in _CONTEXT_BRIDGE:
+            super().__setattr__(name, value)
+            return
+        _BRIDGE_UNDO.setdefault(name, []).append(self._snapshot(name))
+        self._write(name, value)
+
+    def __delattr__(self, name):
+        if name not in _CONTEXT_BRIDGE:
+            super().__delattr__(name)
+            return
+        undo = _BRIDGE_UNDO.get(name) or []
+        if not undo:
+            raise AttributeError(f'cannot delete bridged attribute {name!r} (no previous value)')
+        self._restore(name, undo.pop())
 
 
 sys.modules[__name__].__class__ = _ServerModule

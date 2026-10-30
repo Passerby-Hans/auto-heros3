@@ -101,46 +101,9 @@ except Exception:  # pragma: no cover
 
 from vcmi_agent import VcmiAgent  # noqa: E402
 STATE_DIR = _env_path('AUTO_HEROS3_STATE_DIR', ROOT / 'var' / 'agent_mcp_v2')
-# action -> (bridge command, ordered argument names).  Tool args arrive as a JSON object, so the
-# command line must be built from this spec instead of relying on dict insertion order.
-ACTION_SPECS = {
-    'move': ('move_hero', ('hero', 'x', 'y', 'z')),
-    'move_hero': ('move_hero', ('hero', 'x', 'y', 'z')),
-    'build': ('build', ('town', 'id')),
-    'recruit': ('recruit', ('town', 'level', 'amount')),
-    'recruit_hero': ('recruit_hero', ('town', 'index')),
-    # T40/C11: open the real hero screen (CPlayerInterface::openHeroWindow -> CHeroWindow).  The
-    # window is left OPEN so a demo can show the equipment/paper-doll; close it with close_window
-    # (the bridge accepts CHeroWindow in its close_window_safe list).
-    'open_hero': ('open_hero', ('hero',)),
-    'transfer': ('transfer', ('src', 'src_index', 'src_slot', 'dst', 'dst_index', 'dst_slot')),
-    'merge': ('merge', ('src', 'src_index', 'src_slot', 'dst', 'dst_index', 'dst_slot')),
-    'swap_stacks': ('swap_stacks', ('owner', 'index', 'slot_a', 'slot_b')),
-    'split': ('split', ('owner', 'index', 'slot', 'amount')),
-    'upgrade': ('upgrade', ('owner', 'index', 'slot', 'creature')),
-    'market_trade': ('market_trade', ('town', 'trade_mode', 'sell', 'buy', 'amount')),
-    'answer': ('answer', ('value',)),
-    'end_turn': ('end_turn', ()),
-    # T35: hero magic.  cast_spell is the adventure-map spellbook request (optional x,y,z target);
-    # battle_cast_spell is the battle spellbook request (optional unit stack or hex target).
-    'cast_spell': ('cast_spell', ('hero', 'spell')),
-    'battle_cast_spell': ('battle_cast_spell', ('spell',)),
-    'battle_attack': ('battle_attack', ('stack',)),
-    # Explicit move-towards-without-attacking (the old battle_attack silently did this).
-    'battle_approach': ('battle_approach', ('target',)),
-    'battle_move': ('battle_move', ('x', 'y')),
-    'battle_defend': ('battle_defend', ()),
-    'battle_wait': ('battle_wait', ()),
-    'battle_result_ok': ('battle_result_ok', ()),
-    'confirm_deployment': ('key return', ()),
-    'close_window': ('close_window_safe', ()),
-    'center_hero': ('center_hero', ()),
-    # UI clicks for client-side dialogs the bridge does not expose as server queries
-    # (shipyard, quest windows, battle dialogs).  Coordinates are the same event-dispatcher
-    # coordinates the ui_tree dump uses.  It is a plain single action with no verifier.
-    'click': ('click', ('x', 'y')),
-}
-ACTIONS = set(ACTION_SPECS)
+# action -> (bridge command, ordered argument names).  B0.3: the table lives in
+# auto_heros3.domain.action_specs and is re-exported here for call sites and tests.
+from auto_heros3.domain.action_specs import ACTION_SPECS, ACTIONS  # noqa: E402
 _recorder = {'proc': None, 'dir': None, 'started': 0.0}
 _OVERLAY_MAX = 600
 # N5: the on-video panel must keep the model's reasoning.  A plain "last N lines" trim evicted
@@ -455,198 +418,17 @@ def _overlay(kind: str, text: str, ts: str | None = None) -> None:
         pass
 
 
-# N2/A + T33/P-B: these fields already exist in the bridge state.json (heroJson/battleJson); the
-# digest and the brief pass them through instead of dropping them.  Only present fields are added,
-# so an older/partial state fixture keeps its previous shape (no KeyError).
-# T33/P-B added the hero-screen details the bridge now publishes (mana_max/spellbook/spells/
-# skills/artifacts/luck/morale/specialty and creature names) - all player-visible in the UI.
-_HERO_OBS_FIELDS = ('id', 'level', 'exp', 'mana', 'mana_max', 'spellbook', 'primary',
-                    'luck', 'morale', 'specialty')
-_STACK_OBS_FIELDS = ('shots', 'counterattacks', 'defending', 'waited', 'double_wide',
-                     'creature_name')
-_BATTLE_OBS_FIELDS = ('round', 'hero_mana', 'hero_mana_max', 'hero_spellbook', 'cast_spells')
-# Caps keep the routine digest readable even for a late-game hero with many artifacts/spells.
-_HERO_SPELLS_MAX = 40
-_HERO_SKILLS_MAX = 8
-_HERO_ARTIFACTS_MAX = 30
-_BRIEF_SPELLS_MAX = 12
-_BRIEF_ARTIFACTS_MAX = 12
-
-
-def _optional_fields(source: dict, names: tuple) -> dict:
-    return {name: source[name] for name in names if source.get(name) is not None}
-
-
-# T31/P-A: the bridge already writes the Info-window log into state.json ("info", see
-# AgentBridge.cpp infoJson(): week events, artifact/treasure messages, building visits, ...).
-# The normal UI shows these dialogs to the player, so projecting them is an observation fix,
-# not extra hidden information.  The deque is capped at 20 entries by the bridge; here we keep
-# the newest few, collapse only *consecutive* repeats (repeated weekly events are real events,
-# not duplicates) and truncate overly long texts so a routine brief stays compact.
-_RECENT_INFO_MAX = 8
-_RECENT_INFO_TEXT_MAX = 300
-_ACTION_TAIL_MAX = 5
-_ACTION_EVIDENCE_MAX = 200
-_ACTION_ARGS_MAX = 200
-
-
-def _truncate(text: str, limit: int) -> str:
-    """One-line truncation marker so callers can tell a cut value from a complete one."""
-    return text if len(text) <= limit else text[:limit] + '…'
-
-
-def _recent_info(st: dict) -> list:
-    """Newest player-visible Info-window lines from the current state (oldest->newest)."""
-    raw = (st or {}).get('info')
-    if not isinstance(raw, list):
-        return []
-    cleaned: list[str] = []
-    for item in raw:
-        if not isinstance(item, str):
-            continue
-        text = item.strip()
-        if not text:
-            continue
-        if cleaned and cleaned[-1] == text:
-            continue
-        cleaned.append(text)
-    return [_truncate(text, _RECENT_INFO_TEXT_MAX) for text in cleaned[-_RECENT_INFO_MAX:]]
-
-
-def _hero_digest(hero: dict) -> dict:
-    entry = {'i': hero['index'], 'name': hero['name'],
-             'pos': hero.get('pos') or hero.get('visitable'),
-             'visitable': hero.get('visitable'),
-             'movement': hero['movement'], 'army': hero['army']}
-    entry.update(_optional_fields(hero, _HERO_OBS_FIELDS))
-    # T40/C11: pass the bridge's canonical interaction tile (`tile`) through.  Old/partial
-    # fixtures (and pre-rebuild clients) do not carry it, so their digest shape is unchanged.
-    tile = hero.get('tile')
-    if isinstance(tile, list) and tile:
-        entry['tile'] = list(tile)[:3]
-    # T33/P-B: hero-screen lists.  Old/partial fixtures simply do not have them.
-    spells = hero.get('spells')
-    if isinstance(spells, list):
-        entry['spells'] = spells[:_HERO_SPELLS_MAX]
-    skills = hero.get('skills')
-    if isinstance(skills, list):
-        entry['skills'] = skills[:_HERO_SKILLS_MAX]
-    artifacts = hero.get('artifacts')
-    if isinstance(artifacts, dict):
-        worn = artifacts.get('worn')
-        backpack = artifacts.get('backpack')
-        projected = {}
-        if isinstance(worn, list):
-            projected['worn'] = worn[:_HERO_ARTIFACTS_MAX]
-        if isinstance(backpack, list):
-            projected['backpack'] = backpack[:_HERO_ARTIFACTS_MAX]
-        if projected:
-            entry['artifacts'] = projected
-    return entry
-
-
-def _hero_brief(h: dict) -> dict:
-    """Compact per-hero view for game_brief (hero-screen lists reduced to readable names)."""
-    entry = {'i': h['i'], 'name': h['name'],
-             'pos': list(h['pos'] or [0, 0, 0])[:3],
-             'visitable': list(h.get('visitable') or [])[:3] or None,
-             'mov': h['movement'],
-             'army': sum(a['count'] for a in h['army']),
-             'stacks': len(h['army']),
-             **_optional_fields(h, _HERO_OBS_FIELDS)}
-    # T40/C11: canonical interaction tile (`tile`) from the bridge, compact form.
-    tile = h.get('tile')
-    if isinstance(tile, list) and tile:
-        entry['tile'] = list(tile)[:3]
-    skills = h.get('skills')
-    if isinstance(skills, list):
-        entry['skills'] = skills[:_HERO_SKILLS_MAX]
-    spells = h.get('spells')
-    if isinstance(spells, list):
-        entry['spell_count'] = len(spells)
-        # T35: keep the spellbook compact but usable: id + name + cost + can-cast-now.
-        projected_spells = []
-        for spell in spells[:_BRIEF_SPELLS_MAX]:
-            if not isinstance(spell, dict):
-                continue
-            row = {'id': spell.get('id'), 'name': spell.get('name')}
-            for key in ('cost', 'can_cast', 'adventure'):
-                if spell.get(key) is not None:
-                    row[key] = spell[key]
-            projected_spells.append(row)
-        entry['spells'] = projected_spells
-    artifacts = h.get('artifacts')
-    if isinstance(artifacts, dict):
-        names = [item.get('name') or item.get('id')
-                 for key in ('worn', 'backpack')
-                 for item in (artifacts.get(key) or []) if isinstance(item, dict)]
-        entry['artifact_count'] = len(names)
-        entry['artifacts'] = names[:_BRIEF_ARTIFACTS_MAX]
-    return entry
-
-
-def _stack_digest(stack: dict) -> dict:
-    entry = {'id': stack.get('id'), 'side': stack.get('side'),
-             'creature': stack.get('creature'), 'count': stack.get('count'),
-             'hex': stack.get('hex')}
-    entry.update(_optional_fields(stack, _STACK_OBS_FIELDS))
-    return entry
-
-
-def _town_digest(t: dict) -> dict:
-    entry = {'i': t['index'], 'name': t['name'], 'pos': t.get('pos'),
-             'buildables': [o['id'] for o in t.get('build_options', [])],
-             'built': len(t.get('built') or []),
-             'dwellings': t.get('dwellings'), 'garrison': t.get('garrison'),
-             'available_heroes': t.get('available_heroes')}
-    # T40/C11: canonical interaction tile (`tile`) when the client provides it.
-    tile = t.get('tile')
-    if isinstance(tile, list) and tile:
-        entry['tile'] = list(tile)[:3]
-    return entry
-
-
-def _town_brief(t: dict) -> dict:
-    """Compact per-town view for game_brief (same projection as before + optional tile)."""
-    entry = {'i': t['i'], 'name': t['name'], 'pos': t.get('pos'),
-             'buildables': t['buildables'],
-             'built': t.get('built'),
-             'dwellings': [(d.get('level'), d.get('available'))
-                           for d in t.get('dwellings') or []],
-             'garrison': sum(g['count'] for g in t.get('garrison') or []),
-             'hire': [h.get('name') for h in t.get('available_heroes') or []]}
-    tile = t.get('tile')
-    if isinstance(tile, list) and tile:
-        entry['tile'] = list(tile)[:3]
-    return entry
-
-
-def _digest(st: dict) -> dict:
-    out = {
-        'day': (st.get('date') or {}).get('day'), 'status': st.get('status'),
-        'resources': st.get('resources'), 'query': st.get('query'),
-        'battle_active': (st.get('battle') or {}).get('active'),
-        'heroes': [_hero_digest(hero) for hero in st.get('heroes') or []],
-        'towns': [_town_digest(t) for t in st.get('towns') or []],
-        'objects': [{k: o.get(k) for k in ('id', 'kind', 'type', 'name', 'pos', 'visitable',
-                                           'anchor', 'tile', 'owner', 'hover')
-                     if o.get(k) is not None}
-                    for o in st.get('objects') or []],
-        # Player-visible Info-window log (already in state.json; was previously dropped here).
-        'recent_info': _recent_info(st),
-    }
-    battle = st.get('battle') or {}
-    if battle.get('active'):
-        # A battle needs per-stack detail to choose orders; without it the player would have to
-        # call a second tool and still not see counts/hexes.  Fixed projection, no hidden data.
-        stacks = [s for s in battle.get('stacks') or [] if isinstance(s, dict)]
-        out['battle'] = {
-            'active': battle.get('active_stack'), 'my_side': battle.get('my_side'),
-            'stacks': [_stack_digest(stack) for stack in stacks],
-        }
-        # T33/P-B: round / our hero's battle mana+spellbook / casts this battle (all UI-visible).
-        out['battle'].update(_optional_fields(battle, _BATTLE_OBS_FIELDS))
-    return out
+# ---------------------------------------------------------------- observation projections
+# B0.3: the pure projection helpers live in auto_heros3.observation.digest and are re-exported
+# here for the existing call sites (game_observe/game_brief) and for the offline suites that
+# read M._digest / M._hero_digest / the projection caps.  The caps are re-exported (not copied)
+# so the folded table in the digest module stays the single source of truth.
+from auto_heros3.observation.digest import (  # noqa: E402
+    _BATTLE_OBS_FIELDS, _BRIEF_ARTIFACTS_MAX, _BRIEF_SPELLS_MAX, _HERO_ARTIFACTS_MAX,
+    _HERO_OBS_FIELDS, _HERO_SKILLS_MAX, _HERO_SPELLS_MAX, _RECENT_INFO_MAX,
+    _RECENT_INFO_TEXT_MAX, _STACK_OBS_FIELDS, _digest, _hero_brief, _hero_digest,
+    _optional_fields, _recent_info, _stack_digest, _town_brief, _town_digest, _truncate,
+)
 
 
 # --------------------------------------------------------- decision events (persisted)
@@ -2338,6 +2120,13 @@ def _action_summary(entry: dict) -> dict:
     if age is not None:
         item['age_s'] = round(age, 1)
     return item
+
+
+# Action-history caps: these belong to the ledger summaries, not to the observation digest, so
+# they stay in this module (B0.3 moved only the pure projection helpers out).
+_ACTION_TAIL_MAX = 5
+_ACTION_EVIDENCE_MAX = 200
+_ACTION_ARGS_MAX = 200
 
 
 def _recent_actions(limit: int = _ACTION_TAIL_MAX) -> list:

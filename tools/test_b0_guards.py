@@ -32,15 +32,21 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import paths_check  # noqa: E402  (tools/paths_check.py -> module alias of auto_heros3.paths)
 import mcp_server_v2 as mcp_entry  # noqa: E402  (tools/mcp_server_v2.py -> alias of the impl)
+import fog_path as fog_entry  # noqa: E402  (tools/fog_path.py -> alias of the impl)
 
 from auto_heros3 import paths as paths_impl  # noqa: E402
 from auto_heros3.mcp import server as server_impl  # noqa: E402
+from auto_heros3.domain import action_specs as action_specs_impl  # noqa: E402
+from auto_heros3.exploration import fog_path as fog_impl  # noqa: E402
+from auto_heros3.observation import digest as digest_impl  # noqa: E402
 
 BASELINE_FILE = ROOT / "tools" / "tool_surface_baseline.json"
 CONTRACT_FILE = ROOT / "tools" / "bridge_contract.json"
 FORMAL_LEDGER = ROOT / "var" / "agent_mcp_v2" / "actions.jsonl"
 SERVER = ROOT / "tools" / "mcp_server_v2.py"
 SERVER_IMPL = ROOT / "src" / "auto_heros3" / "mcp" / "server.py"
+FOG_ENTRY = ROOT / "tools" / "fog_path.py"
+FOG_IMPL = ROOT / "src" / "auto_heros3" / "exploration" / "fog_path.py"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -153,6 +159,22 @@ def main() -> int:
     impl_size = SERVER_IMPL.stat().st_size if SERVER_IMPL.exists() else 0
     check("B0-M3 the historical entry is a thin shim and the implementation is the large file",
           entry_size < 5_000 and impl_size > 200_000, f"entry={entry_size} impl={impl_size}")
+    check("B0-M4 tools/fog_path.py is a module alias of auto_heros3.exploration.fog_path",
+          fog_entry is fog_impl, f"{fog_entry.__name__} != {fog_impl.__name__}")
+    fog_entry_size = FOG_ENTRY.stat().st_size if FOG_ENTRY.exists() else 0
+    fog_impl_size = FOG_IMPL.stat().st_size if FOG_IMPL.exists() else 0
+    check("B0-M5 the fog_path entry is a thin shim and the implementation is the large file",
+          fog_entry_size < 5_000 and fog_impl_size > 10_000,
+          f"entry={fog_entry_size} impl={fog_impl_size}")
+    # B0.3 pure-module extraction contract: the server must expose the very same objects the
+    # new modules define (call sites and the offline suites rely on these identities).
+    check("B0-M6 the server action table is the auto_heros3.domain.action_specs object",
+          mcp_entry.ACTION_SPECS is action_specs_impl.ACTION_SPECS
+          and mcp_entry.ACTIONS is action_specs_impl.ACTIONS)
+    check("B0-M7 the server digest helpers are the auto_heros3.observation.digest objects",
+          mcp_entry._digest is digest_impl._digest
+          and mcp_entry._hero_digest is digest_impl._hero_digest
+          and mcp_entry._truncate is digest_impl._truncate)
 
     # ---------------------------------------------------------------- C: engine contract
     try:

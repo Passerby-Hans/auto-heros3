@@ -47,6 +47,9 @@ ROOT_MARKERS = (
     "src/auto_heros3/__init__.py",
     "src/auto_heros3/paths.py",
     "src/auto_heros3/mcp/server.py",
+    "src/auto_heros3/domain/action_specs.py",
+    "src/auto_heros3/observation/digest.py",
+    "src/auto_heros3/exploration/fog_path.py",
 )
 
 # Every path the runtime resolves from ROOT.  ``tracked=True`` means it must exist in a
@@ -64,6 +67,9 @@ KEY_PATHS = {
     "src_pkg": ("src/auto_heros3", True),
     "paths_module": ("src/auto_heros3/paths.py", True),
     "mcp_server_impl": ("src/auto_heros3/mcp/server.py", True),
+    "action_specs": ("src/auto_heros3/domain/action_specs.py", True),
+    "digest_module": ("src/auto_heros3/observation/digest.py", True),
+    "fog_path_impl": ("src/auto_heros3/exploration/fog_path.py", True),
     "agent_pkg": ("agent", True),
     "agent_h3": ("agent/h3", True),
     "knowledge_module": ("agent/knowledge/manual.py", True),

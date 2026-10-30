@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""B0.1 unified OFFLINE test entry - explicit whitelist, never a glob.
+"""Unified OFFLINE test entry - explicit whitelist, never a glob.
 
-Why: the repository has 32 ``test_*.py`` files, of which 7 are LIVE tests (they start the
-real VCMI client and/or would write outside temporary directories).  Globbing all of them
-must never be the default.  This runner executes exactly the suites listed in
-``OFFLINE_SUITES`` (each one is a plain script that prints ``N/N checks passed`` and exits
-non-zero on failure), and only *reports* the live suites it skipped.
+Why: the suites live under ``tests/offline`` (26 deterministic suites) and ``tests/live``
+(7 LIVE tests that start the real VCMI client and/or would write outside temporary
+directories).  Globbing all of them must never be the default.  This runner executes exactly
+the suites listed in ``OFFLINE_SUITES`` (each one is a plain script that prints
+``N/N checks passed`` and exits non-zero on failure), and only *reports* the live suites it
+skipped.  ``tools/test_*.py`` are compatibility shims for the historical commands.
 
-Adding a new offline suite is a two-line change: create the ``test_*.py`` file and append
-its name to ``OFFLINE_SUITES``.  The runner warns when an unlisted ``test_*.py`` shows up,
-so a new test cannot silently escape validation.
+B0.5 layout: canonical suites are ``tests/offline/<name>`` / ``tests/live/<name>``; the
+runner resolves them there.  Adding a new offline suite is a two-line change: create the
+file under ``tests/offline`` and append its name to ``OFFLINE_SUITES``.  The runner warns
+when an unlisted ``test_*.py`` shows up, so a new test cannot silently escape validation.
 
 Usage
 -----
@@ -33,6 +35,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
+OFFLINE_DIR = ROOT / "tests" / "offline"
+LIVE_DIR = ROOT / "tests" / "live"
 
 # Explicit whitelist.  Order mirrors the historical offline-full.log for easy diffing.
 OFFLINE_SUITES: tuple[str, ...] = (
@@ -107,7 +111,7 @@ def parse_result(stdout: str) -> tuple[int, int] | None:
 
 
 def run_suite(name: str, timeout: float) -> dict:
-    path = TOOLS / name
+    path = OFFLINE_DIR / name
     started = time.time()
     record = {"suite": name, "path": str(path), "exit": None, "passed": None,
               "total": None, "seconds": 0.0, "output_tail": "",
@@ -205,9 +209,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"==== TOTAL {total_passed}/{total_checks} checks; suites={len(suites)} failed={failed}")
     if not a.suite:
-        present = {p.name for p in TOOLS.glob("test_*.py")}
-        unlisted = sorted(present - set(OFFLINE_SUITES) - set(LIVE_SUITES))
-        skipped_live = sorted(present & set(LIVE_SUITES))
+        present = {p.name for p in OFFLINE_DIR.glob("test_*.py")}
+        unlisted = sorted(present - set(OFFLINE_SUITES))
+        live_present = {p.name for p in LIVE_DIR.glob("test_*.py")}
+        skipped_live = sorted(live_present & set(LIVE_SUITES))
         if skipped_live:
             print(f"skipped live suites ({len(skipped_live)}): {', '.join(skipped_live)}")
         if unlisted:

@@ -274,14 +274,16 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
 ```text
 platform/vcmi-patch/            唯一补丁源（AgentBridge C++ + apply.py）
 platform/memory_templates/      LLM 玩家记忆模板（PLAYER / CURRENT / long_term）
-tools/mcp_server_v2.py          标准 MCP server（stdio，官方 Python SDK v2）
-tools/vcmi_agent.py             客户端生命周期 + 桥协议 v2（seq、状态新鲜度、所有权、租约）
+src/auto_heros3/                实现包（MCP server、runtime context、recorder、投影、动作表、探索）
+tools/mcp_server_v2.py          MCP 入口兼容壳（module alias → src/auto_heros3/mcp/server.py）
+tools/vcmi_agent.py             客户端驱动兼容壳（→ src/auto_heros3/runtime/vcmi_agent.py）
 tools/vcmi_build.ps1            MSVC + Ninja + Conan 构建脚本
-tools/vcmi_overlay_recorder.py  离屏录屏（16:9 画面 + 思考面板，ffmpeg 编码）
-tools/fog_path.py               黑幕边界 BFS 探索器（`explore_toward` 的核心算法）
+tools/vcmi_overlay_recorder.py  离屏录屏兼容壳（→ src/auto_heros3/recording/overlay_recorder.py）
+tools/fog_path.py               黑幕边界 BFS 探索器兼容壳（→ src/auto_heros3/exploration/fog_path.py）
 tools/fog_path_live.py          实机黑幕探索演示 CLI
 tools/fog_battle.py             战斗机械执行器（演示/诊断用；正式对局由 LLM 决策）
-tools/test_*.py                 离线回归与隔离 live 测试套件
+tests/offline/                  离线回归套件（26 套，统一入口 tools/run_offline_suite.py）
+tests/live/                     隔离 live 套件（7 套；tools/test_*.py 保留兼容入口）
 tools/bridge_contract.json      锁定客户端 sha256 / protocol / 冻结行为
 agent/h3/                       Track A 零售版逆向（历史保留，当前主轨不使用）
 var/                            运行期状态、证据、录像（部分目录不入 git）
@@ -292,15 +294,17 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 
 - MCP 自检：`.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   （打印能力清单并做一次租约 acquire/release；不会启动游戏）。
-- 离线回归：`tools/test_*.py` 中的离线套件共 **25 套 / 744 项断言**，直接运行即可，输出
-  `N/N checks passed` 且退出码 0 表示通过（2026-10-29 复核 **744/744 PASS**）：
+- 离线回归：`tests/offline/` 共 **26 套 / 819 项断言**，统一入口一次跑完（显式白名单，7 个 live
+  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-10-30 复核 **819/819 PASS**）：
 
   ```powershell
-  .\.venv\Scripts\python.exe -X utf8 tools\test_fog_path.py
-  .\.venv\Scripts\python.exe -X utf8 tools\test_t40_bridge_contract.py
+  .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
+  .\.venv\Scripts\python.exe -X utf8 tests\offline\test_fog_path.py
   ```
 
-- 隔离 live 套件（`test_*_live_*.py`）会启动离屏客户端做真实链路验证，一次只跑一个，
+  历史入口 `tools/test_*.py` 保留为兼容壳（转发到 `tests/{offline,live}/`）。
+
+- 隔离 live 套件（`tests/live/test_*_live_*.py`）会启动离屏客户端做真实链路验证，一次只跑一个，
   结束后必须停止客户端。
 
 ### 状态与路线图
@@ -656,14 +660,16 @@ In your MCP client:
 ```text
 platform/vcmi-patch/            single patch source (AgentBridge C++ + apply.py)
 platform/memory_templates/      LLM player memory templates (PLAYER / CURRENT / long_term)
-tools/mcp_server_v2.py          standard MCP server (stdio, official Python SDK v2)
-tools/vcmi_agent.py             client lifecycle + bridge protocol v2 (seq, freshness, ownership, lease)
+src/auto_heros3/                implementation package (MCP server, runtime context, recorder, projections, action table, exploration)
+tools/mcp_server_v2.py          MCP entry compatibility shim (module alias → src/auto_heros3/mcp/server.py)
+tools/vcmi_agent.py             client driver compatibility shim (→ src/auto_heros3/runtime/vcmi_agent.py)
 tools/vcmi_build.ps1            MSVC + Ninja + Conan build script
-tools/vcmi_overlay_recorder.py  off-screen recorder (16:9 frame + reasoning panel, ffmpeg encoded)
-tools/fog_path.py               shroud-border BFS explorer (core of `explore_toward`)
+tools/vcmi_overlay_recorder.py  off-screen recorder compatibility shim (→ src/auto_heros3/recording/overlay_recorder.py)
+tools/fog_path.py               shroud-border BFS explorer compatibility shim (→ src/auto_heros3/exploration/fog_path.py)
 tools/fog_path_live.py          live shroud-exploration demo CLI
 tools/fog_battle.py             mechanical battle executor (demo/diagnostics; real games are LLM-decided)
-tools/test_*.py                 offline regression and isolated live test suites
+tests/offline/                  offline regression suites (26; unified entry tools/run_offline_suite.py)
+tests/live/                     isolated live suites (7; tools/test_*.py kept as compatibility entries)
 tools/bridge_contract.json      pinned client sha256 / protocol / frozen behaviour
 agent/h3/                       Track A retail-binary reverse engineering (kept for reference; unused by the main track)
 var/                            runtime state, evidence, recordings (parts excluded from git)
@@ -674,15 +680,19 @@ doc/                            engineering docs / handover / log (kept locally,
 
 - MCP self-test: `.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   (prints the capability list and does one lease acquire/release; it does not start the game).
-- Offline regression: **25 suites / 744 assertions** under `tools/test_*.py`; run any file directly —
-  it prints `N/N checks passed` and exits 0 on success (re-checked 2026-10-29: **744/744 PASS**):
+- Offline regression: **26 suites / 819 assertions** under `tests/offline/`, run through the explicit
+  whitelist entry (7 live suites are skipped by default); it prints `N/N checks passed` and exits 0 on
+  success (re-checked 2026-10-30: **819/819 PASS**):
 
   ```powershell
-  .\.venv\Scripts\python.exe -X utf8 tools\test_fog_path.py
-  .\.venv\Scripts\python.exe -X utf8 tools\test_t40_bridge_contract.py
+  .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
+  .\.venv\Scripts\python.exe -X utf8 tests\offline\test_fog_path.py
   ```
 
-- Isolated live suites (`test_*_live_*.py`) start the off-screen client for real end-to-end checks; run one
+  The historical `tools/test_*.py` entries remain as compatibility shims forwarding to
+  `tests/{offline,live}/`.
+
+- Isolated live suites (`tests/live/test_*_live_*.py`) start the off-screen client for real end-to-end checks; run one
   at a time and always stop the client afterwards.
 
 ### Status and roadmap

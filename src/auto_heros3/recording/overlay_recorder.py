@@ -49,9 +49,9 @@ for _candidate in (_HERE, *_HERE.parents):
         break
 else:  # pragma: no cover - a broken checkout must fail loudly, never guess a directory
     raise RuntimeError(f'cannot locate the auto-heros3 repository root above {_HERE}')
-sys.path.insert(0, str(_REPO))
-sys.path.insert(0, str(_REPO / 'tools'))
-sys.path.insert(0, str(_REPO / 'src'))
+for _path in (str(_REPO), str(_REPO / 'tools'), str(_REPO / 'src')):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from auto_heros3.paths import repo_root  # noqa: E402
 

@@ -175,7 +175,7 @@ def test_move_verifier_xyz() -> None:
 def test_source_guards() -> None:
     bridge = (ROOT / 'platform' / 'vcmi-patch' / 'client' / 'AgentBridge.cpp').read_text(
         encoding='utf-8')
-    server = (ROOT / 'tools' / 'mcp_server_v2.py').read_text(encoding='utf-8')
+    server = (ROOT / 'src' / 'auto_heros3' / 'mcp' / 'server.py').read_text(encoding='utf-8')
     agent = (ROOT / 'tools' / 'vcmi_agent.py').read_text(encoding='utf-8')
     check('W4-5a probe reply carries turns/cost/len/teleport/embark',
           '" turns="' in bridge and '" cost="' in bridge and '" teleport="' in bridge

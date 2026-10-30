@@ -235,7 +235,7 @@ def test_battle_round_record() -> None:
                       for entry in entries) is False,
               'summary entry present (per-order entries are written by battle_round itself)')
         # source guard: the live loop logs each order before appending it to the record
-        source = (ROOT / 'tools' / 'mcp_server_v2.py').read_text(encoding='utf-8')
+        source = (ROOT / 'src' / 'auto_heros3' / 'mcp' / 'server.py').read_text(encoding='utf-8')
         check('R7c battle_round logs each order with its round_id',
               "'action': 'battle_attack'," in source and "'round_id': round_guard}" in source,
               'order ledger')
@@ -273,7 +273,7 @@ def test_recording_lock_and_identity() -> None:
               status.get('run_id') == identity.get('run_id')
               and status.get('matches_current_run') is True,
               str({k: status.get(k) for k in ('run_id', 'branch_id', 'matches_current_run')}))
-        source = (ROOT / 'tools' / 'mcp_server_v2.py').read_text(encoding='utf-8')
+        source = (ROOT / 'src' / 'auto_heros3' / 'mcp' / 'server.py').read_text(encoding='utf-8')
         check('R9f recording_start writes the identity and uses an exclusive lock',
               "'identity': identity" in source and 'O_CREAT | os.O_EXCL' in source
               and '_release_recording_lock()' in source, 'recording identity')

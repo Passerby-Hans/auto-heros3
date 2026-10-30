@@ -365,7 +365,7 @@ def test_query_blocks_and_auto_answer_continues() -> None:
 
 def test_mcp_tool_source_guard() -> None:
     """The MCP tool must exist, reuse fog_path, and go through the honest action path."""
-    src = (ROOT / 'tools' / 'mcp_server_v2.py').read_text(encoding='utf-8')
+    src = (ROOT / 'src' / 'auto_heros3' / 'mcp' / 'server.py').read_text(encoding='utf-8')
     check('mcp: explore_toward tool defined', 'def explore_toward(' in src)
     check('mcp: explore_toward is a serialized mutation',
           "@_serialized_mutation('explore_toward')" in src)

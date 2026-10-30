@@ -30,12 +30,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-import paths_check  # noqa: E402
+import paths_check  # noqa: E402  (tools/paths_check.py -> module alias of auto_heros3.paths)
+import mcp_server_v2 as mcp_entry  # noqa: E402  (tools/mcp_server_v2.py -> alias of the impl)
+
+from auto_heros3 import paths as paths_impl  # noqa: E402
+from auto_heros3.mcp import server as server_impl  # noqa: E402
 
 BASELINE_FILE = ROOT / "tools" / "tool_surface_baseline.json"
 CONTRACT_FILE = ROOT / "tools" / "bridge_contract.json"
 FORMAL_LEDGER = ROOT / "var" / "agent_mcp_v2" / "actions.jsonl"
 SERVER = ROOT / "tools" / "mcp_server_v2.py"
+SERVER_IMPL = ROOT / "src" / "auto_heros3" / "mcp" / "server.py"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -129,6 +134,25 @@ def main() -> int:
     check("B0-P3 every tracked runtime path exists", not missing, missing)
     escaping = sorted(k for k, v in report["paths"].items() if not v["inside_root"])
     check("B0-P4 every resolved runtime path stays inside the repo", not escaping, escaping)
+
+    # ---------------------------------------------------------------- M: module-alias shims
+    # B0.2 moved the implementation into src/ and kept the historical entry paths as shims.
+    # These checks pin the contract that matters for the offline suites and the DSH entry:
+    # importing the historical module name must yield the very same module object.
+    check("B0-P5 tools/paths_check.py is a module alias of auto_heros3.paths",
+          paths_check is paths_impl, f"{paths_check.__name__} != {paths_impl.__name__}")
+    check("B0-M1 tools/mcp_server_v2.py is a module alias of auto_heros3.mcp.server",
+          mcp_entry is server_impl, f"{mcp_entry.__name__} != {server_impl.__name__}")
+    try:
+        impl_file = Path(mcp_entry.__file__).resolve()
+    except (OSError, TypeError):  # pragma: no cover - only when the import failed
+        impl_file = None
+    check("B0-M2 the imported MCP entry resolves to src/auto_heros3/mcp/server.py",
+          impl_file == SERVER_IMPL.resolve(), impl_file)
+    entry_size = SERVER.stat().st_size if SERVER.exists() else 0
+    impl_size = SERVER_IMPL.stat().st_size if SERVER_IMPL.exists() else 0
+    check("B0-M3 the historical entry is a thin shim and the implementation is the large file",
+          entry_size < 5_000 and impl_size > 200_000, f"entry={entry_size} impl={impl_size}")
 
     # ---------------------------------------------------------------- C: engine contract
     try:

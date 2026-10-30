@@ -387,7 +387,7 @@ class ShotAgent:
 
 
 def test_screenshot_default_path() -> None:
-    source = (ROOT / 'tools' / 'mcp_server_v2.py').read_text(encoding='utf-8')
+    source = (ROOT / 'src' / 'auto_heros3' / 'mcp' / 'server.py').read_text(encoding='utf-8')
     check('5D2-1 the tracked mcp_v2.png is no longer the implicit screenshot target',
           "ROOT / 'var' / 'shots' / 'mcp_v2.png'" not in source
           and "ROOT / 'var' / 'shots' / 'current.png'" in source, 'source default')

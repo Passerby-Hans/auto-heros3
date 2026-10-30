@@ -169,7 +169,7 @@ def test_transfer_visiting_tiles() -> None:
 
 
 def test_source_guards() -> None:
-    source = (ROOT / 'tools' / 'mcp_server_v2.py').read_text(encoding='utf-8')
+    source = (ROOT / 'src' / 'auto_heros3' / 'mcp' / 'server.py').read_text(encoding='utf-8')
     check('SG-3a recruit_hero has a verifier and a slow verification window',
           "'recruit_hero'" in source and 'def _hero_names' in source
           and 'new hero observed' in source, 'verifier')

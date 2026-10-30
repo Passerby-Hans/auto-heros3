@@ -1,0 +1,75 @@
+# auto-heros3 — dependency and environment definition (B0.1 refactor baseline).
+#
+# The versions below are the EXACT versions this project's .venv was validated with
+# (2026-10-30: 25 offline suites / 744 checks). A refactor batch must not change runtime
+# dependency versions; update this file deliberately and re-validate.
+# uv.lock is the resolved full graph and is meant to be committed.
+#
+# Install / verify (never sync the live .venv while the MCP server is in use):
+#   uv sync --frozen --python .venv\Scripts\python.exe
+#   .venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
+[project]
+name = "auto-heros3"
+version = "0.0.0"
+description = "LLM agent that plays Heroes of Might and Magic III on VCMI (MCP server + engine bridge)"
+requires-python = ">=3.14,<3.15"
+license = "GPL-2.0-or-later"
+dependencies = [
+    "annotated-types==0.8.0",
+    "anyio==4.15.1",
+    "attrs==26.1.0",
+    "capstone==5.0.9",
+    "cffi==2.1.1",
+    "click==8.5.0",
+    "colorama==0.4.6",
+    "comtypes==1.4.17",
+    "cryptography==50.0.2",
+    "flatbuffers==25.12.19",
+    "h11==0.16.0",
+    "httpcore2==2.16.0",
+    "httpx2==2.16.0",
+    "idna==3.20",
+    "jsonschema==4.26.0",
+    "jsonschema-specifications==2025.9.1",
+    "mcp==2.3.0",
+    "mcp-types==2.3.0",
+    "mss==10.2.0",
+    "numpy==2.5.4",
+    "onnxruntime==1.31.0",
+    "opencv-python==5.0.0.93",
+    "opencv-python-headless==5.0.0.93",
+    "opentelemetry-api==1.45.1",
+    "packaging==26.3",
+    "pefile==2024.8.26",
+    "pillow==13.0.0",
+    "protobuf==7.36.2",
+    "psutil==7.2.2",
+    "pycaw==20260927",
+    "pyclipper==1.4.0",
+    "pycparser==3.12",
+    "pydantic==2.14.1",
+    "pydantic-core==2.50.1",
+    "pyjwt==2.15.1",
+    "pypdf==6.21.1",
+    "python-multipart==0.0.32",
+    "pywin32==312",
+    "pyyaml==6.0.3",
+    "rapidocr-onnxruntime==1.4.4",
+    "referencing==0.37.0",
+    "rpds-py==2026.9.1",
+    "shapely==2.2.0",
+    "six==1.17.0",
+    "sse-starlette==3.5.0",
+    "starlette==1.9.0",
+    "tqdm==4.70.1",
+    "truststore==0.10.5",
+    "typing-extensions==4.16.0",
+    "typing-inspection==0.4.4",
+    "uvicorn==0.54.0",
+    "winsdk==1.0.0b10",
+]
+
+[tool.uv]
+# Not installed as a package: tools/ and agent/ are imported from the working tree and the
+# DSH MCP registration launches tools/mcp_server_v2.py directly with .venv\Scripts\python.exe.
+package = false

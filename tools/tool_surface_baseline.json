@@ -1,0 +1,827 @@
+{
+ "schema_version": 1,
+ "note": "B0.1 guard: MCP tool surface the LLM client depends on. A refactor batch must keep the tool name set and every input schema identical; adding or changing a tool is an explicit interface change that requires updating this baseline deliberately.",
+ "source": "tools/mcp_server_v2.py @ master/a75dc77 (2026-10-30, mcp SDK 2.3.0)",
+ "tool_count": 33,
+ "tools": [
+  {
+   "name": "army_info",
+   "input_schema": {
+    "properties": {
+     "owner": {
+      "default": "hero",
+      "title": "Owner",
+      "type": "string"
+     },
+     "index": {
+      "default": 0,
+      "title": "Index",
+      "type": "integer"
+     }
+    },
+    "type": "object",
+    "title": "army_infoArguments"
+   }
+  },
+  {
+   "name": "battle_actions",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "battle_actionsArguments"
+   }
+  },
+  {
+   "name": "battle_assess",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "battle_assessArguments"
+   }
+  },
+  {
+   "name": "battle_round",
+   "input_schema": {
+    "properties": {
+     "target": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Target"
+     },
+     "allow_auto_answer": {
+      "default": false,
+      "title": "Allow Auto Answer",
+      "type": "boolean"
+     },
+     "allow_auto_enter": {
+      "default": false,
+      "title": "Allow Auto Enter",
+      "type": "boolean"
+     },
+     "allow_retarget": {
+      "default": false,
+      "title": "Allow Retarget",
+      "type": "boolean"
+     }
+    },
+    "type": "object",
+    "title": "battle_roundArguments"
+   }
+  },
+  {
+   "name": "battle_start",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "battle_startArguments"
+   }
+  },
+  {
+   "name": "debug_resources",
+   "input_schema": {
+    "properties": {
+     "amounts": {
+      "additionalProperties": true,
+      "title": "Amounts",
+      "type": "object"
+     }
+    },
+    "required": [
+     "amounts"
+    ],
+    "type": "object",
+    "title": "debug_resourcesArguments"
+   }
+  },
+  {
+   "name": "explore_toward",
+   "input_schema": {
+    "properties": {
+     "hero": {
+      "title": "Hero",
+      "type": "integer"
+     },
+     "x": {
+      "title": "X",
+      "type": "integer"
+     },
+     "y": {
+      "title": "Y",
+      "type": "integer"
+     },
+     "z": {
+      "default": 0,
+      "title": "Z",
+      "type": "integer"
+     },
+     "max_steps": {
+      "default": 8,
+      "title": "Max Steps",
+      "type": "integer"
+     },
+     "max_turns": {
+      "default": 0,
+      "title": "Max Turns",
+      "type": "integer"
+     },
+     "map_w": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Map W"
+     },
+     "map_h": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Map H"
+     }
+    },
+    "required": [
+     "hero",
+     "x",
+     "y"
+    ],
+    "type": "object",
+    "title": "explore_towardArguments"
+   }
+  },
+  {
+   "name": "game_act",
+   "input_schema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "args": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Args"
+     },
+     "request_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Request Id"
+     },
+     "thought": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Thought"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "type": "object",
+    "title": "game_actArguments"
+   }
+  },
+  {
+   "name": "game_action_status",
+   "input_schema": {
+    "properties": {
+     "action_id": {
+      "title": "Action Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "action_id"
+    ],
+    "type": "object",
+    "title": "game_action_statusArguments"
+   }
+  },
+  {
+   "name": "game_brief",
+   "input_schema": {
+    "properties": {
+     "hero": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Hero"
+     },
+     "radius": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Radius"
+     },
+     "limit": {
+      "default": 16,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "kinds": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Kinds"
+     }
+    },
+    "type": "object",
+    "title": "game_briefArguments"
+   }
+  },
+  {
+   "name": "game_events",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "game_eventsArguments"
+   }
+  },
+  {
+   "name": "game_note",
+   "input_schema": {
+    "properties": {
+     "text": {
+      "title": "Text",
+      "type": "string"
+     },
+     "kind": {
+      "default": "thought",
+      "title": "Kind",
+      "type": "string"
+     }
+    },
+    "required": [
+     "text"
+    ],
+    "type": "object",
+    "title": "game_noteArguments"
+   }
+  },
+  {
+   "name": "game_observe",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "game_observeArguments"
+   }
+  },
+  {
+   "name": "game_reconcile",
+   "input_schema": {
+    "properties": {
+     "request_id": {
+      "title": "Request Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "request_id"
+    ],
+    "type": "object",
+    "title": "game_reconcileArguments"
+   }
+  },
+  {
+   "name": "game_screenshot",
+   "input_schema": {
+    "properties": {
+     "path": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Path"
+     }
+    },
+    "type": "object",
+    "title": "game_screenshotArguments"
+   }
+  },
+  {
+   "name": "game_status",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "game_statusArguments"
+   }
+  },
+  {
+   "name": "lease_acquire",
+   "input_schema": {
+    "properties": {
+     "force": {
+      "default": false,
+      "title": "Force",
+      "type": "boolean"
+     },
+     "reason": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Reason"
+     }
+    },
+    "type": "object",
+    "title": "lease_acquireArguments"
+   }
+  },
+  {
+   "name": "lease_release",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "lease_releaseArguments"
+   }
+  },
+  {
+   "name": "list_saves",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "list_savesArguments"
+   }
+  },
+  {
+   "name": "load_game",
+   "input_schema": {
+    "properties": {
+     "name": {
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "type": "object",
+    "title": "load_gameArguments"
+   }
+  },
+  {
+   "name": "memory_read",
+   "input_schema": {
+    "properties": {
+     "scope": {
+      "title": "Scope",
+      "type": "string"
+     },
+     "key": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Key"
+     }
+    },
+    "required": [
+     "scope"
+    ],
+    "type": "object",
+    "title": "memory_readArguments"
+   }
+  },
+  {
+   "name": "memory_write",
+   "input_schema": {
+    "properties": {
+     "scope": {
+      "title": "Scope",
+      "type": "string"
+     },
+     "key": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Key"
+     },
+     "body": {
+      "title": "Body",
+      "type": "string"
+     },
+     "expected_revision": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Revision"
+     },
+     "sources": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Sources"
+     },
+     "observed_day": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Observed Day"
+     }
+    },
+    "required": [
+     "scope",
+     "key",
+     "body"
+    ],
+    "type": "object",
+    "title": "memory_writeArguments"
+   }
+  },
+  {
+   "name": "move_near",
+   "input_schema": {
+    "properties": {
+     "hero": {
+      "title": "Hero",
+      "type": "integer"
+     },
+     "x": {
+      "title": "X",
+      "type": "integer"
+     },
+     "y": {
+      "title": "Y",
+      "type": "integer"
+     },
+     "z": {
+      "default": 0,
+      "title": "Z",
+      "type": "integer"
+     },
+     "radius": {
+      "default": 1,
+      "title": "Radius",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "hero",
+     "x",
+     "y"
+    ],
+    "type": "object",
+    "title": "move_nearArguments"
+   }
+  },
+  {
+   "name": "path_preview",
+   "input_schema": {
+    "properties": {
+     "hero": {
+      "title": "Hero",
+      "type": "integer"
+     },
+     "x": {
+      "title": "X",
+      "type": "integer"
+     },
+     "y": {
+      "title": "Y",
+      "type": "integer"
+     },
+     "z": {
+      "default": 0,
+      "title": "Z",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "hero",
+     "x",
+     "y"
+    ],
+    "type": "object",
+    "title": "path_previewArguments"
+   }
+  },
+  {
+   "name": "recording_start",
+   "input_schema": {
+    "properties": {
+     "fps": {
+      "default": 60,
+      "title": "Fps",
+      "type": "integer"
+     },
+     "height": {
+      "default": 768,
+      "title": "Height",
+      "type": "integer"
+     },
+     "crf": {
+      "default": 10,
+      "title": "Crf",
+      "type": "integer"
+     }
+    },
+    "type": "object",
+    "title": "recording_startArguments"
+   }
+  },
+  {
+   "name": "recording_status",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "recording_statusArguments"
+   }
+  },
+  {
+   "name": "recording_stop",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "recording_stopArguments"
+   }
+  },
+  {
+   "name": "resolve_unresolved",
+   "input_schema": {
+    "properties": {
+     "action_id": {
+      "title": "Action Id",
+      "type": "string"
+     },
+     "observed": {
+      "title": "Observed",
+      "type": "string"
+     }
+    },
+    "required": [
+     "action_id",
+     "observed"
+    ],
+    "type": "object",
+    "title": "resolve_unresolvedArguments"
+   }
+  },
+  {
+   "name": "save_game",
+   "input_schema": {
+    "properties": {
+     "name": {
+      "title": "Name",
+      "type": "string"
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "type": "object",
+    "title": "save_gameArguments"
+   }
+  },
+  {
+   "name": "session_start",
+   "input_schema": {
+    "properties": {
+     "map_name": {
+      "default": "Maps/Arrogance",
+      "title": "Map Name",
+      "type": "string"
+     },
+     "difficulty": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Difficulty"
+     },
+     "player_color": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Player Color"
+     },
+     "starting_town": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Starting Town"
+     },
+     "starting_hero": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Starting Hero"
+     },
+     "starting_bonus": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Starting Bonus"
+     },
+     "turn_time_seconds": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Turn Time Seconds"
+     },
+     "battle_time_seconds": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Battle Time Seconds"
+     },
+     "unit_time_seconds": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Unit Time Seconds"
+     }
+    },
+    "type": "object",
+    "title": "session_startArguments"
+   }
+  },
+  {
+   "name": "session_stop",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "session_stopArguments"
+   }
+  },
+  {
+   "name": "town_info",
+   "input_schema": {
+    "properties": {
+     "town": {
+      "default": 0,
+      "title": "Town",
+      "type": "integer"
+     }
+    },
+    "type": "object",
+    "title": "town_infoArguments"
+   }
+  },
+  {
+   "name": "ui_tree",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "ui_treeArguments"
+   }
+  }
+ ]
+}

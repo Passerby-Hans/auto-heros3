@@ -33,12 +33,16 @@ sys.path.insert(0, str(ROOT / "tools"))
 import paths_check  # noqa: E402  (tools/paths_check.py -> module alias of auto_heros3.paths)
 import mcp_server_v2 as mcp_entry  # noqa: E402  (tools/mcp_server_v2.py -> alias of the impl)
 import fog_path as fog_entry  # noqa: E402  (tools/fog_path.py -> alias of the impl)
+import vcmi_agent as agent_entry  # noqa: E402  (tools/vcmi_agent.py -> alias of the impl)
+import vcmi_shot as shot_entry  # noqa: E402  (tools/vcmi_shot.py -> alias of the impl)
 
 from auto_heros3 import paths as paths_impl  # noqa: E402
 from auto_heros3.mcp import server as server_impl  # noqa: E402
 from auto_heros3.domain import action_specs as action_specs_impl  # noqa: E402
 from auto_heros3.exploration import fog_path as fog_impl  # noqa: E402
 from auto_heros3.observation import digest as digest_impl  # noqa: E402
+from auto_heros3.runtime import vcmi_agent as agent_impl  # noqa: E402
+from auto_heros3.runtime import vcmi_shot as shot_impl  # noqa: E402
 
 BASELINE_FILE = ROOT / "tools" / "tool_surface_baseline.json"
 CONTRACT_FILE = ROOT / "tools" / "bridge_contract.json"
@@ -47,6 +51,8 @@ SERVER = ROOT / "tools" / "mcp_server_v2.py"
 SERVER_IMPL = ROOT / "src" / "auto_heros3" / "mcp" / "server.py"
 FOG_ENTRY = ROOT / "tools" / "fog_path.py"
 FOG_IMPL = ROOT / "src" / "auto_heros3" / "exploration" / "fog_path.py"
+AGENT_ENTRY = ROOT / "tools" / "vcmi_agent.py"
+AGENT_IMPL = ROOT / "src" / "auto_heros3" / "runtime" / "vcmi_agent.py"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -175,6 +181,22 @@ def main() -> int:
           mcp_entry._digest is digest_impl._digest
           and mcp_entry._hero_digest is digest_impl._hero_digest
           and mcp_entry._truncate is digest_impl._truncate)
+    # B0.4 runtime-module alias contract (vcmi_agent / vcmi_shot).
+    check("B0-M8 tools/vcmi_agent.py is a module alias of auto_heros3.runtime.vcmi_agent",
+          agent_entry is agent_impl, f"{agent_entry.__name__} != {agent_impl.__name__}")
+    check("B0-M9 tools/vcmi_shot.py is a module alias of auto_heros3.runtime.vcmi_shot",
+          shot_entry is shot_impl, f"{shot_entry.__name__} != {shot_impl.__name__}")
+    agent_entry_size = AGENT_ENTRY.stat().st_size if AGENT_ENTRY.exists() else 0
+    agent_impl_size = AGENT_IMPL.stat().st_size if AGENT_IMPL.exists() else 0
+    check("B0-M10 the vcmi_agent entry is a thin shim and the implementation is the large file",
+          agent_entry_size < 5_000 and agent_impl_size > 20_000,
+          f"entry={agent_entry_size} impl={agent_impl_size}")
+    try:
+        agent_file = Path(agent_entry.__file__).resolve()
+    except (OSError, TypeError):  # pragma: no cover
+        agent_file = None
+    check("B0-M11 the imported driver resolves to src/auto_heros3/runtime/vcmi_agent.py",
+          agent_file == AGENT_IMPL.resolve(), agent_file)
 
     # ---------------------------------------------------------------- C: engine contract
     try:

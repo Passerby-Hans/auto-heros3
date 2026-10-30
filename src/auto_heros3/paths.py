@@ -50,6 +50,8 @@ ROOT_MARKERS = (
     "src/auto_heros3/domain/action_specs.py",
     "src/auto_heros3/observation/digest.py",
     "src/auto_heros3/exploration/fog_path.py",
+    "src/auto_heros3/runtime/vcmi_agent.py",
+    "src/auto_heros3/runtime/vcmi_shot.py",
 )
 
 # Every path the runtime resolves from ROOT.  ``tracked=True`` means it must exist in a
@@ -70,6 +72,9 @@ KEY_PATHS = {
     "action_specs": ("src/auto_heros3/domain/action_specs.py", True),
     "digest_module": ("src/auto_heros3/observation/digest.py", True),
     "fog_path_impl": ("src/auto_heros3/exploration/fog_path.py", True),
+    "runtime_dir": ("src/auto_heros3/runtime", True),
+    "vcmi_agent_impl": ("src/auto_heros3/runtime/vcmi_agent.py", True),
+    "vcmi_shot_impl": ("src/auto_heros3/runtime/vcmi_shot.py", True),
     "agent_pkg": ("agent", True),
     "agent_h3": ("agent/h3", True),
     "knowledge_module": ("agent/knowledge/manual.py", True),

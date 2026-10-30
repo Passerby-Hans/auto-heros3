@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -75,6 +76,25 @@ LIVE_SUITES: tuple[str, ...] = (
     "test_t42_live_two_stage.py",
 )
 
+# Test-isolation escape hatch read by the MCP server/driver at import time.  The runner must
+# NOT let the caller's shell inject these into the suite subprocesses: a suite that replaces
+# module.ROOT with its temp fixture can still follow an inherited path override and write
+# outside its fixture.  GPT6 review P2 (2026-10-30) reproduced exactly that with
+# AUTO_HEROS3_RECORDINGS_DIR: test_recording_segment 20/20 PASS but wrote 7 fake recording
+# files into the inherited directory.  Suites that need redirects set these variables inside
+# their own subprocess (see tools/test_session_memory.py's import guard), so stripping the
+# inherited values is safe and makes the offline run deterministic.
+PROJECT_ENV_PREFIX = "AUTO_HEROS3_"
+
+
+def suite_environment() -> tuple[dict[str, str], list[str]]:
+    """Environment for one suite subprocess + the inherited project vars that were dropped."""
+    env = dict(os.environ)
+    removed = sorted(name for name in env if name.startswith(PROJECT_ENV_PREFIX))
+    for name in removed:
+        env.pop(name, None)
+    return env, removed
+
 PASSED_RE = re.compile(r"^(\d+)/(\d+) checks passed\s*$", re.MULTILINE)
 
 
@@ -90,15 +110,18 @@ def run_suite(name: str, timeout: float) -> dict:
     path = TOOLS / name
     started = time.time()
     record = {"suite": name, "path": str(path), "exit": None, "passed": None,
-              "total": None, "seconds": 0.0, "output_tail": ""}
+              "total": None, "seconds": 0.0, "output_tail": "",
+              "inherited_env_removed": []}
     if not path.is_file():
         record["output_tail"] = "suite file is missing"
         return record
+    env, removed = suite_environment()
+    record["inherited_env_removed"] = removed
     try:
         proc = subprocess.run(
             [sys.executable, "-X", "utf8", str(path)],
             cwd=str(ROOT), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+            encoding="utf-8", errors="replace", timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired as exc:
         record["exit"] = "timeout"
@@ -153,6 +176,10 @@ def main(argv: list[str] | None = None) -> int:
 
     suites = selected_suites(a.suite)
     print(f"OFFLINE SUITE {time.strftime('%Y-%m-%d %H:%M:%S')}  suites={len(suites)}")
+    inherited_dropped = sorted({name for name in os.environ if name.startswith(PROJECT_ENV_PREFIX)})
+    if inherited_dropped:
+        print("NOTICE: dropped inherited project environment for suite subprocesses: "
+              + ", ".join(inherited_dropped))
     records = []
     failed = 0
     total_checks = 0
@@ -192,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "python": sys.version,
+            "inherited_project_env_dropped": inherited_dropped,
             "suites": [{k: v for k, v in rec.items() if k != "_stdout"} for rec in records],
             "total_passed": total_passed,
             "total_checks": total_checks,

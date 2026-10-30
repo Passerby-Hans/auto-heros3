@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -130,6 +131,49 @@ def read_formal_ledger() -> str:
         return FORMAL_LEDGER.read_text(encoding="utf-8")
     except OSError:
         return "<absent>"
+
+
+RUNNER = ROOT / "tools" / "run_offline_suite.py"
+
+
+def check_runner_isolation() -> None:
+    """GPT6 review P2: inherited AUTO_HEROS3_* must not leak into suite subprocesses.
+
+    Reproduces the reported scenario: the caller's shell exports every path override to a
+    sentinel directory; the recording-segment suite used to PASS (20/20) while writing fake
+    recording files into the inherited directory.  The runner must strip the inherited project
+    variables, and the sentinel must stay empty.
+    """
+    with tempfile.TemporaryDirectory(prefix="b0-runner-iso-") as tmp:
+        base = Path(tmp)
+        sentinel = base / "sentinel"
+        hostile = dict(os.environ)
+        hostile.update({
+            "AUTO_HEROS3_STATE_DIR": str(sentinel / "state"),
+            "AUTO_HEROS3_SAVES_DIR": str(sentinel / "saves"),
+            "AUTO_HEROS3_SAVE_SUBDIR": "inherited",
+            "AUTO_HEROS3_RECORDINGS_DIR": str(sentinel / "recordings"),
+            "AUTO_HEROS3_MEMORY_ROOT": str(sentinel / "player"),
+        })
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-X", "utf8", str(RUNNER),
+                 "--suite", "test_recording_segment.py"],
+                cwd=str(ROOT), env=hostile, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=240,
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            check("B0-R1 the runner strips inherited AUTO_HEROS3_* from suite subprocesses",
+                  proc.returncode == 0 and "dropped inherited project environment" in out,
+                  f"exit={proc.returncode}")
+            written = sorted(str(p.relative_to(base)) for p in base.rglob("*") if p.is_file())
+            check("B0-R2 the inherited recording target stays empty (GPT6 P2 reproduction)",
+                  not written, written[:8])
+        except (OSError, subprocess.TimeoutExpired) as exc:  # pragma: no cover
+            check("B0-R1 the runner strips inherited AUTO_HEROS3_* from suite subprocesses",
+                  False, f"{type(exc).__name__}: {exc}")
+            check("B0-R2 the inherited recording target stays empty (GPT6 P2 reproduction)",
+                  False, "runner could not be executed")
 
 
 def main() -> int:
@@ -244,6 +288,10 @@ def main() -> int:
     shutil.rmtree(temp_dir, ignore_errors=True)
     check("B0-I2 temporary isolation directory was cleaned up",
           not Path(temp_dir).exists(), temp_dir)
+
+    # ---------------------------------------------------------------- R: runner env isolation
+    # GPT6 review P2: the unified offline entry must not forward the caller's path overrides.
+    check_runner_isolation()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed}/{len(RESULTS)} checks passed")

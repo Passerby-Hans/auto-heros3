@@ -1,7 +1,7 @@
 {
  "schema_version": 1,
  "note": "B0.1 guard: MCP tool surface the LLM client depends on. A refactor batch must keep the tool name set and every input schema identical; adding or changing a tool is an explicit interface change that requires updating this baseline deliberately. B0.7: explore_toward gained operation_id/time_budget_s and explore_cancel was added (operation contract); all other tools unchanged.",
- "source": "tools/mcp_server_v2.py @ refactor/b0 6ff28ab (2026-10-31, mcp SDK 2.3.0)",
+ "source": "tools/mcp_server_v2.py @ master 2f71e63 (2026-10-31, mcp SDK 2.3.0)",
  "tool_count": 34,
  "tools": [
   {

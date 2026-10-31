@@ -60,8 +60,8 @@
 | 原版游戏数据 | 自备正版《英雄无敌 III 完整版 / 死亡阴影》（Steam / GOG 均可） |
 | Git | 较新版本 |
 | PowerShell | Windows PowerShell 5.1（启动客户端用）+ PowerShell 7（构建脚本用） |
-| Python | 3.11+ |
-| uv（推荐）或 pip | 创建虚拟环境 |
+| Python | 3.14.x（`pyproject.toml` 要求 >=3.14,<3.15；实测 3.14.2） |
+| uv | 创建 `.venv` 并按 `uv.lock` 冻结安装依赖 |
 | MSVC | Visual Studio 2022 或更新版本的 Build Tools，含"使用 C++ 的桌面开发"与 Windows SDK |
 | CMake | 较新版本 |
 | Ninja | 较新版本 |
@@ -80,25 +80,18 @@ cd auto-heros3
 
 #### 2. 创建 Python 环境
 
-```powershell
-uv venv .venv
-uv pip install --python .venv\Scripts\python.exe `
-  "mcp==2.3.0" "psutil==7.2.2" "numpy==2.5.4" "pillow==13.0.0" "mss==10.2.0" "pycaw==20260927"
-```
-
-不用 uv 时：
+依赖完全由 `pyproject.toml` + `uv.lock` 固定（当前 **52 包**，实测 CPython 3.14.2）：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install `
-  "mcp==2.3.0" "psutil==7.2.2" "numpy==2.5.4" "pillow==13.0.0" "mss==10.2.0" "pycaw==20260927"
+uv venv --python 3.14 .venv
+uv sync --frozen
 ```
 
-- `mcp`：MCP 官方 Python SDK（[模型上下文协议](https://modelcontextprotocol.io/)），本项目按 v2 API `MCPServer` 编写，并兼容旧版 `FastMCP`。
-- `pycaw`：进程级静音；缺失时只会跳过静音。
-- 可选（逆向/手册/OCR 研究工具）：`pypdf capstone pefile rapidocr-onnxruntime`。
-- 上面的版本号是开发环境实测版本，可按需放宽。
+- 不要用手工 `pip install` 的旧六包清单覆盖冻结环境；需要变更依赖时修改 `pyproject.toml` 后重新 `uv lock`。
+- 核对：`uv sync --frozen --dry-run` 应报告无需变更；`uv lock --check` 应通过。
+- `pycaw` 用于进程级静音；缺失时只会跳过静音。
+
+> 可选（逆向/手册/OCR 研究工具）已纳入 lock；如只需最小 MCP 服务器，仍建议保留同一冻结环境以保证可复现。
 
 #### 3. 构建带桥接补丁的 VCMI 客户端
 
@@ -435,8 +428,8 @@ Magic III* engine — into a game that an **LLM agent can play as a real player*
 | Original game data | A legally owned *Heroes III Complete / Shadow of Death* copy (Steam or GOG) |
 | Git | any recent version |
 | PowerShell | Windows PowerShell 5.1 (used to start the client) + PowerShell 7 (build script) |
-| Python | 3.11+ |
-| uv (recommended) or pip | virtual environment |
+| Python | 3.14.x (`pyproject.toml` requires >=3.14,<3.15; tested 3.14.2) |
+| uv | creates `.venv` and installs the frozen `uv.lock` environment |
 | MSVC | Visual Studio 2022 or newer Build Tools with "Desktop development with C++" and the Windows SDK |
 | CMake | a recent version |
 | Ninja | a recent version |
@@ -456,25 +449,20 @@ cd auto-heros3
 
 #### 2. Create the Python environment
 
-```powershell
-uv venv .venv
-uv pip install --python .venv\Scripts\python.exe `
-  "mcp==2.3.0" "psutil==7.2.2" "numpy==2.5.4" "pillow==13.0.0" "mss==10.2.0" "pycaw==20260927"
-```
-
-Without uv:
+Dependencies are fully pinned by `pyproject.toml` + `uv.lock` (**52 packages**, tested with CPython 3.14.2):
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install `
-  "mcp==2.3.0" "psutil==7.2.2" "numpy==2.5.4" "pillow==13.0.0" "mss==10.2.0" "pycaw==20260927"
+uv venv --python 3.14 .venv
+uv sync --frozen
 ```
 
-- `mcp` is the official [Model Context Protocol](https://modelcontextprotocol.io/) Python SDK; the server is
-  written against the v2 `MCPServer` API and keeps a fallback for the older `FastMCP` API.
+- Do not overwrite the frozen environment with an unlocked manual `pip install` list; change
+  `pyproject.toml` and re-lock if dependencies must change.
+- Verify with `uv sync --frozen --dry-run` (no changes) and `uv lock --check`.
 - `pycaw` provides per-process muting; if it is missing, muting is simply skipped.
-- Optional (reverse-engineering / manual / OCR research tools): `pypdf capstone pefile rapidocr-onnxruntime`.
+
+> Optional reverse-engineering / manual / OCR tooling is part of the same lock. Keep the frozen
+> environment for reproducibility even if you only need the MCP server.
 - The pins above are the versions tested in development; feel free to relax them.
 
 #### 3. Build the patched VCMI client
@@ -669,7 +657,7 @@ tools/vcmi_overlay_recorder.py  off-screen recorder compatibility shim (→ src/
 tools/fog_path.py               shroud-border BFS explorer compatibility shim (→ src/auto_heros3/exploration/fog_path.py)
 tools/fog_path_live.py          live shroud-exploration demo CLI
 tools/fog_battle.py             mechanical battle executor (demo/diagnostics; real games are LLM-decided)
-tests/offline/                  offline regression suites (26; unified entry tools/run_offline_suite.py)
+tests/offline/                  offline regression suites (28; unified entry tools/run_offline_suite.py)
 tests/live/                     isolated live suites (7; tools/test_*.py kept as compatibility entries)
 tools/bridge_contract.json      pinned client sha256 / protocol / frozen behaviour
 agent/h3/                       Track A retail-binary reverse engineering (kept for reference; unused by the main track)

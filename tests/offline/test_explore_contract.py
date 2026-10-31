@@ -10,8 +10,10 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -19,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mcp_server_v2 as M  # noqa: E402
-from test_action_contract import Env, FakeAgent, state  # noqa: E402
+from test_action_contract import Env, FakeAgent, bridge_ok, state  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -113,11 +115,229 @@ def test_cancel_stops_the_loop_without_new_action() -> None:
               str(again)[:160])
 
 
+def _base_operation(opid: str) -> dict:
+    return {'operation_id': opid, 'status': 'running', 'started_at': time.time(),
+            'deadline': time.time() + 60, 'time_budget_s': 60, 'hero': 0,
+            'target': [8, 8, 0], 'max_steps': 8, 'max_turns': 0,
+            'attempts': [], 'sent_actions': [], 'refused_actions': [],
+            'inflight_actions': [], 'steps_done': 0, 'moves': 0,
+            'cancel_requested': False, 'result_status': None, 'error': None}
+
+
+def test_operation_transactions_do_not_lose_updates() -> None:
+    """F1: cancel/terminal updates and progress writes must be a locked transaction."""
+    with Env():
+        M._explore_op_write(_base_operation('txn-cancel'))
+        progress = _base_operation('txn-cancel')
+        progress['attempts'] = [{'action': 'move_hero', 'request_id': 'req-1',
+                                 'sent': True, 'status': 'completed'}]
+        entered, resume = threading.Event(), threading.Event()
+        real = M._explore_op_write_locked
+
+        def gated(operation):
+            if threading.current_thread().name == 'progress-writer':
+                entered.set()
+                if not resume.wait(5):
+                    raise RuntimeError('test barrier timeout')
+            return real(operation)
+
+        response = {}
+        with mock.patch.object(M, '_explore_op_write_locked', gated):
+            worker = threading.Thread(target=M._explore_op_write,
+                                      args=(progress,), name='progress-writer')
+            worker.start()
+            assert entered.wait(5)
+            cancel = threading.Thread(target=lambda: response.update(
+                M.explore_cancel('txn-cancel')), name='cancel-writer')
+            cancel.start()
+            time.sleep(0.05)
+            resume.set()
+            worker.join(5)
+            cancel.join(5)
+        final = M._explore_op_read('txn-cancel')
+        check('L12 cancel survives a concurrent progress write (sent actions preserved)',
+              response.get('ok') is True and final.get('cancel_requested') is True
+              and len(final.get('sent_actions') or []) == 1,
+              json.dumps(final, ensure_ascii=False)[:300])
+
+    with Env():
+        M._explore_op_write(_base_operation('txn-terminal'))
+        completed = _base_operation('txn-terminal')
+        completed['status'] = 'completed'
+        completed['attempts'] = [{'action': 'move_hero', 'request_id': 'req-2',
+                                  'sent': True, 'status': 'completed'}]
+        entered, resume = threading.Event(), threading.Event()
+        real = M._explore_op_write_locked
+
+        def gated(operation):
+            if threading.current_thread().name == 'terminal-writer':
+                entered.set()
+                if not resume.wait(5):
+                    raise RuntimeError('test barrier timeout')
+            return real(operation)
+
+        response = {}
+        with mock.patch.object(M, '_explore_op_write_locked', gated):
+            worker = threading.Thread(target=M._explore_op_write,
+                                      args=(completed,), name='terminal-writer')
+            worker.start()
+            assert entered.wait(5)
+            cancel = threading.Thread(target=lambda: response.update(
+                M.explore_cancel('txn-terminal')), name='cancel-writer')
+            cancel.start()
+            time.sleep(0.05)
+            resume.set()
+            worker.join(5)
+            cancel.join(5)
+        final = M._explore_op_read('txn-terminal')
+        check('L13 cancel cannot resurrect/blank a completed operation',
+              response.get('ok') is False
+              and response.get('error') == 'operation_not_running'
+              and final.get('status') == 'completed'
+              and len(final.get('sent_actions') or []) == 1,
+              json.dumps(final, ensure_ascii=False)[:300])
+
+
+def test_full_explorer_cancel_waits_for_inflight_action() -> None:
+    """F1 end-to-end: cancel returns after the in-flight move, and no next move is sent."""
+    with Env() as env:
+        class WalkingAgent(FakeAgent):
+            def __init__(self):
+                super().__init__([])
+                self.pos = (1, 1, 0)
+                self.moves = []
+                self.moved = threading.Event()
+
+            def state(self, timeout: float = 10.0):
+                return hero_state(self.pos)
+
+            def execute(self, line: str, verify=None, result_timeout: float = 20.0):
+                self.sent.append(line)
+                if line.startswith('probe'):
+                    suffix = ('1,1,0=1 2,1,0=1 3,1,0='
+                              + ('0' if self.pos[0] == 1 else '1'))
+                    return bridge_ok(len(self.sent), 'probe ' + suffix)
+                words = line.split()
+                assert words[0] == 'move_hero', line
+                self.pos = tuple(map(int, words[2:5]))
+                self.moves.append({'line': line, 'ts': time.time()})
+                self.moved.set()
+                return bridge_ok(len(self.sent), line)
+
+        fake = env.agent(WalkingAgent())
+        response, errors = {}, []
+
+        def explore():
+            try:
+                response.update(M.explore_toward(0, 3, 1, map_w=8, map_h=8,
+                                                 operation_id='full-race'))
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(repr(exc))
+
+        worker = threading.Thread(target=explore, name='explorer')
+        worker.start()
+        assert fake.moved.wait(10)
+        cancelled = M.explore_cancel('full-race')
+        worker.join(10)
+        final = M._explore_op_read('full-race')
+        check('L14 a real explorer cannot start a second move after cancel returns',
+              not errors and cancelled.get('ok') is True and len(fake.moves) == 1
+              and final.get('cancel_requested') is True
+              and final.get('status') == 'cancelled'
+              and response.get('operation_status') == 'cancelled',
+              f'errors={errors} moves={fake.moves} cancel={cancelled} '
+              f'response={str(response)[:180]} op={str(final)[:180]}')
+        check('L15 the in-flight move is recorded exactly once as sent',
+              len(final.get('sent_actions') or []) == 1
+              and (final.get('sent_actions') or [{}])[0].get('sent') is True,
+              json.dumps(final.get('sent_actions'), ensure_ascii=False)[:300])
+
+
+def test_crash_leaves_a_durable_attempt_record() -> None:
+    """F2: the attempt/request_id is persisted before the bridge command is sent."""
+    with Env() as env:
+        class SimulatedProcessExit(BaseException):
+            pass
+
+        def crash(line: str) -> None:
+            if not line.startswith('probe'):
+                raise SimulatedProcessExit('process died after submit before receipt')
+
+        env.agent(FakeAgent([hero_state()],
+                            results=[bridge_ok(1, 'probe 2,1,0=1 turns=0 cost=100 len=1')],
+                            on_execute=crash))
+        try:
+            M.explore_toward(0, 2, 1, map_w=8, map_h=8, operation_id='crashed-op')
+        except SimulatedProcessExit:
+            pass
+        operation = M._explore_op_read('crashed-op') or {}
+        attempts = operation.get('attempts') or []
+        move_attempts = [item for item in attempts if item.get('action') == 'move_hero']
+        cancelled = M.explore_cancel('crashed-op')
+        check('L16 a crash after submission leaves the request_id in the operation record',
+              bool(move_attempts) and move_attempts[0].get('request_id')
+              and move_attempts[0].get('sent') is None
+              and move_attempts[0] in (operation.get('inflight_actions') or []),
+              json.dumps(operation, ensure_ascii=False)[:400])
+        check('L17 cancel reports the in-flight/pending attempt for reconciliation',
+              cancelled.get('ok') is True
+              and any(item.get('request_id') == move_attempts[0].get('request_id')
+                      for item in cancelled.get('inflight_actions') or []),
+              json.dumps(cancelled, ensure_ascii=False)[:400])
+
+
+def test_persistence_failure_is_reported_not_completed() -> None:
+    """F3: a failed critical write must not report completed or allow silent re-execution."""
+    with Env() as env:
+        path = M._explore_op_path('persist-op')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.with_suffix(path.suffix + '.tmp').mkdir(parents=True, exist_ok=True)
+        fake = env.agent(FakeAgent([hero_state()]))
+        first = M.explore_toward(0, 1, 1, map_w=8, map_h=8, operation_id='persist-op')
+        second = M.explore_toward(0, 1, 1, map_w=8, map_h=8, operation_id='persist-op')
+        check('L18 create-persist failure returns persist_error and sends no game action',
+              first.get('ok') is False and first.get('status') == 'operation_persist_error'
+              and fake.sent == [], str(first)[:260])
+        check('L19 the same id is not silently executed a second time after a persist failure',
+              second.get('ok') is False
+              and second.get('status') in ('operation_persist_error',)
+              and not path.exists(), str(second)[:260])
+
+
+def test_not_sent_is_not_counted_as_sent_actions() -> None:
+    """F4: a pre-send refusal keeps sent=false/bridge_status and stays out of sent_actions."""
+    with Env() as env:
+        blocked = hero_state()
+        blocked['query'] = {'id': 7, 'type': 'CHestQuery'}
+        env.agent(FakeAgent([hero_state(), hero_state(), blocked],
+                            results=[bridge_ok(1, 'probe 2,1,0=1 turns=0 cost=100 len=1')]))
+        response = M.explore_toward(0, 2, 1, map_w=8, map_h=8, operation_id='notsent-op')
+        operation = M._explore_op_read('notsent-op') or {}
+        refused = operation.get('refused_actions') or []
+        check('L20 a NOT_SENT precondition refusal is not in sent_actions',
+              operation.get('sent_actions') == [] and len(refused) == 1,
+              json.dumps(operation, ensure_ascii=False)[:400])
+        check('L21 the refused attempt keeps sent=false/request_id/seq/bridge_status',
+              refused and refused[0].get('sent') is False
+              and refused[0].get('request_id') and refused[0].get('seq') is None
+              and str(refused[0].get('bridge_status')).upper() in ('NOT_SENT', ''),
+              json.dumps(refused, ensure_ascii=False)[:400])
+        check('L22 the wrapper reports the refusal without claiming a completed explore',
+              response.get('ok') is False
+              and response.get('sent_actions') == [] and refused,
+              str(response)[:260])
+
+
 def main() -> int:
     test_interface()
     test_reached_completion_has_operation_record()
     test_overall_deadline_stops_before_next_action()
     test_cancel_stops_the_loop_without_new_action()
+    test_operation_transactions_do_not_lose_updates()
+    test_full_explorer_cancel_waits_for_inflight_action()
+    test_crash_leaves_a_durable_attempt_record()
+    test_persistence_failure_is_reported_not_completed()
+    test_not_sent_is_not_counted_as_sent_actions()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f'\n{passed}/{len(RESULTS)} checks passed')
     return 0 if passed == len(RESULTS) else 1

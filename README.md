@@ -294,8 +294,8 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 
 - MCP 自检：`.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   （打印能力清单并做一次租约 acquire/release；不会启动游戏）。
-- 离线回归：`tests/offline/` 共 **28 套 / 846 项断言**，统一入口一次跑完（显式白名单，7 个 live
-  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-10-31 复核 **846/846 PASS**）：
+- 离线回归：`tests/offline/` 共 **28 套 / 858 项断言**，统一入口一次跑完（显式白名单，7 个 live
+  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-10-31 复核 **858/858 PASS**）：
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
@@ -681,9 +681,9 @@ doc/                            engineering docs / handover / log (kept locally,
 
 - MCP self-test: `.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   (prints the capability list and does one lease acquire/release; it does not start the game).
-- Offline regression: **28 suites / 846 assertions** under `tests/offline/`, run through the explicit
+- Offline regression: **28 suites / 858 assertions** under `tests/offline/`, run through the explicit
   whitelist entry (7 live suites are skipped by default); it prints `N/N checks passed` and exits 0 on
-  success (re-checked 2026-10-31: **846/846 PASS**):
+  success (re-checked 2026-10-31: **858/858 PASS**):
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py

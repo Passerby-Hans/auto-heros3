@@ -4527,27 +4527,11 @@ def _battle_cache_stamp(path: Path):
     return (st.st_mtime_ns, st.st_size)
 
 
-@mcp.tool()
-def battle_actions() -> dict:
-    """Report the currently legal battle options for the active stack (read-only).
+_BATTLE_ACTIONS_LOCK = threading.Lock()
 
-    Returns the active stack (id/creature/count/hex/shots/counterattacks), legal move
-    destinations, every enemy target with `can_melee` / `walk` / `attack_from` / `can_shoot`,
-    and the visible turn order (current + next round).  Read-only: it never flushes a pending
-    UI transaction.  Use it to choose between battle_attack (attack), battle_approach
-    (explicit move towards), battle_move, battle_wait and battle_defend.
 
-    T35 hero magic: `hero` gives our fighting hero's mana/mana_max/spellbook/can_cast/reason/
-    casts_used and `spells` lists every known battle spell with engine-provided cost, can_cast
-    and target_kind ('none' | 'unit' | 'hex'); cast one with battle_cast_spell(spell=...,
-    stack=<unit> for target_kind 'unit', x/y for target_kind 'hex', omitted for 'none').
-    """
-    st, error = _state_or_error()
-    if error:
-        return {'ok': False, 'error': error}
-    if not (st.get('battle') or {}).get('active'):
-        return {'ok': False, 'error': 'no active battle'}
-    agent = _agent()
+def _battle_actions_query(agent) -> dict:
+    """One complete battle_actions query under `_BATTLE_ACTIONS_LOCK` (F5)."""
     path = _dir() / 'battle_actions.json'
     before = _battle_cache_stamp(path)
     try:
@@ -4598,6 +4582,35 @@ def battle_actions() -> dict:
     data['ok'] = True
     data['bridge_status'] = bridge_status
     return data
+
+
+@mcp.tool()
+def battle_actions() -> dict:
+    """Report the currently legal battle options for the active stack (read-only).
+
+    Returns the active stack (id/creature/count/hex/shots/counterattacks), legal move
+    destinations, every enemy target with `can_melee` / `walk` / `attack_from` / `can_shoot`,
+    and the visible turn order (current + next round).  Read-only: it never flushes a pending
+    UI transaction.  Use it to choose between battle_attack (attack), battle_approach
+    (explicit move towards), battle_move, battle_wait and battle_defend.
+
+    T35 hero magic: `hero` gives our fighting hero's mana/mana_max/spellbook/can_cast/reason/
+    casts_used and `spells` lists every known battle spell with engine-provided cost, can_cast
+    and target_kind ('none' | 'unit' | 'hex'); cast one with battle_cast_spell(spell=...,
+    stack=<unit> for target_kind 'unit', x/y for target_kind 'hex', omitted for 'none').
+    """
+    st, error = _state_or_error()
+    if error:
+        return {'ok': False, 'error': error}
+    if not (st.get('battle') or {}).get('active'):
+        return {'ok': False, 'error': 'no active battle'}
+    agent = _agent()
+    # F5 (GPT6): the bridge cache is a single shared file.  Serialize the WHOLE query
+    # (reply + cache freshness + read) so another battle_actions call cannot overwrite the
+    # cache between this query's reply and its read.  The single-writer lease means one MCP
+    # server owns a state dir; cross-process readers are not part of the contract.
+    with _BATTLE_ACTIONS_LOCK:
+        return _battle_actions_query(agent)
 
 
 @mcp.tool()
@@ -4706,6 +4719,25 @@ _EXPLORE_DEFAULT_BUDGET_S = 180.0
 _EXPLORE_MAX_BUDGET_S = 3600.0
 _EXPLORE_OP_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
 
+# B0.7.1 (GPT6 F1/F3): the operation record is a transactional read-modify-write store, not a
+# best-effort side file.  A process-wide RLock serializes MCP worker threads; the cross-process
+# _file_lock covers a second server reading the same state dir.  Persist failures are explicit:
+# callers must not report a completed/durable operation when the critical write failed.
+_EXPLORE_OPS_THREAD_LOCK = threading.RLock()
+_EXPLORE_DISPATCH_LOCK = threading.RLock()
+
+
+class _ExplorePersistError(RuntimeError):
+    """A critical operation-record write failed (never swallowed)."""
+
+
+@contextmanager
+def _explore_transaction():
+    _dir().mkdir(parents=True, exist_ok=True)
+    with _EXPLORE_OPS_THREAD_LOCK:
+        with _file_lock('explore_operations', timeout=5):
+            yield
+
 
 def _explore_ops_dir() -> Path:
     return _dir() / 'explore_operations'
@@ -4723,15 +4755,93 @@ def _explore_op_read(operation_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _explore_op_write(operation: dict) -> None:
-    """Atomically persist one operation record, preserving a concurrent cancel request."""
+def _explore_sync_views(operation: dict) -> None:
+    """Derive sent/refused/in-flight views from the per-attempt records.
+
+    F4 (GPT6): a NOT_SENT precondition refusal is an attempt, not a submission.  Keep `sent`,
+    `bridge_status`, `request_id` and `seq` on every attempt so a recovery consumer can tell
+    "tried to call" from "may have been submitted".
+    """
+    attempts = [item for item in (operation.get('attempts') or []) if isinstance(item, dict)]
+    operation['attempts'] = attempts
+    operation['sent_actions'] = [item for item in attempts if item.get('sent') is True]
+    operation['refused_actions'] = [item for item in attempts if item.get('sent') is False]
+    operation['inflight_actions'] = [item for item in attempts if item.get('sent') is None]
+
+
+def _explore_op_write_locked(operation: dict) -> None:
+    """Write one operation record while the caller holds `_explore_transaction()`.
+
+    Merges a concurrently requested cancel (one-way flag) and uses an explicit temp file +
+    os.replace.  Unlike the best-effort `_atomic_write_json`, this raises `_ExplorePersistError`.
+    """
     current = _explore_op_read(str(operation['operation_id'])) or {}
     if current.get('cancel_requested'):
         operation['cancel_requested'] = True
+    _explore_sync_views(operation)
     operation['updated_at'] = round(time.time(), 3)
     path = _explore_op_path(str(operation['operation_id']))
     path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(path, operation)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    try:
+        tmp.write_text(json.dumps(operation, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise _ExplorePersistError(f'operation record persist failed: {exc}') from exc
+
+
+def _explore_op_write(operation: dict) -> None:
+    with _explore_transaction():
+        _explore_op_write_locked(operation)
+
+
+def _explore_begin_attempt(operation: dict, action: str, tile, request_id: str) -> dict:
+    """Persist an attempt (with its request_id) BEFORE the bridge command is sent."""
+    attempt = {'action': action, 'tile': list(tile) if tile else None,
+               'request_id': request_id, 'status': 'sending', 'sent': None,
+               'action_id': None, 'seq': None, 'bridge_status': None,
+               'evidence': None, 'ts': round(time.time(), 3)}
+    operation.setdefault('attempts', []).append(attempt)
+    operation['steps_done'] = int(operation.get('steps_done') or 0) + (1 if action != 'probe' else 0)
+    if action == 'move_hero':
+        operation['moves'] = int(operation.get('moves') or 0) + 1
+    _explore_op_write(operation)
+    return attempt
+
+
+def _explore_finish_attempt(operation: dict, request_id: str, outcome: dict) -> None:
+    outcome = dict(outcome or {})
+    for attempt in operation.get('attempts') or []:
+        if attempt.get('request_id') != request_id:
+            continue
+        sent = outcome.get('sent')
+        if not isinstance(sent, bool):
+            # game_act omits `sent` on some success paths; infer conservatively from the
+            # submission evidence.  A rejected/query blocked result carries sent=false already.
+            bridge_status = str(outcome.get('bridge_status') or '').upper()
+            status = str(outcome.get('status') or '')
+            if bridge_status == 'NOT_SENT' or (outcome.get('seq') is None
+                                               and status in ('rejected', 'unknown')):
+                sent = False
+            elif status in ('completed', 'submitted') or outcome.get('seq') is not None:
+                sent = True
+            else:
+                sent = None
+        attempt.update({
+            'status': outcome.get('status'),
+            'sent': sent,
+            'action_id': outcome.get('action_id'),
+            'seq': outcome.get('seq'),
+            'bridge_status': outcome.get('bridge_status'),
+            'evidence': str(outcome.get('evidence') or outcome.get('error') or '')[:400],
+            'finished_at': round(time.time(), 3),
+        })
+        break
+    _explore_op_write(operation)
 
 
 def _explore_latest_running() -> dict | None:
@@ -4866,10 +4976,23 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
         'operation_id': op_id, 'status': 'running', 'started_at': round(started, 3),
         'deadline': round(started + budget, 3), 'time_budget_s': budget,
         'hero': hero, 'target': [x, y, z], 'max_steps': max_steps, 'max_turns': max_turns,
-        'sent_actions': [], 'steps_done': 0, 'moves': 0,
+        'attempts': [], 'sent_actions': [], 'refused_actions': [], 'inflight_actions': [],
+        'steps_done': 0, 'moves': 0,
         'cancel_requested': False, 'result_status': None, 'error': None,
     }
-    _explore_op_write(operation)
+    try:
+        with _explore_transaction():
+            if _explore_op_read(op_id) is not None:
+                # Another process/thread created the same id between the early check and now.
+                return {'ok': False, 'status': 'operation_id_exists', 'operation_id': op_id,
+                        'hint': 'operation ids are durable; use a new id'}
+            _explore_op_write_locked(operation)
+    except _ExplorePersistError as exc:
+        # F3 (GPT6): a failed critical create must not start a game action, and must not be
+        # reported as a completed/durable operation.
+        return {'ok': False, 'status': 'operation_persist_error', 'operation_id': op_id,
+                'error': str(exc), 'sent': False,
+                'hint': 'operation record could not be persisted; no game action was sent'}
 
     def check_stop() -> None:
         live = _explore_op_read(op_id) or {}
@@ -4882,20 +5005,35 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
     def remaining() -> float:
         return max(0.0, operation['deadline'] - time.time())
 
-    def record(action: str, outcome: dict, tile=None) -> None:
-        operation['sent_actions'].append({
-            'action': action, 'tile': list(tile) if tile else None,
-            'request_id': outcome.get('request_id'),
-            'action_id': outcome.get('action_id'), 'seq': outcome.get('seq'),
-            'status': outcome.get('status'), 'ts': round(time.time(), 3),
-        })
-        operation['steps_done'] = int(operation.get('steps_done') or 0) + 1
-        if action == 'move_hero':
-            operation['moves'] = int(operation.get('moves') or 0) + 1
-        _explore_op_write(operation)
-        if str(outcome.get('status') or '') == 'unknown':
-            raise _ExploreStopped('unknown_action',
-                                  f'{action} outcome UNKNOWN; stopping without retrying')
+    def dispatch(action: str, tile, send):
+        """Send one game action under the dispatch lock, with a pre-recorded attempt.
+
+        The lock makes cancel/terminal updates transactional against an in-flight action:
+        cancel waits for the action to finish, then returns; after it returns no further action
+        can start.  The attempt (with request_id) is persisted BEFORE the bridge command, so a
+        crash between submission and receipt leaves a durable association.
+        """
+        with _EXPLORE_DISPATCH_LOCK:
+            check_stop()
+            request_id = f'explore-{action.replace("_", "-")}-{uuid.uuid4().hex[:12]}'
+            _explore_begin_attempt(operation, action, tile, request_id)
+            try:
+                outcome = send(request_id)
+            except BaseException:
+                try:
+                    _explore_finish_attempt(operation, request_id, {
+                        'status': 'exception', 'sent': None,
+                        'evidence': 'exception before a reply (attempt may be in flight)'})
+                except _ExplorePersistError:
+                    pass
+                raise
+            outcome = dict(outcome or {})
+            outcome.setdefault('request_id', request_id)
+            _explore_finish_attempt(operation, request_id, outcome)
+            if str(outcome.get('status') or '') == 'unknown':
+                raise _ExploreStopped('unknown_action',
+                                      f'{action} outcome UNKNOWN; stopping without retrying')
+            return outcome
 
     def probe(tiles):
         check_stop()
@@ -4915,15 +5053,12 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
         return fp.parse_probe_reply(body)
 
     def move(tile):
-        check_stop()
-        request_id = f'explore-move-{uuid.uuid4().hex[:12]}'
-        outcome = game_act('move_hero', {'hero': hero, 'x': int(tile[0]),
-                                        'y': int(tile[1]), 'z': int(tile[2])},
-                           request_id=request_id,
-                           thought=f'探索黑幕边缘：踩上 ({tile[0]},{tile[1]}) 打开视野')
-        outcome = dict(outcome or {})
-        outcome.setdefault('request_id', request_id)
-        record('move_hero', outcome, tile)
+        def send(request_id):
+            return game_act('move_hero', {'hero': hero, 'x': int(tile[0]),
+                                          'y': int(tile[1]), 'z': int(tile[2])},
+                            request_id=request_id,
+                            thought=f'探索黑幕边缘：踩上 ({tile[0]},{tile[1]}) 打开视野')
+        outcome = dispatch('move_hero', tile, send)
         status = str(outcome.get('status') or '')
         return {'ok': status in ('completed', 'submitted'), 'status': status,
                 'action_id': outcome.get('action_id'), 'error': outcome.get('error'),
@@ -4934,63 +5069,116 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
         return fresh if (fresh and not observe_error) else {}
 
     def end_turn():
-        check_stop()
-        request_id = f'explore-turn-{uuid.uuid4().hex[:12]}'
-        outcome = game_act('end_turn', {}, request_id=request_id,
-                           thought='探索黑幕边缘：移动力用尽，结束回合后继续沿黑幕走')
-        outcome = dict(outcome or {})
-        outcome.setdefault('request_id', request_id)
-        record('end_turn', outcome)
+        def send(request_id):
+            return game_act('end_turn', {}, request_id=request_id,
+                            thought='探索黑幕边缘：移动力用尽，结束回合后继续沿黑幕走')
+        outcome = dispatch('end_turn', None, send)
         status = str(outcome.get('status') or '')
         return {'ok': status in ('completed', 'submitted'), 'status': status,
                 'action_id': outcome.get('action_id'), 'error': outcome.get('error')}
+
+    def finalize(status: str, result_status: str | None = None, error: str | None = None
+                 ) -> tuple[str, str | None]:
+        """Persist the terminal state atomically against cancel/finalization, if possible."""
+        with _EXPLORE_DISPATCH_LOCK:
+            with _explore_transaction():
+                current = _explore_op_read(op_id) or {}
+                if current.get('cancel_requested') and status in ('completed', 'stopped'):
+                    status = 'cancelled'
+                    result_status = result_status or 'cancelled'
+                    error = error or 'cancel requested during finalization'
+                operation.update(status=status, result_status=result_status,
+                                 error=error, elapsed_s=round(time.time() - started, 2))
+                _explore_op_write_locked(operation)
+                return status, result_status
 
     explorer = fp.FogExplorer(probe=probe, move=move, observe=observe, hero=hero,
                               target=(x, y, z), bounds=bounds, max_steps=max_steps,
                               end_turn=end_turn if max_turns else None,
                               max_turns=max_turns)
+    def persist_failure(exc: Exception, attempted_status: str) -> dict:
+        # If begin_attempt failed before the bridge call, the newest attempt never left the
+        # process; mark it not-sent so the recovery consumer does not treat it as submitted.
+        for attempt in operation.get('attempts') or []:
+            if attempt.get('status') == 'sending' and attempt.get('sent') is None:
+                attempt['status'] = 'not_sent_persist_error'
+                attempt['sent'] = False
+        operation.update(status='persist_error', result_status=attempted_status,
+                         error=str(exc), elapsed_s=round(time.time() - started, 2))
+        _explore_sync_views(operation)
+        return {'ok': False, 'status': 'persist_error', 'operation_id': op_id,
+                'operation_status': 'persist_error', 'attempted_status': attempted_status,
+                'error': str(exc), 'persisted': False,
+                'elapsed_s': operation['elapsed_s'],
+                'attempts': operation.get('attempts') or [],
+                'sent_actions': operation.get('sent_actions') or [],
+                'refused_actions': operation.get('refused_actions') or [],
+                'inflight_actions': operation.get('inflight_actions') or [],
+                'hint': ('operation record could not be persisted; reconcile attempts with '
+                         'game_action_status and do not retry automatically')}
+
     try:
         result = explorer.run(max_moves=max_steps, max_turns=max_turns)
     except _ExploreStopped as stop:
-        operation.update(status=stop.status, result_status=stop.status,
-                         error=str(stop), elapsed_s=round(time.time() - started, 2))
-        _explore_op_write(operation)
-        _ledger({'action': 'explore_toward', 'status': stop.status, 'accepted': False,
+        try:
+            final_status, _ = finalize(stop.status, stop.status, str(stop))
+        except _ExplorePersistError as exc:
+            return persist_failure(exc, stop.status)
+        _ledger({'action': 'explore_toward', 'status': final_status, 'accepted': False,
                  'hero': hero, 'target': [x, y, z], 'operation_id': op_id,
-                 'result_status': stop.status, 'sent_actions': operation['sent_actions'],
+                 'result_status': stop.status, 'attempts': operation.get('attempts') or [],
+                 'sent_actions': operation.get('sent_actions') or [],
                  'elapsed_s': operation['elapsed_s'], 'error': str(stop)})
         return {'ok': False, 'status': stop.status, 'operation_id': op_id,
-                'operation_status': stop.status, 'error': str(stop),
-                'elapsed_s': operation['elapsed_s'], 'sent_actions': operation['sent_actions'],
+                'operation_status': final_status, 'error': str(stop),
+                'elapsed_s': operation['elapsed_s'],
+                'attempts': operation.get('attempts') or [],
+                'sent_actions': operation.get('sent_actions') or [],
+                'refused_actions': operation.get('refused_actions') or [],
+                'inflight_actions': operation.get('inflight_actions') or [],
                 'hint': ('stopped before the next action; reconcile sent_actions with '
                          'game_action_status; never auto-retry an UNKNOWN action')}
+    except _ExplorePersistError as exc:
+        return persist_failure(exc, 'running')
     except Exception as exc:  # noqa: BLE001 - bridge/probe errors must be a typed result
-        operation.update(status='error', result_status='error', error=str(exc),
-                         elapsed_s=round(time.time() - started, 2))
-        _explore_op_write(operation)
+        try:
+            final_status, _ = finalize('error', 'error', str(exc))
+        except _ExplorePersistError as persist_exc:
+            return persist_failure(persist_exc, 'error')
         return {'ok': False, 'status': 'error', 'operation_id': op_id,
-                'operation_status': 'error', 'error': f'explore_toward failed: {exc}',
-                'elapsed_s': operation['elapsed_s'], 'sent_actions': operation['sent_actions']}
+                'operation_status': final_status, 'error': f'explore_toward failed: {exc}',
+                'elapsed_s': operation['elapsed_s'],
+                'attempts': operation.get('attempts') or [],
+                'sent_actions': operation.get('sent_actions') or [],
+                'refused_actions': operation.get('refused_actions') or [],
+                'inflight_actions': operation.get('inflight_actions') or []}
     trace = result.get('trace') or []
     stats = result.get('stats') or {}
     moves = len([entry for entry in trace if entry.get('kind') in ('frontier', 'direct')])
-    operation.update(status='completed' if result.get('ok') else 'stopped',
-                     result_status=result.get('status'), moves=moves,
-                     elapsed_s=round(time.time() - started, 2))
-    _explore_op_write(operation)
+    try:
+        final_status, _ = finalize('completed' if result.get('ok') else 'stopped',
+                                   result.get('status'))
+    except _ExplorePersistError as exc:
+        return persist_failure(exc, result.get('status') or 'unknown')
     _ledger({'action': 'explore_toward',
-             'status': 'completed' if result.get('ok') else 'submitted',
-             'accepted': bool(result.get('ok')),
+             'status': 'completed' if final_status == 'completed' else 'submitted',
+             'accepted': final_status == 'completed',
              'hero': hero, 'target': [x, y, z], 'operation_id': op_id,
              'result_status': result.get('status'), 'moves': moves,
              'turns': result.get('turns'), 'bounds': list(bounds),
-             'sent_actions': operation['sent_actions'],
+             'attempts': operation.get('attempts') or [],
+             'sent_actions': operation.get('sent_actions') or [],
              'evidence': (f"hero {result.get('hero_tile')} status={result.get('status')} "
                           f"region={stats.get('region_reachable')} "
                           f"revealed={stats.get('revealed_tiles')} moves={moves}")})
-    return {'ok': bool(result.get('ok')), 'status': result.get('status'),
-            'operation_id': op_id, 'operation_status': operation['status'],
-            'elapsed_s': operation['elapsed_s'], 'sent_actions': operation['sent_actions'],
+    return {'ok': bool(result.get('ok')) and final_status == 'completed',
+            'status': result.get('status'), 'operation_id': op_id,
+            'operation_status': final_status,
+            'elapsed_s': operation['elapsed_s'],
+            'attempts': operation.get('attempts') or [],
+            'sent_actions': operation.get('sent_actions') or [],
+            'refused_actions': operation.get('refused_actions') or [],
+            'inflight_actions': operation.get('inflight_actions') or [],
             'hero': hero, 'hero_tile': result.get('hero_tile'), 'target': [x, y, z],
             'map_bounds': list(bounds), 'moves': moves, 'turns': result.get('turns'),
             'stats': stats, 'trace': trace[-8:], 'query': result.get('query'),
@@ -5011,22 +5199,39 @@ def explore_cancel(operation_id: str | None = None) -> dict:
                                      or not _EXPLORE_OP_ID_RE.fullmatch(operation_id)):
         return {'ok': False, 'error': 'operation_id must match [A-Za-z0-9_-]{1,64}'}
     target = operation_id or ''
-    operation = _explore_op_read(target) if target else _explore_latest_running()
-    if operation is None:
-        return {'ok': False, 'error': 'no_running_operation',
-                'operation_id': target or None}
-    status = str(operation.get('status') or '')
-    op_id = str(operation.get('operation_id') or target)
-    if status not in ('running', 'cancel_requested'):
-        return {'ok': False, 'error': 'operation_not_running', 'operation_id': op_id,
-                'status': status, 'sent_actions': operation.get('sent_actions') or []}
-    operation['cancel_requested'] = True
-    operation['status'] = 'cancel_requested'
-    _explore_op_write(operation)
+    try:
+        with _EXPLORE_DISPATCH_LOCK:
+            with _explore_transaction():
+                operation = _explore_op_read(target) if target else _explore_latest_running()
+                if operation is None:
+                    return {'ok': False, 'error': 'no_running_operation',
+                            'operation_id': target or None}
+                status = str(operation.get('status') or '')
+                op_id = str(operation.get('operation_id') or target)
+                if status not in ('running', 'cancel_requested'):
+                    _explore_sync_views(operation)
+                    return {'ok': False, 'error': 'operation_not_running',
+                            'operation_id': op_id, 'status': status,
+                            'sent_actions': operation.get('sent_actions') or [],
+                            'refused_actions': operation.get('refused_actions') or [],
+                            'inflight_actions': operation.get('inflight_actions') or []}
+                operation['cancel_requested'] = True
+                operation['status'] = 'cancel_requested'
+                _explore_op_write_locked(operation)
+                _explore_sync_views(operation)
+    except _ExplorePersistError as exc:
+        # F3: a cancel that could not be persisted is NOT a successful cancel; the explorer
+        # cannot see it, so report the write failure explicitly.
+        return {'ok': False, 'error': 'operation_persist_error',
+                'operation_id': target or None, 'detail': str(exc),
+                'note': 'cancel flag may not have been persisted; do not assume it took effect'}
     return {'ok': True, 'operation_id': op_id, 'status': 'cancel_requested',
             'sent_actions': operation.get('sent_actions') or [],
-            'note': ('the running explorer stops before its next action; reconcile any '
-                     'UNKNOWN action via game_action_status and never auto-retry it')}
+            'refused_actions': operation.get('refused_actions') or [],
+            'inflight_actions': operation.get('inflight_actions') or [],
+            'note': ('the running explorer stops before its next action; an already in-flight '
+                     'action may complete (cancel waits for it), and UNKNOWN actions are never '
+                     'retried; reconcile via game_action_status')}
 
 
 _BATTLE_ASSESS_DISCLAIMER = (

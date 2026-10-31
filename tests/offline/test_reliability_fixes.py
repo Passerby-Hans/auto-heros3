@@ -10,8 +10,12 @@ suite guards the split with a >64 KiB file.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
+import threading
+import time
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mcp_server_v2 as M  # noqa: E402
+from test_action_contract import Env, state  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -29,7 +34,59 @@ def check(name: str, condition, detail: str = '') -> None:
     print(('PASS ' if condition else 'FAIL ') + name + (f'  ({detail})' if detail else ''))
 
 
+def test_battle_actions_concurrent_cache() -> None:
+    """F5: two concurrent battle_actions queries must not exchange the shared cache file."""
+    with Env() as env:
+        class ConcurrentBattleAgent:
+            def __init__(self):
+                self.calls = 0
+                self.first_written = threading.Event()
+                self.call_lock = threading.Lock()
+
+            def state(self, timeout: float = 10.0) -> dict:
+                return state(battle={'active': True})
+
+            def execute(self, line: str, verify=None, result_timeout: float = 20.0):
+                with self.call_lock:
+                    self.calls += 1
+                    call = self.calls
+                active = 11 if call == 1 else 222
+                path = M._dir() / 'battle_actions.json'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({'active': active,
+                                            'targets': [{'id': active}]}), encoding='utf-8')
+                if call == 1:
+                    self.first_written.set()
+                    time.sleep(0.2)  # give the second query a chance to overwrite without a lock
+                return types.SimpleNamespace(seq=call, status='COMPLETED',
+                                             line=f'seq={call} OK battle_actions', detail='')
+
+        agent = ConcurrentBattleAgent()
+        env.agent(agent)
+        results: dict = {}
+
+        def query(name: str) -> None:
+            try:
+                results[name] = M.battle_actions()
+            except Exception as exc:  # noqa: BLE001 - reported below
+                results[name] = {'error': repr(exc)}
+
+        first = threading.Thread(target=query, args=('a',), name='reader-a')
+        first.start()
+        assert agent.first_written.wait(5)
+        second = threading.Thread(target=query, args=('b',), name='reader-b')
+        second.start()
+        first.join(5)
+        second.join(5)
+        check('R5 concurrent battle_actions queries cannot exchange cache payloads',
+              results.get('a', {}).get('active') == 11
+              and results.get('b', {}).get('active') == 222,
+              str({key: value.get('active') if isinstance(value, dict) else value
+                   for key, value in results.items()}))
+
+
 def main() -> int:
+    test_battle_actions_concurrent_cache()
     with tempfile.TemporaryDirectory(prefix='reliability-signature-') as tmp:
         path = Path(tmp) / 'ui_tree.json'
         check('R1 missing UI/save files have no signature',

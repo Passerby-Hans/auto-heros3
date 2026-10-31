@@ -404,6 +404,40 @@ def test_legacy_b07_operation_is_preserved() -> None:
               json.dumps(after, ensure_ascii=False)[:400])
 
 
+def test_execute_not_sent_is_not_counted_as_sent() -> None:
+    """N1: execute() returning NOT_SENT/seq=0 is a known pre-write failure, not a submission."""
+    from auto_heros3.runtime.vcmi_agent import VcmiAgent
+
+    with Env() as env:
+        agent = VcmiAgent(M._dir(), log=False)
+        real_execute = agent.execute
+
+        def execute(line, verify=None, result_timeout=20):
+            if line.startswith('probe'):
+                return bridge_ok(1, 'probe 2,1,0=1')
+            return real_execute(line, verify=verify, result_timeout=result_timeout)
+
+        agent.execute = execute
+        agent.state = lambda timeout=10: hero_state()
+        env.agent(agent)
+        # A directory at commands.txt makes the real submit fail before it can write anything.
+        (M._dir() / 'commands.txt').mkdir(parents=True, exist_ok=True)
+        response = M.explore_toward(0, 2, 1, map_w=8, map_h=8,
+                                    operation_id='not-sent-execute')
+        operation = M._explore_op_read('not-sent-execute') or {}
+        refused = operation.get('refused_actions') or []
+        check('L27 execute NOT_SENT/seq=0 is classified as not sent',
+              response.get('ok') is False
+              and operation.get('sent_actions') == []
+              and len(refused) == 1
+              and refused[0].get('sent') is False,
+              json.dumps(operation, ensure_ascii=False)[:400])
+        check('L28 a confirmed pre-write failure does not leave the unresolved gate armed',
+              M._load_unresolved() is None
+              and (M._dir() / 'commands.txt').is_dir(),
+              str(M._load_unresolved())[:300])
+
+
 def main() -> int:
     test_interface()
     test_reached_completion_has_operation_record()
@@ -416,6 +450,7 @@ def main() -> int:
     test_not_sent_is_not_counted_as_sent_actions()
     test_post_submit_exception_keeps_submission_unknown()
     test_legacy_b07_operation_is_preserved()
+    test_execute_not_sent_is_not_counted_as_sent()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f'\n{passed}/{len(RESULTS)} checks passed')
     return 0 if passed == len(RESULTS) else 1

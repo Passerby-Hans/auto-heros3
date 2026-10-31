@@ -105,6 +105,16 @@ class BridgeError(RuntimeError):
     """Generic bridge/session problem."""
 
 
+class SubmitUnknown(OSError):
+    """The command file was opened but writing/closing failed: submission is indeterminate.
+
+    A failure BEFORE the file is opened (lock/read/count errors, open failure) is a known
+    not-sent error and is reported as ordinary OSError -> CommandResult(NOT_SENT, sent=False).
+    A failure after open is represented by this subclass -> CommandResult(UNKNOWN, sent=None):
+    bytes may already have reached commands.txt, so consumers must NOT treat it as unsent.
+    """
+
+
 class StaleStateError(BridgeError):
     """The state.json snapshot is not from this session, is too old, or the client is dead."""
 
@@ -159,6 +169,9 @@ class CommandResult:
     status: str            # COMPLETED | REJECTED | UNKNOWN | NOT_SENT
     line: str = ''
     detail: str = ''
+    # N1: explicit submission classification.  None = submission may have happened but the
+    # outcome is unknown; False = known not sent; True = the command was submitted.
+    sent: bool | None = None
 
     @property
     def ok(self) -> bool:
@@ -708,8 +721,19 @@ class VcmiAgent:
             # Reply lines for THIS command can only appear after this offset; recording it lets
             # a later reconciliation distinguish this reply from a stale one of another session.
             offset = len(self.results())
-            with open(self.dir / 'commands.txt', 'a', encoding='utf-8', newline='\n') as f:
-                f.write(line + '\n')
+            try:
+                command_file = open(self.dir / 'commands.txt', 'a', encoding='utf-8',
+                                    newline='\n')
+            except OSError:
+                # Known not sent: the file was never opened, so no command bytes were queued.
+                raise
+            try:
+                with command_file:
+                    command_file.write(line + '\n')
+            except OSError as exc:
+                # The file was opened; a partial write is possible.  Never report this as a
+                # confirmed NOT_SENT.
+                raise SubmitUnknown(f'command file write failed after open: {exc}') from exc
             seq = lines + 1
         finally:
             try:
@@ -764,26 +788,30 @@ class VcmiAgent:
         """
         try:
             seq = self.submit(line)
+        except SubmitUnknown as exc:
+            return CommandResult(0, 'UNKNOWN', '', f'submission unknown: {exc}', sent=None)
         except OSError as exc:
-            return CommandResult(0, 'NOT_SENT', '', str(exc))
+            return CommandResult(0, 'NOT_SENT', '', str(exc), sent=False)
         try:
             kind, ln = self.wait_seq(seq, timeout=result_timeout)
         except TimeoutError:
-            return CommandResult(seq, 'UNKNOWN', '', 'no reply before timeout')
+            return CommandResult(seq, 'UNKNOWN', '', 'no reply before timeout', sent=True)
         if kind == 'ERR':
-            return CommandResult(seq, 'REJECTED', ln)
+            return CommandResult(seq, 'REJECTED', ln, sent=True)
         if verify is None:
-            return CommandResult(seq, 'COMPLETED', ln, 'submitted (no post-condition given)')
+            return CommandResult(seq, 'COMPLETED', ln, 'submitted (no post-condition given)',
+                                 sent=True)
         t0 = time.time()
         while time.time() - t0 < verify_timeout:
             try:
                 done, detail = verify()
             except StaleStateError as exc:
-                return CommandResult(seq, 'UNKNOWN', ln, f'state lost: {exc}')
+                return CommandResult(seq, 'UNKNOWN', ln, f'state lost: {exc}', sent=True)
             if done:
-                return CommandResult(seq, 'COMPLETED', ln, detail)
+                return CommandResult(seq, 'COMPLETED', ln, detail, sent=True)
             time.sleep(0.25)
-        return CommandResult(seq, 'UNKNOWN', ln, 'reply received but effect not observed')
+        return CommandResult(seq, 'UNKNOWN', ln, 'reply received but effect not observed',
+                             sent=True)
 
     # ------------------------------------------------------------------ screenshots
     def shot(self, path: Path | str | None = None):

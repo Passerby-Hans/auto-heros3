@@ -4012,6 +4012,8 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
     # as "submission unknown" (sent=None) and must create the unresolved-action gate.
     submission_attempted = False
     submission_returned = False
+    have_res_sent = False
+    res_sent = None
     try:
         agent = _agent()
         try:
@@ -4079,6 +4081,8 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
         line = _bridge_line(cmd, args)
         res = agent.execute(line, verify=None, result_timeout=15)
         submission_returned = True
+        have_res_sent = hasattr(res, 'sent')
+        res_sent = getattr(res, 'sent', None)
         seq = getattr(res, 'seq', None)
         bridge_status = str(getattr(res, 'status', '') or 'UNKNOWN')
         detail = str(getattr(res, 'detail', '') or getattr(res, 'line', '') or '')[:300]
@@ -4234,8 +4238,24 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
                    'enemies': [{'id': stack.get('id'), 'count': stack.get('count'),
                                 'hex': stack.get('hex')}
                                for stack in stacks if stack.get('side') != mine]}
-    if status == 'unknown' and (submission_attempted or seq is not None
-                                or bridge_status not in ('NOT_SENT', '', None)):
+    # N1 (GPT6 B0.7.2 review): "execute returned" alone is not proof of submission.  The
+    # driver explicitly classifies NOT_SENT (known pre-write failure) as sent=False and an
+    # open-but-write-failed submit as sent=None.  Keep three states; only fall back to the
+    # bridge status when the result has no explicit classification.
+    if submission_returned:
+        if have_res_sent and (isinstance(res_sent, bool) or res_sent is None):
+            sent_value = res_sent
+        elif bridge_status == 'NOT_SENT' and seq in (0, None):
+            sent_value = False
+        else:
+            sent_value = True
+    elif submission_attempted:
+        sent_value = None
+    else:
+        sent_value = False
+    if status == 'unknown' and sent_value is not False and (
+            submission_attempted or seq is not None
+            or bridge_status not in ('NOT_SENT', '', None)):
         # The command may have reached the engine but its outcome is not observable.  Block
         # further mutations until the caller inspects the game and closes this explicitly.
         _set_unresolved({'action': cmd, 'args': args, 'action_id': action_id,
@@ -4243,15 +4263,10 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
                          'evidence': evidence, 'bridge_status': bridge_status,
                          'submission_attempted': submission_attempted,
                          'submission_returned': submission_returned,
+                         'sent': sent_value,
                          'ts': time.time(), 'run_id': run['run_id'],
                          'branch_id': run['branch_id']})
         _overlay('event', f'未决动作 {cmd}（unknown）：后续动作已阻塞，需 resolve_unresolved')
-    if submission_returned:
-        sent_value = True
-    elif submission_attempted:
-        sent_value = None
-    else:
-        sent_value = False
     result = {'ok': status == 'completed', 'accepted': bool(accepted),
               'action_id': action_id, 'request_id': request, 'seq': seq,
               'retry_seq': retry_seq,

@@ -45,6 +45,42 @@ def find_window(title_prefix='VCMI'):
     return out
 
 
+def window_process_id(hwnd):
+    """Owning process id of a top-level window."""
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid))
+    return int(pid.value)
+
+
+def find_window_for_pid(pid, title_prefix='VCMI'):
+    """Candidate VCMI windows owned by *pid* (visible/non-minimized first).
+
+    A screenshot must bind to the CURRENT session's client process, not to whatever window is
+    first in EnumWindows order.  Hidden/minimized windows are still reported so the caller can
+    return a precise stale/unavailable error instead of trusting an older surface.
+    """
+    out = []
+
+    def cb(hwnd, _):
+        n = user32.GetWindowTextLengthW(hwnd)
+        title = ''
+        if n:
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            title = buf.value
+        if title_prefix and not title.startswith(title_prefix):
+            return True
+        if window_process_id(hwnd) != int(pid):
+            return True
+        out.append((hwnd, title, bool(user32.IsWindowVisible(hwnd)),
+                    bool(user32.IsIconic(hwnd))))
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(cb), 0)
+    out.sort(key=lambda item: (not item[2], item[3], item[0]))
+    return out
+
+
 def client_geometry(hwnd):
     """(client_w, client_h, client_screen_x, client_screen_y)."""
     cr = wt.RECT(); user32.GetClientRect(hwnd, ctypes.byref(cr))

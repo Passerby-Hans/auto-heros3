@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unified OFFLINE test entry - explicit whitelist, never a glob.
 
-Why: the suites live under ``tests/offline`` (26 deterministic suites) and ``tests/live``
+Why: the suites live under ``tests/offline`` (29 deterministic suites) and ``tests/live``
 (7 LIVE tests that start the real VCMI client and/or would write outside temporary
 directories).  Globbing all of them must never be the default.  This runner executes exactly
 the suites listed in ``OFFLINE_SUITES`` (each one is a plain script that prints
@@ -68,6 +68,7 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_b0_guards.py",
     "test_reliability_fixes.py",
     "test_explore_contract.py",
+    "test_knowledge_sources.py",
 )
 
 # LIVE suites: listed for transparency only; they start the real client / write real save

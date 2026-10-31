@@ -814,16 +814,71 @@ class VcmiAgent:
                              sent=True)
 
     # ------------------------------------------------------------------ screenshots
-    def shot(self, path: Path | str | None = None):
+    def capture_screenshot(self, path: Path | str | None = None) -> dict:
+        """Capture the CURRENT session window and write a freshness sidecar.
+
+        Why: `PrintWindow` can return an older surface if the cached hwnd is dead/reused or the
+        window is no longer the one the session owns.  AV.1a therefore re-resolves the window by
+        the session's client PID (not "first VCMI-titled window"), verifies the process create
+        time, refuses hidden/minimized surfaces, and records capture-time/window/source metadata
+        in `<path>.json`.  A screenshot is never silently reported as fresh when this binding
+        cannot be established - the caller gets a StaleStateError-style failure.
+        """
         import sys
         sys.path.insert(0, str(ROOT / 'tools'))
         import vcmi_shot
-        path = Path(path or (ROOT / 'var' / 'shots' / 'vcmi_agent.png'))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        img = vcmi_shot.grab(self.hwnd)
-        img.save(path)
-        self._print(f'[agent] shot -> {path} {img.size}')
-        return path
+
+        target = Path(path or (ROOT / 'var' / 'shots' / 'vcmi_agent.png'))
+        sess = self.session or self._load_session()
+        if sess is None or not sess.client_pid:
+            raise StaleStateError('no session/client pid: cannot bind a live screenshot source')
+        pid = int(sess.client_pid)
+        try:
+            proc = psutil.Process(pid)
+            create_time = float(proc.create_time())
+        except psutil.Error as exc:
+            raise StaleStateError(f'client pid {pid} is not alive: {exc}') from exc
+        if sess.client_create_time and abs(create_time - float(sess.client_create_time)) > 2.0:
+            raise StaleStateError(
+                f'client pid {pid} was reused by another process (create-time mismatch); '
+                'refusing a stale screenshot')
+        candidates = vcmi_shot.find_window_for_pid(pid)
+        if not candidates:
+            raise StaleStateError(f'no live window owned by client pid {pid}')
+        hwnd, title, visible, minimized = candidates[0]
+        if not visible or minimized:
+            raise StaleStateError(
+                f'client window {hwnd:#x} is not capturable (visible={visible}, '
+                f'minimized={minimized})')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        img = vcmi_shot.grab(hwnd)
+        img.save(target)
+        cw, ch, cx, cy = vcmi_shot.client_geometry(hwnd)
+        meta = {
+            'captured_at_wall': time.time(),
+            'captured_at_monotonic': time.monotonic(),
+            'client_pid': pid,
+            'hwnd': int(hwnd),
+            'window_title': title,
+            'window_visible': visible,
+            'window_minimized': minimized,
+            'client_rect': [int(cw), int(ch)],
+            'client_screen_origin': [int(cx), int(cy)],
+            'image_size': [int(img.size[0]), int(img.size[1])],
+            'candidates': [{'hwnd': int(item[0]), 'title': item[1],
+                            'visible': bool(item[2]), 'minimized': bool(item[3])}
+                           for item in candidates],
+        }
+        sidecar = target.with_suffix(target.suffix + '.json')
+        sidecar.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding='utf-8')
+        self.hwnd = hwnd
+        self.last_shot_meta = meta
+        self._print(f'[agent] shot -> {target} {img.size} hwnd={hwnd:#x} pid={pid}')
+        return {'path': str(target), 'meta': meta, 'sidecar': str(sidecar)}
+
+    def shot(self, path: Path | str | None = None):
+        """Backward-compatible screenshot entry (returns the image path)."""
+        return Path(self.capture_screenshot(path)['path'])
 
     # ------------------------------------------------------------------ verification helpers
     def wait_until(self, predicate, timeout: float = 10.0, interval: float = 0.3):

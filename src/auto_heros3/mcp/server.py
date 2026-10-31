@@ -5619,15 +5619,36 @@ def game_screenshot(path: str | None = None) -> object:
     Default: var/shots/current.png - deliberately an untracked path.  The old default
     var/shots/mcp_v2.png is a git-tracked file: a routine capture used to overwrite it and dirty
     the worktree (D-014 ④), so it must never be the implicit target again.
+
+    AV.1a: the capture is bound to the CURRENT session client PID/HWND and writes a
+    `<path>.json` freshness sidecar (capture wall/monotonic time, hwnd, pid, window title/rect,
+    source size, candidates).  If a live current window cannot be established, this returns an
+    explicit stale/failed result instead of an old image.
     """
     target = Path(path) if path else (ROOT / 'var' / 'shots' / 'current.png')
-    saved = _agent().shot(target)
+    agent = _agent()
+    captured: dict | None = None
+    try:
+        if hasattr(agent, 'capture_screenshot'):
+            captured = agent.capture_screenshot(target)
+            saved = Path(captured['path'])
+        else:  # legacy/fake agents in offline fixtures
+            saved = agent.shot(target)
+    except Exception as exc:  # noqa: BLE001 - report freshness/capture failure explicitly
+        text = f'{type(exc).__name__}: {exc}'
+        status = 'stale' if 'stale' in text.lower() or 'no live window' in text.lower() else 'capture_failed'
+        return {'ok': False, 'status': status, 'error': text, 'path': str(target)}
     if Image is not None:
         try:
             return Image(path=str(saved))
         except Exception:
             pass
-    return {'ok': True, 'path': str(saved), 'bytes': saved.stat().st_size}
+    result = {'ok': True, 'path': str(saved), 'bytes': saved.stat().st_size}
+    if captured and captured.get('meta'):
+        result['capture'] = captured['meta']
+        if captured.get('sidecar'):
+            result['sidecar'] = captured['sidecar']
+    return result
 
 
 # ------------------------------------------------------------------ recording sidecars (§5.2 / T8)

@@ -559,6 +559,53 @@ def test_recruit_hero_precondition() -> None:
               str(fake.sent))
 
 
+class CaptureAgent:
+    """AV.1a-style agent: capture_screenshot writes image + freshness sidecar."""
+
+    def capture_screenshot(self, path=None):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'fake-png')
+        meta = {'captured_at_wall': 1.0, 'captured_at_monotonic': 2.0,
+                'client_pid': 456, 'hwnd': 123, 'window_title': 'VCMI',
+                'window_visible': True, 'window_minimized': False,
+                'client_rect': [8, 6], 'image_size': [8, 6], 'candidates': []}
+        sidecar = target.with_suffix(target.suffix + '.json')
+        sidecar.write_text(json.dumps(meta), encoding='utf-8')
+        return {'path': str(target), 'meta': meta, 'sidecar': str(sidecar)}
+
+
+class StaleCaptureAgent:
+    def capture_screenshot(self, path=None):
+        raise RuntimeError('StaleStateError: no live window owned by client pid 456')
+
+
+def test_screenshot_freshness_binding() -> None:
+    with Env() as env:
+        original_root, original_image = M.ROOT, M.Image
+        M.ROOT = env.root / 'root'
+        M.Image = None
+        try:
+            env.agent(CaptureAgent())
+            target = env.root / 'shots' / 'captured.png'
+            res = M.game_screenshot(str(target))
+            sidecar = target.with_suffix(target.suffix + '.json')
+            check('5D2-4 game_screenshot exposes capture-time/hwnd/pid freshness metadata',
+                  isinstance(res, dict) and res.get('ok') is True
+                  and (res.get('capture') or {}).get('hwnd') == 123
+                  and (res.get('capture') or {}).get('client_pid') == 456
+                  and sidecar.exists(), str(res)[:220])
+            env.agent(StaleCaptureAgent())
+            stale = M.game_screenshot(str(env.root / 'shots' / 'stale.png'))
+            check('5D2-5 an unbindable window is reported stale, never as an old image',
+                  isinstance(stale, dict) and stale.get('ok') is False
+                  and stale.get('status') in ('stale', 'capture_failed')
+                  and 'no live window' in str(stale.get('error')),
+                  str(stale)[:220])
+        finally:
+            M.ROOT, M.Image = original_root, original_image
+
+
 def main() -> int:
     test_rotate_archives_and_resets_chain()
     test_rotate_never_deletes_unarchived_chain()
@@ -569,6 +616,7 @@ def main() -> int:
     test_save_never_settles()
     test_save_missing_and_unchanged()
     test_screenshot_default_path()
+    test_screenshot_freshness_binding()
     test_in_flight_rejection()
     test_slot_released_on_exception()
     test_nested_composite_call()

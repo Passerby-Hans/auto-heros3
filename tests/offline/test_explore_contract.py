@@ -328,6 +328,82 @@ def test_not_sent_is_not_counted_as_sent_actions() -> None:
               str(response)[:260])
 
 
+def test_post_submit_exception_keeps_submission_unknown() -> None:
+    """R1: an exception after the real submit() must not be classified as 'not sent'."""
+    from auto_heros3.runtime.vcmi_agent import VcmiAgent
+
+    with Env() as env:
+        agent = VcmiAgent(M._dir(), log=False)
+        real_execute = agent.execute
+
+        def execute(line, verify=None, result_timeout=20):
+            if line.startswith('probe'):
+                return bridge_ok(1, 'probe 2,1,0=1')
+            return real_execute(line, verify=verify, result_timeout=result_timeout)
+
+        def wait_error(*_args, **_kwargs):
+            raise PermissionError('injected results.log read failure AFTER real submit')
+
+        agent.execute = execute
+        agent.wait_seq = wait_error
+        agent.state = lambda timeout=10: hero_state()
+        env.agent(agent)
+        response = M.explore_toward(0, 2, 1, map_w=8, map_h=8,
+                                    operation_id='post-submit-error')
+        operation = M._explore_op_read('post-submit-error') or {}
+        commands = ((M._dir() / 'commands.txt').read_text(encoding='utf-8').splitlines()
+                    if (M._dir() / 'commands.txt').exists() else [])
+        unresolved = M._load_unresolved()
+        move_attempts = [item for item in operation.get('attempts') or []
+                         if item.get('action') == 'move_hero']
+        check('L23 a post-submit exception is not classified as refused/not-sent',
+              response.get('status') == 'unknown_action'
+              and not operation.get('refused_actions')
+              and len(move_attempts) == 1
+              and move_attempts[0].get('sent') is None,
+              f"commands={commands} response={str(response)[:200]} "
+              f"op={str(operation)[:300]}")
+        check('L24 the submitted command is persisted and the unresolved gate is established',
+              any(line.startswith('move_hero ') for line in commands)
+              and bool(unresolved)
+              and move_attempts[0] in (operation.get('inflight_actions') or []),
+              f"commands={commands} unresolved={str(unresolved)[:180]}")
+
+
+def test_legacy_b07_operation_is_preserved() -> None:
+    """R2: a pre-B0.7.1 record has no attempts; migrating it must not erase its history."""
+    with Env():
+        legacy = {
+            'operation_id': 'b07-existing', 'status': 'running',
+            'started_at': time.time() - 10, 'deadline': time.time() + 100,
+            'hero': 0, 'target': [9, 9, 0], 'max_steps': 8, 'max_turns': 0,
+            'sent_actions': [{'action': 'move_hero', 'tile': [2, 1, 0],
+                              'request_id': 'explore-move-prior',
+                              'action_id': 'prior-id', 'seq': 10,
+                              'status': 'completed', 'ts': time.time() - 9}],
+            'steps_done': 1, 'moves': 1, 'cancel_requested': False,
+            'result_status': None, 'error': None,
+        }
+        path = M._explore_op_path('b07-existing')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(legacy), encoding='utf-8')
+        response = M.explore_cancel('b07-existing')
+        after = M._explore_op_read('b07-existing') or {}
+        preserved = after.get('sent_actions') or []
+        migrated = after.get('attempts') or []
+        check('L25 cancelling a legacy operation preserves request_id/action_id/seq',
+              response.get('ok') is True and preserved
+              and preserved[0].get('request_id') == 'explore-move-prior'
+              and preserved[0].get('action_id') == 'prior-id'
+              and preserved[0].get('seq') == 10,
+              json.dumps(after, ensure_ascii=False)[:400])
+        check('L26 legacy entries are migrated as unknown (sent=None), not assumed sent',
+              len(migrated) == 1 and migrated[0].get('sent') is None
+              and migrated[0].get('legacy') is True
+              and migrated[0] in (after.get('inflight_actions') or []),
+              json.dumps(after, ensure_ascii=False)[:400])
+
+
 def main() -> int:
     test_interface()
     test_reached_completion_has_operation_record()
@@ -338,6 +414,8 @@ def main() -> int:
     test_crash_leaves_a_durable_attempt_record()
     test_persistence_failure_is_reported_not_completed()
     test_not_sent_is_not_counted_as_sent_actions()
+    test_post_submit_exception_keeps_submission_unknown()
+    test_legacy_b07_operation_is_preserved()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f'\n{passed}/{len(RESULTS)} checks passed')
     return 0 if passed == len(RESULTS) else 1

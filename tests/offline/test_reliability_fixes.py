@@ -11,6 +11,7 @@ suite guards the split with a >64 KiB file.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mcp_server_v2 as M  # noqa: E402
-from test_action_contract import Env, state  # noqa: E402
+from test_action_contract import Env, FakeAgent, state  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -85,7 +86,42 @@ def test_battle_actions_concurrent_cache() -> None:
                    for key, value in results.items()}))
 
 
+def test_battle_actions_cross_process_lock() -> None:
+    """R3: a foreign process holding the shared cache lock must block the query."""
+    with Env() as env:
+        payload = {'active': 333, 'targets': [{'id': 333}]}
+
+        def on_execute(_line: str) -> None:
+            path = M._dir() / 'battle_actions.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload), encoding='utf-8')
+
+        env.agent(FakeAgent([state(battle={'active': True})], on_execute=on_execute))
+        lock_path = M._dir() / '.lock_battle_actions'
+        ready_path = M._dir() / '.lock_battle_actions.ready'
+        script = (
+            "import pathlib,time;"
+            f"lock=pathlib.Path({str(lock_path)!r});"
+            f"ready=pathlib.Path({str(ready_path)!r});"
+            "lock.write_text('child');ready.write_text('1');"
+            "time.sleep(0.8);lock.unlink();ready.unlink()"
+        )
+        child = subprocess.Popen([sys.executable, '-c', script])
+        deadline = time.time() + 5
+        while not ready_path.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        started = time.time()
+        result = M.battle_actions()
+        elapsed = time.time() - started
+        child.wait(5)
+        check('R6 battle_actions honors the cross-process shared-cache lock',
+              elapsed >= 0.5 and result.get('ok') is True
+              and result.get('active') == 333,
+              f'elapsed={elapsed:.2f}s result={str(result)[:200]}')
+
+
 def main() -> int:
+    test_battle_actions_cross_process_lock()
     test_battle_actions_concurrent_cache()
     with tempfile.TemporaryDirectory(prefix='reliability-signature-') as tmp:
         path = Path(tmp) / 'ui_tree.json'

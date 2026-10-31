@@ -4006,6 +4006,12 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
     before: dict = {}
     st: dict = {}
     retry_seq = None
+    # R1 (GPT6 B0.7.1 review): `bridge_status=NOT_SENT`/seq=None are initial defaults and do
+    # NOT prove the command was never submitted.  Track the submission attempt separately; an
+    # exception after execute() may have appended commands.txt already, so it must be reported
+    # as "submission unknown" (sent=None) and must create the unresolved-action gate.
+    submission_attempted = False
+    submission_returned = False
     try:
         agent = _agent()
         try:
@@ -4069,8 +4075,10 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
                 _index_finish(request, arg_key, result)
             _overlay('action', f"{cmd} -> rejected (precondition)")
             return result
+        submission_attempted = True
         line = _bridge_line(cmd, args)
         res = agent.execute(line, verify=None, result_timeout=15)
+        submission_returned = True
         seq = getattr(res, 'seq', None)
         bridge_status = str(getattr(res, 'status', '') or 'UNKNOWN')
         detail = str(getattr(res, 'detail', '') or getattr(res, 'line', '') or '')[:300]
@@ -4226,24 +4234,34 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
                    'enemies': [{'id': stack.get('id'), 'count': stack.get('count'),
                                 'hex': stack.get('hex')}
                                for stack in stacks if stack.get('side') != mine]}
-    if status == 'unknown' and (seq is not None or bridge_status not in ('NOT_SENT', '', None)):
+    if status == 'unknown' and (submission_attempted or seq is not None
+                                or bridge_status not in ('NOT_SENT', '', None)):
         # The command may have reached the engine but its outcome is not observable.  Block
         # further mutations until the caller inspects the game and closes this explicitly.
         _set_unresolved({'action': cmd, 'args': args, 'action_id': action_id,
                          'request_id': request, 'seq': seq, 'status': status,
                          'evidence': evidence, 'bridge_status': bridge_status,
+                         'submission_attempted': submission_attempted,
+                         'submission_returned': submission_returned,
                          'ts': time.time(), 'run_id': run['run_id'],
                          'branch_id': run['branch_id']})
         _overlay('event', f'未决动作 {cmd}（unknown）：后续动作已阻塞，需 resolve_unresolved')
+    if submission_returned:
+        sent_value = True
+    elif submission_attempted:
+        sent_value = None
+    else:
+        sent_value = False
     result = {'ok': status == 'completed', 'accepted': bool(accepted),
               'action_id': action_id, 'request_id': request, 'seq': seq,
               'retry_seq': retry_seq,
               'bridge_status': bridge_status, 'status': status, 'evidence': evidence,
               'detail': detail, 'bridge_line': line_text[:300],
-              'decisions': decisions, 'battle': summary}
+              'decisions': decisions, 'battle': summary, 'sent': sent_value}
     _ledger({'action': cmd, 'args': args, 'seq': seq, 'retry_seq': retry_seq,
              'bridge_status': bridge_status,
              'status': status, 'accepted': bool(accepted), 'evidence': evidence,
+             'sent': sent_value,
              'action_id': action_id, 'request_id': request, 'run_id': run['run_id'],
              'branch_id': run['branch_id'], 'detail': detail})
     if request:
@@ -4530,6 +4548,21 @@ def _battle_cache_stamp(path: Path):
 _BATTLE_ACTIONS_LOCK = threading.Lock()
 
 
+@contextmanager
+def _battle_actions_transaction():
+    """Serialize the shared battle_actions cache across threads AND server processes.
+
+    The lease only limits mutating writers; a second read-only process can still query the same
+    state dir and overwrite the bridge's single cache file.  The O_EXCL file lock covers that
+    cross-process boundary for the whole query transaction.  The holder/expiry semantics come
+    from `_file_lock` (10 s stale reclaim, 30 s waiter budget here).
+    """
+    _dir().mkdir(parents=True, exist_ok=True)
+    with _BATTLE_ACTIONS_LOCK:
+        with _file_lock('battle_actions', timeout=30):
+            yield
+
+
 def _battle_actions_query(agent) -> dict:
     """One complete battle_actions query under `_BATTLE_ACTIONS_LOCK` (F5)."""
     path = _dir() / 'battle_actions.json'
@@ -4605,12 +4638,16 @@ def battle_actions() -> dict:
     if not (st.get('battle') or {}).get('active'):
         return {'ok': False, 'error': 'no active battle'}
     agent = _agent()
-    # F5 (GPT6): the bridge cache is a single shared file.  Serialize the WHOLE query
-    # (reply + cache freshness + read) so another battle_actions call cannot overwrite the
-    # cache between this query's reply and its read.  The single-writer lease means one MCP
-    # server owns a state dir; cross-process readers are not part of the contract.
-    with _BATTLE_ACTIONS_LOCK:
-        return _battle_actions_query(agent)
+    # F5/R3 (GPT6): the bridge cache is a single shared file.  Serialize the WHOLE query
+    # (reply + cache freshness + read) across threads and server processes; a read-only second
+    # process (no lease) must not replace the cache between this query's reply and its read.
+    try:
+        with _battle_actions_transaction():
+            return _battle_actions_query(agent)
+    except RuntimeError as exc:
+        return {'ok': False, 'status': 'lock_busy',
+                'error': f'battle_actions shared cache lock unavailable: {exc}',
+                'hint': 'another process is querying battle_actions; retry after it finishes'}
 
 
 @mcp.tool()
@@ -4761,12 +4798,37 @@ def _explore_sync_views(operation: dict) -> None:
     F4 (GPT6): a NOT_SENT precondition refusal is an attempt, not a submission.  Keep `sent`,
     `bridge_status`, `request_id` and `seq` on every attempt so a recovery consumer can tell
     "tried to call" from "may have been submitted".
+
+    R2 (GPT6 B0.7.1 review): pre-B0.7.1 records have only `sent_actions` and no `attempts`.
+    Treat a missing `attempts` field as a legacy record, migrate each entry conservatively with
+    `sent=None`/`legacy_unknown` (never assume it was sent), keep the original list in
+    `legacy_sent_actions`, and do not clear it when a cancel rewrites the record.
     """
-    attempts = [item for item in (operation.get('attempts') or []) if isinstance(item, dict)]
-    operation['attempts'] = attempts
-    operation['sent_actions'] = [item for item in attempts if item.get('sent') is True]
+    raw_attempts = operation.get('attempts')
+    if raw_attempts is None:
+        legacy = [dict(item) for item in (operation.get('sent_actions') or [])
+                  if isinstance(item, dict)]
+        attempts = []
+        for item in legacy:
+            migrated = dict(item)
+            migrated.setdefault('sent', None)
+            migrated.setdefault('status', 'legacy_unknown')
+            migrated['legacy'] = True
+            attempts.append(migrated)
+        operation['attempts'] = attempts
+        operation['legacy_sent_actions'] = legacy
+        operation['legacy_format'] = True
+    else:
+        attempts = [item for item in raw_attempts if isinstance(item, dict)]
+        operation['attempts'] = attempts
     operation['refused_actions'] = [item for item in attempts if item.get('sent') is False]
     operation['inflight_actions'] = [item for item in attempts if item.get('sent') is None]
+    if operation.get('legacy_format'):
+        # Preserve the historical list verbatim; its entries are unknown-submission, not proven
+        # sent.  New code reads attempts/inflight_actions for recovery.
+        operation['sent_actions'] = list(operation.get('legacy_sent_actions') or [])
+    else:
+        operation['sent_actions'] = [item for item in attempts if item.get('sent') is True]
 
 
 def _explore_op_write_locked(operation: dict) -> None:
@@ -4819,9 +4881,11 @@ def _explore_finish_attempt(operation: dict, request_id: str, outcome: dict) -> 
         if attempt.get('request_id') != request_id:
             continue
         sent = outcome.get('sent')
-        if not isinstance(sent, bool):
-            # game_act omits `sent` on some success paths; infer conservatively from the
-            # submission evidence.  A rejected/query blocked result carries sent=false already.
+        if 'sent' in outcome:
+            # An explicit None means "submitted/unknown": never infer not-sent from the
+            # initial DEFAULT NOT_SENT/seq=None fields (R1).
+            sent = sent if isinstance(sent, bool) else None
+        else:
             bridge_status = str(outcome.get('bridge_status') or '').upper()
             status = str(outcome.get('status') or '')
             if bridge_status == 'NOT_SENT' or (outcome.get('seq') is None

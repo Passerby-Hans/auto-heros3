@@ -4695,11 +4695,76 @@ def move_near(hero: int, x: int, y: int, z: int = 0, radius: int = 1) -> dict:
             'attempts': attempts}
 
 
+# ---------------------------------------------------------------- explore operation contract (B0.7)
+# The explorer is a long-running composite (probe + move + optional end_turn).  The old tool
+# only had step/turn budgets and could not be cancelled or given an overall wall-clock limit;
+# an UNKNOWN action could only be discovered after the whole call returned.  This contract gives
+# each invocation a durable identity + status file and makes the loop stop before its next
+# action on (a) an explicit cancel request, (b) the overall deadline, or (c) an UNKNOWN action.
+# It never retries an UNKNOWN action and reports the actions already sent for reconciliation.
+_EXPLORE_DEFAULT_BUDGET_S = 180.0
+_EXPLORE_MAX_BUDGET_S = 3600.0
+_EXPLORE_OP_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+
+def _explore_ops_dir() -> Path:
+    return _dir() / 'explore_operations'
+
+
+def _explore_op_path(operation_id: str) -> Path:
+    return _explore_ops_dir() / f'{operation_id}.json'
+
+
+def _explore_op_read(operation_id: str) -> dict | None:
+    try:
+        data = json.loads(_explore_op_path(operation_id).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _explore_op_write(operation: dict) -> None:
+    """Atomically persist one operation record, preserving a concurrent cancel request."""
+    current = _explore_op_read(str(operation['operation_id'])) or {}
+    if current.get('cancel_requested'):
+        operation['cancel_requested'] = True
+    operation['updated_at'] = round(time.time(), 3)
+    path = _explore_op_path(str(operation['operation_id']))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(path, operation)
+
+
+def _explore_latest_running() -> dict | None:
+    try:
+        paths = sorted(_explore_ops_dir().glob('*.json'),
+                       key=lambda item: item.stat().st_mtime_ns, reverse=True)
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            operation = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(operation, dict)
+                and operation.get('status') in ('running', 'cancel_requested')):
+            return operation
+    return None
+
+
+class _ExploreStopped(Exception):
+    """Internal stop signal for deadline / cancel / an UNKNOWN action (never swallowed)."""
+
+    def __init__(self, status: str, message: str = ''):
+        super().__init__(message or status)
+        self.status = status
+
+
 @mcp.tool()
 @_serialized_mutation('explore_toward')
 def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
                    max_turns: int = 0, map_w: int | None = None,
-                   map_h: int | None = None) -> dict:
+                   map_h: int | None = None, operation_id: str | None = None,
+                   time_budget_s: float | None = None) -> dict:
     """Fallback shroud-border BFS explorer: walk the black shroud, step by step, toward a target.
 
     Why it exists: the client pathfinder (the very same call that draws the hover arrows) treats
@@ -4724,6 +4789,15 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
     (border exhausted: walls/void or another walkable component) / need_turn (movement spent;
     pass max_turns>0 to end turns automatically) / max_steps.
 
+    B0.7 operation contract: pass `operation_id` (or let the tool generate one) and
+    `time_budget_s` (default 180 s, max 3600).  The operation is persisted under
+    <state>/explore_operations/<id>.json with status running -> completed/stopped/cancelled/
+    timed_out/error and the exact `sent_actions`.  `explore_cancel(operation_id)` sets a cancel
+    request; the loop checks it before every probe/move/end_turn and stops before the next
+    action.  At the overall deadline it stops the same way.  An UNKNOWN move stops the loop
+    immediately (status=unknown_action) and is NEVER retried; reconcile the recorded
+    action_ids with game_action_status before sending anything else.
+
     map_w/map_h: optional scenario size (e.g. 36 for Key to Victory) - the explorer only ever
     probes tiles inside the map box, because the engine indexes the fog map without bounds
     checks.  Without them the box is inferred from the observed coordinates (smaller, still safe).
@@ -4742,6 +4816,31 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
     if map_w is not None and (not isinstance(map_w, int) or not isinstance(map_h, int)
                               or map_w < 1 or map_h < 1):
         return {'ok': False, 'error': 'map_w/map_h must be positive integers'}
+    if operation_id is None:
+        op_id = f'explore-{uuid.uuid4().hex[:12]}'
+    elif not isinstance(operation_id, str) or not _EXPLORE_OP_ID_RE.fullmatch(operation_id):
+        return {'ok': False,
+                'error': 'operation_id must match [A-Za-z0-9_-]{1,64}'}
+    else:
+        op_id = operation_id
+    if time_budget_s is None:
+        budget = _EXPLORE_DEFAULT_BUDGET_S
+    elif (isinstance(time_budget_s, bool) or not isinstance(time_budget_s, (int, float))
+          or not 0.01 <= float(time_budget_s) <= _EXPLORE_MAX_BUDGET_S):
+        return {'ok': False,
+                'error': f'time_budget_s must be a number in 0.01..{_EXPLORE_MAX_BUDGET_S:.0f}'}
+    else:
+        budget = float(time_budget_s)
+    existing = _explore_op_read(op_id)
+    if existing is not None:
+        if (existing.get('status') in ('running', 'cancel_requested')
+                and float(existing.get('deadline') or 0) > time.time()):
+            return {'ok': False, 'status': 'operation_in_progress', 'operation_id': op_id,
+                    'operation': existing,
+                    'hint': 'this operation is still running; cancel it first or observe it'}
+        return {'ok': False, 'status': 'operation_id_exists', 'operation_id': op_id,
+                'operation': existing,
+                'hint': 'operation ids are durable; use a new id (no silent resume/retry)'}
     unresolved_error = _unresolved_error()
     if unresolved_error is not None:
         return {'ok': False, 'status': 'blocked', 'error': unresolved_error['error'],
@@ -4762,20 +4861,69 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
     except ValueError as exc:
         return {'ok': False, 'error': f'bad map size: {exc}'}
     agent = _agent()
+    started = time.time()
+    operation = {
+        'operation_id': op_id, 'status': 'running', 'started_at': round(started, 3),
+        'deadline': round(started + budget, 3), 'time_budget_s': budget,
+        'hero': hero, 'target': [x, y, z], 'max_steps': max_steps, 'max_turns': max_turns,
+        'sent_actions': [], 'steps_done': 0, 'moves': 0,
+        'cancel_requested': False, 'result_status': None, 'error': None,
+    }
+    _explore_op_write(operation)
+
+    def check_stop() -> None:
+        live = _explore_op_read(op_id) or {}
+        if live.get('cancel_requested'):
+            raise _ExploreStopped('cancelled', 'cancel requested by explore_cancel')
+        if time.time() >= operation['deadline']:
+            raise _ExploreStopped('timed_out',
+                                  f'overall wall-clock budget {budget:g}s exceeded')
+
+    def remaining() -> float:
+        return max(0.0, operation['deadline'] - time.time())
+
+    def record(action: str, outcome: dict, tile=None) -> None:
+        operation['sent_actions'].append({
+            'action': action, 'tile': list(tile) if tile else None,
+            'request_id': outcome.get('request_id'),
+            'action_id': outcome.get('action_id'), 'seq': outcome.get('seq'),
+            'status': outcome.get('status'), 'ts': round(time.time(), 3),
+        })
+        operation['steps_done'] = int(operation.get('steps_done') or 0) + 1
+        if action == 'move_hero':
+            operation['moves'] = int(operation.get('moves') or 0) + 1
+        _explore_op_write(operation)
+        if str(outcome.get('status') or '') == 'unknown':
+            raise _ExploreStopped('unknown_action',
+                                  f'{action} outcome UNKNOWN; stopping without retrying')
 
     def probe(tiles):
-        result = agent.execute(fp.probe_command(hero, tiles), verify=None,
-                               result_timeout=60)
+        check_stop()
+        timeout = max(0.5, min(60.0, remaining() or 0.5))
+        try:
+            result = agent.execute(fp.probe_command(hero, tiles), verify=None,
+                                   result_timeout=timeout)
+        except Exception:
+            if time.time() >= operation['deadline']:
+                raise _ExploreStopped('timed_out',
+                                      f'overall wall-clock budget {budget:g}s exceeded')
+            raise
+        check_stop()
         body = str(getattr(result, 'line', '') or '')
         if 'OK probe' not in body:
             raise RuntimeError(f'probe failed: {body[:200]}')
         return fp.parse_probe_reply(body)
 
     def move(tile):
+        check_stop()
+        request_id = f'explore-move-{uuid.uuid4().hex[:12]}'
         outcome = game_act('move_hero', {'hero': hero, 'x': int(tile[0]),
                                         'y': int(tile[1]), 'z': int(tile[2])},
-                           request_id=f'explore-move-{uuid.uuid4().hex[:12]}',
+                           request_id=request_id,
                            thought=f'探索黑幕边缘：踩上 ({tile[0]},{tile[1]}) 打开视野')
+        outcome = dict(outcome or {})
+        outcome.setdefault('request_id', request_id)
+        record('move_hero', outcome, tile)
         status = str(outcome.get('status') or '')
         return {'ok': status in ('completed', 'submitted'), 'status': status,
                 'action_id': outcome.get('action_id'), 'error': outcome.get('error'),
@@ -4786,9 +4934,13 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
         return fresh if (fresh and not observe_error) else {}
 
     def end_turn():
-        outcome = game_act('end_turn', {},
-                           request_id=f'explore-turn-{uuid.uuid4().hex[:12]}',
+        check_stop()
+        request_id = f'explore-turn-{uuid.uuid4().hex[:12]}'
+        outcome = game_act('end_turn', {}, request_id=request_id,
                            thought='探索黑幕边缘：移动力用尽，结束回合后继续沿黑幕走')
+        outcome = dict(outcome or {})
+        outcome.setdefault('request_id', request_id)
+        record('end_turn', outcome)
         status = str(outcome.get('status') or '')
         return {'ok': status in ('completed', 'submitted'), 'status': status,
                 'action_id': outcome.get('action_id'), 'error': outcome.get('error')}
@@ -4799,24 +4951,82 @@ def explore_toward(hero: int, x: int, y: int, z: int = 0, max_steps: int = 8,
                               max_turns=max_turns)
     try:
         result = explorer.run(max_moves=max_steps, max_turns=max_turns)
+    except _ExploreStopped as stop:
+        operation.update(status=stop.status, result_status=stop.status,
+                         error=str(stop), elapsed_s=round(time.time() - started, 2))
+        _explore_op_write(operation)
+        _ledger({'action': 'explore_toward', 'status': stop.status, 'accepted': False,
+                 'hero': hero, 'target': [x, y, z], 'operation_id': op_id,
+                 'result_status': stop.status, 'sent_actions': operation['sent_actions'],
+                 'elapsed_s': operation['elapsed_s'], 'error': str(stop)})
+        return {'ok': False, 'status': stop.status, 'operation_id': op_id,
+                'operation_status': stop.status, 'error': str(stop),
+                'elapsed_s': operation['elapsed_s'], 'sent_actions': operation['sent_actions'],
+                'hint': ('stopped before the next action; reconcile sent_actions with '
+                         'game_action_status; never auto-retry an UNKNOWN action')}
     except Exception as exc:  # noqa: BLE001 - bridge/probe errors must be a typed result
-        return {'ok': False, 'status': 'error', 'error': f'explore_toward failed: {exc}'}
+        operation.update(status='error', result_status='error', error=str(exc),
+                         elapsed_s=round(time.time() - started, 2))
+        _explore_op_write(operation)
+        return {'ok': False, 'status': 'error', 'operation_id': op_id,
+                'operation_status': 'error', 'error': f'explore_toward failed: {exc}',
+                'elapsed_s': operation['elapsed_s'], 'sent_actions': operation['sent_actions']}
     trace = result.get('trace') or []
     stats = result.get('stats') or {}
     moves = len([entry for entry in trace if entry.get('kind') in ('frontier', 'direct')])
+    operation.update(status='completed' if result.get('ok') else 'stopped',
+                     result_status=result.get('status'), moves=moves,
+                     elapsed_s=round(time.time() - started, 2))
+    _explore_op_write(operation)
     _ledger({'action': 'explore_toward',
              'status': 'completed' if result.get('ok') else 'submitted',
              'accepted': bool(result.get('ok')),
-             'hero': hero, 'target': [x, y, z], 'result_status': result.get('status'),
-             'moves': moves, 'turns': result.get('turns'), 'bounds': list(bounds),
+             'hero': hero, 'target': [x, y, z], 'operation_id': op_id,
+             'result_status': result.get('status'), 'moves': moves,
+             'turns': result.get('turns'), 'bounds': list(bounds),
+             'sent_actions': operation['sent_actions'],
              'evidence': (f"hero {result.get('hero_tile')} status={result.get('status')} "
                           f"region={stats.get('region_reachable')} "
                           f"revealed={stats.get('revealed_tiles')} moves={moves}")})
     return {'ok': bool(result.get('ok')), 'status': result.get('status'),
+            'operation_id': op_id, 'operation_status': operation['status'],
+            'elapsed_s': operation['elapsed_s'], 'sent_actions': operation['sent_actions'],
             'hero': hero, 'hero_tile': result.get('hero_tile'), 'target': [x, y, z],
             'map_bounds': list(bounds), 'moves': moves, 'turns': result.get('turns'),
             'stats': stats, 'trace': trace[-8:], 'query': result.get('query'),
             'hint': result.get('hint'), 'reason': result.get('reason')}
+
+
+@mcp.tool()
+def explore_cancel(operation_id: str | None = None) -> dict:
+    """Request cancellation of a running `explore_toward` operation.
+
+    This is a control-plane tool (NOT a mutating game action and NOT serialized): it writes a
+    cancel_requested flag into <state>/explore_operations/<id>.json.  The running explorer checks
+    the flag before every probe/move/end_turn and stops before its next action; it does not send
+    new actions and never retries an UNKNOWN one.  Omit operation_id to cancel the newest
+    running/cancel_requested operation.
+    """
+    if operation_id is not None and (not isinstance(operation_id, str)
+                                     or not _EXPLORE_OP_ID_RE.fullmatch(operation_id)):
+        return {'ok': False, 'error': 'operation_id must match [A-Za-z0-9_-]{1,64}'}
+    target = operation_id or ''
+    operation = _explore_op_read(target) if target else _explore_latest_running()
+    if operation is None:
+        return {'ok': False, 'error': 'no_running_operation',
+                'operation_id': target or None}
+    status = str(operation.get('status') or '')
+    op_id = str(operation.get('operation_id') or target)
+    if status not in ('running', 'cancel_requested'):
+        return {'ok': False, 'error': 'operation_not_running', 'operation_id': op_id,
+                'status': status, 'sent_actions': operation.get('sent_actions') or []}
+    operation['cancel_requested'] = True
+    operation['status'] = 'cancel_requested'
+    _explore_op_write(operation)
+    return {'ok': True, 'operation_id': op_id, 'status': 'cancel_requested',
+            'sent_actions': operation.get('sent_actions') or [],
+            'note': ('the running explorer stops before its next action; reconcile any '
+                     'UNKNOWN action via game_action_status and never auto-retry it')}
 
 
 _BATTLE_ASSESS_DISCLAIMER = (

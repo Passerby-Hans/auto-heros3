@@ -275,7 +275,7 @@ tools/vcmi_overlay_recorder.py  离屏录屏兼容壳（→ src/auto_heros3/reco
 tools/fog_path.py               黑幕边界 BFS 探索器兼容壳（→ src/auto_heros3/exploration/fog_path.py）
 tools/fog_path_live.py          实机黑幕探索演示 CLI
 tools/fog_battle.py             战斗机械执行器（演示/诊断用；正式对局由 LLM 决策）
-tests/offline/                  离线回归套件（29 套，统一入口 tools/run_offline_suite.py）
+tests/offline/                  离线回归套件（30 套，统一入口 tools/run_offline_suite.py）
 tests/live/                     隔离 live 套件（7 套；tools/test_*.py 保留兼容入口）
 tools/bridge_contract.json      锁定客户端 sha256 / protocol / 冻结行为
 agent/h3/                       Track A 零售版逆向（历史保留，当前主轨不使用）
@@ -287,8 +287,8 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 
 - MCP 自检：`.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   （打印能力清单并做一次租约 acquire/release；不会启动游戏）。
-- 离线回归：`tests/offline/` 共 **29 套 / 936 项断言**，统一入口一次跑完（显式白名单，7 个 live
-  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-10-31 复核 **936/936 PASS**）：
+- 离线回归：`tests/offline/` 共 **30 套 / 966 项断言**，统一入口一次跑完（显式白名单，7 个 live
+  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-11-02 复核 **966/966 PASS**）：
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
@@ -657,7 +657,7 @@ tools/vcmi_overlay_recorder.py  off-screen recorder compatibility shim (→ src/
 tools/fog_path.py               shroud-border BFS explorer compatibility shim (→ src/auto_heros3/exploration/fog_path.py)
 tools/fog_path_live.py          live shroud-exploration demo CLI
 tools/fog_battle.py             mechanical battle executor (demo/diagnostics; real games are LLM-decided)
-tests/offline/                  offline regression suites (29; unified entry tools/run_offline_suite.py)
+tests/offline/                  offline regression suites (30; unified entry tools/run_offline_suite.py)
 tests/live/                     isolated live suites (7; tools/test_*.py kept as compatibility entries)
 tools/bridge_contract.json      pinned client sha256 / protocol / frozen behaviour
 agent/h3/                       Track A retail-binary reverse engineering (kept for reference; unused by the main track)
@@ -669,9 +669,9 @@ doc/                            engineering docs / handover / log (kept locally,
 
 - MCP self-test: `.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   (prints the capability list and does one lease acquire/release; it does not start the game).
-- Offline regression: **29 suites / 936 assertions** under `tests/offline/`, run through the explicit
+- Offline regression: **30 suites / 966 assertions** under `tests/offline/`, run through the explicit
   whitelist entry (7 live suites are skipped by default); it prints `N/N checks passed` and exits 0 on
-  success (re-checked 2026-10-31: **936/936 PASS**):
+  success (re-checked 2026-11-02: **966/966 PASS**):
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py

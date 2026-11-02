@@ -256,6 +256,9 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
 9. 卡住时探索：`explore_toward(hero=0, x=…, y=…, z=…, map_w=36, map_h=36)` 沿黑幕边界逐格开雾；
    遇到战斗或未应答 query 会直接返回对应状态。
 10. 需要录像：`recording_start(height=1080, fps=60)` … `recording_stop()`（需要 PATH 中有 `ffmpeg`）。
+    `height` 默认 1080；游戏窗在屏上时默认用 WGC 捕获客户端区域，完全离屏时自动回退 PrintWindow。
+    实测是“基本60 capture”（约54–56 callback/s，CFR60 容器含显式重复槽），不是稳定 60 个不同游戏画面；
+    `recording_stop()`/`meta.json` 会披露 `capture_backend`、`source_duplicates`、WGC 错误，不能把容器头当源60。
 11. 结束：`session_stop()`（只关闭本会话拥有的客户端）。
 
 > 游戏由 MCP server 自动以**屏幕外**窗口（虚拟桌面之外，如 -1600,0）、**静音**方式启动，不抢你的鼠标和焦点。
@@ -638,6 +641,11 @@ In your MCP client:
 9. When stuck: `explore_toward(hero=0, x=…, y=…, z=…, map_w=36, map_h=36)` walks the shroud border and
    reveals it tile by tile; an active battle or an unanswered query is reported as its own status.
 10. Recording: `recording_start(height=1080, fps=60)` … `recording_stop()` (requires `ffmpeg` on `PATH`).
+    `height` defaults to 1080. An on-screen/VDD game window is captured through WGC and cropped to the
+    client area; a fully off-screen legacy window falls back to PrintWindow. The measured contract is
+    "basic-60 capture" (~54–56 callbacks/s, CFR60 output with explicit duplicate slots), not 60 distinct
+    game frames. `recording_stop()`/`meta.json` disclose `capture_backend`, `source_duplicates`, and WGC
+    errors; a 60 fps container header alone is never evidence of source 60 fps.
 11. Finish with `session_stop()` (only closes the client owned by this session).
 
 > The MCP server starts the game **off-screen** (outside the virtual desktop, e.g. -1600,0) and **muted**, so

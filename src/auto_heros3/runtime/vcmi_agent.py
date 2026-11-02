@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import re
 import subprocess
@@ -57,6 +58,10 @@ WORKDIR = ROOT / 'vendor' / 'vcmi-src' / 'build' / 'bin'
 CONANRUN = ROOT / 'vendor' / 'vcmi-src' / 'conan-msvc' / 'conanrun.ps1'
 DEFAULT_BRIDGE = ROOT / 'var' / 'agent'
 LOGDIR = ROOT / 'var' / 'logs' / 'vcmi'
+# VCMI keeps its launcher settings in the user's Documents tree (not the repo).  A targeted
+# display run patches video.displayIndex/fullscreen/resolution before launch and restores the
+# original bytes on stop; see _patch_video_settings/_restore_video_settings.
+VCMI_SETTINGS = Path.home() / 'Documents' / 'My Games' / 'vcmi' / 'config' / 'settings.json'
 SESSION_FILE = 'session.json'
 EPOCH_FILE = 'state_epoch.json'
 # Map names are embedded in a PowerShell -Command string; allow only inert characters.
@@ -183,14 +188,17 @@ class CommandResult:
 
 class VcmiAgent:
     def __init__(self, bridge_dir: Path | str = DEFAULT_BRIDGE, map_name: str | None = None,
-                 offscreen: bool = True, log: bool = True, max_state_age: float = 3.0):
+                 offscreen: bool = True, log: bool = True, max_state_age: float = 3.0,
+                 display_index: int | None = None):
         self.dir = Path(bridge_dir).resolve()
         self.map_name = map_name
-        self.offscreen = offscreen
+        self.display_index = None if display_index is None else int(display_index)
+        self.offscreen = bool(offscreen) and self.display_index is None
         self.log = log
         self.max_state_age = max_state_age
         self.proc = None
         self.hwnd: int | None = None
+        self._settings_backup: tuple[Path, bytes] | None = None
         self.session: Session | None = None
         self._pending_seq = 0
         self._seq_offset: dict[int, int] = {}
@@ -410,13 +418,19 @@ class VcmiAgent:
                 '--agent-view', q(self.dir)]
         if self.map_name:
             args += ['--agent-start', q(self.map_name)]
+        self._patch_video_settings()
         cmdline = (f"& {q(CONANRUN)}; $env:AUTO_HEROS3_CHEAT_FILE={q(cheat_path)}; "
                    f"& {args[0]} " + ' '.join(args[1:]))
-        self.proc = subprocess.Popen(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                                      '-Command', cmdline],
-                                     cwd=str(WORKDIR),
-                                     creationflags=CREATE_NO_WINDOW,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.proc = None
+        try:
+            self.proc = subprocess.Popen(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                          '-Command', cmdline],
+                                         cwd=str(WORKDIR),
+                                         creationflags=CREATE_NO_WINDOW,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            self._restore_video_settings()
+            raise
         self._print(f'[agent] launcher pid={self.proc.pid}')
         t0 = time.time()
         client_pid, create_time = None, None
@@ -448,20 +462,29 @@ class VcmiAgent:
             return False
         self.hwnd = win[0]
         time.sleep(1.0)
-        self._place_and_mute()
-        # hard guarantee: window rect must be outside the virtual desktop, and stay there
-        if not self._place_offscreen():
-            self._print('[agent] ERROR: cannot place the window off-screen - aborting start')
+        try:
+            self._place_and_mute()
+        except Exception:
+            self._restore_video_settings()
             self._abort_start(client_pid=client_pid, create_time=create_time)
-            raise BridgeError('refusing to run a game that is not off-screen')
-        self._stop_watch.clear()
-        self._watch_thread = threading.Thread(target=self._offscreen_watchdog, daemon=True)
-        self._watch_thread.start()
+            raise
+        if self.offscreen:
+            # legacy mode: hard guarantee the window is outside the virtual desktop
+            if not self._place_offscreen():
+                self._print('[agent] ERROR: cannot place the window off-screen - aborting start')
+                self._abort_start(client_pid=client_pid, create_time=create_time)
+                raise BridgeError('refusing to run a game that is not off-screen')
+            self._stop_watch.clear()
+            self._watch_thread = threading.Thread(target=self._offscreen_watchdog, daemon=True)
+            self._watch_thread.start()
         sess = Session(dir=str(self.dir), map_name=self.map_name, client_pid=client_pid,
                        client_create_time=create_time, launcher_pid=self.proc.pid,
                        created_at=time.time())
         rect = self._window_rect()
         sess.notes.append(f'window_rect={rect} offscreen={self.window_is_offscreen()}')
+        if self.display_index is not None:
+            sess.notes.append(f'target_display_index={self.display_index} '
+                              f'first_placement_kept=true')
         if self.contract:
             sess.notes.append(
                 f"client_sha256={self.contract.get('actual_sha256')} "
@@ -493,7 +516,54 @@ class VcmiAgent:
                 self._kill_owned(sess)
             except Exception:                   # pragma: no cover - best effort
                 pass
+        self._restore_video_settings()
         self.proc = None
+
+    def _patch_video_settings(self) -> None:
+        """Temporarily point VCMI at the requested SDL display, preserving exact bytes.
+
+        Product placement must happen at first window creation; moving the SDL window after it
+        appears is not equivalent.  These values are read by the launcher before the client
+        creates its window and are restored after the owned client is stopped (or on abort).
+        """
+        if self.display_index is None:
+            return
+        if self._settings_backup is not None:
+            return
+        path = VCMI_SETTINGS
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise BridgeError(f'cannot read VCMI settings for display placement: {exc}') from exc
+        try:
+            data = json.loads(raw.decode('utf-8-sig'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BridgeError(f'cannot parse VCMI settings for display placement: {exc}') from exc
+        video = data.setdefault('video', {})
+        if not isinstance(video, dict):
+            raise BridgeError('VCMI video settings is not an object')
+        video['displayIndex'] = int(self.display_index)
+        video['fullscreen'] = False
+        video['resolution'] = {'width': 1024, 'height': 768}
+        payload = json.dumps(data, ensure_ascii=False, indent=4).encode('utf-8')
+        try:
+            path.write_bytes(payload)
+        except OSError as exc:
+            raise BridgeError(f'cannot write VCMI settings for display placement: {exc}') from exc
+        self._settings_backup = (path, raw)
+        atexit.register(self._restore_video_settings)
+        self._print(f'[agent] targeted display {self.display_index}: patched {path}')
+
+    def _restore_video_settings(self) -> None:
+        if self._settings_backup is None:
+            return
+        path, raw = self._settings_backup
+        self._settings_backup = None
+        try:
+            path.write_bytes(raw)
+            self._print(f'[agent] restored VCMI settings {path}')
+        except OSError as exc:                      # pragma: no cover - best effort
+            self._print(f'[agent] WARNING: cannot restore VCMI settings: {exc}')
 
     def _place_and_mute(self) -> None:
         import sys
@@ -508,8 +578,10 @@ class VcmiAgent:
         user32.SetProcessDPIAware()
         if self.offscreen:
             self._place_offscreen()
-        else:
+        elif self.display_index is None:
             user32.SetWindowPos(self.hwnd, 0, 0, 0, 0, 0, 0x1 | 0x4 | 0x10)
+        # display_index is not None: keep the first-created SDL window exactly where the
+        # launcher placed it; no post-creation move means the first-placement contract holds.
         try:
             from agent.h3.audio import set_mute
             for p in psutil.process_iter(['pid', 'name']):
@@ -559,6 +631,7 @@ class VcmiAgent:
         result = {'owned_pid': None, 'killed': False, 'leftover': [], 'session_removed': False}
         if sess is None:
             result['detail'] = 'no session file'
+            self._restore_video_settings()
             return result
         result['owned_pid'] = sess.client_pid
         if sess.alive():
@@ -579,6 +652,7 @@ class VcmiAgent:
                 pass
             self.session = None
         self._stop_watch.set()
+        self._restore_video_settings()
         self.proc = None
         return result
 

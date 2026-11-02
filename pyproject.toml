@@ -67,6 +67,7 @@ dependencies = [
     "typing-inspection==0.4.4",
     "uvicorn==0.54.0",
     "winsdk==1.0.0b10",
+    "windows-capture==2.0.1",
 ]
 
 [tool.uv]

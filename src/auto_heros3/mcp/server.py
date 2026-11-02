@@ -1794,7 +1794,8 @@ def session_start(map_name: str = 'Maps/Arrogance',
                   starting_bonus: str | int | None = None,
                   turn_time_seconds: int | None = None,
                   battle_time_seconds: int | None = None,
-                  unit_time_seconds: int | None = None) -> dict:
+                  unit_time_seconds: int | None = None,
+                  display_index: int | None = None) -> dict:
     """Start the owned VCMI client (explicit business action; tool discovery never does this).
 
     map_name: a scenario ("Maps/Arrogance", bare names get the Maps/ prefix) or a saved slot
@@ -1807,6 +1808,10 @@ def session_start(map_name: str = 'Maps/Arrogance',
       starting_hero: hero identifier from config/heroes (e.g. "sylvia"), numeric id, or "random"
       starting_bonus: random | artifact | gold | resource
       turn_time_seconds / battle_time_seconds / unit_time_seconds: H3 turn timers (0 = unlimited)
+    display_index: opt-in SDL display index for first-window placement (e.g. 2 = the dedicated
+      VDD on this host). When set, VCMI settings are patched before launch and restored on
+      session_stop; the window is NOT moved off-screen and the off-screen watchdog is disabled.
+      Default None preserves the legacy off-screen behavior.
     Only options the map allows are applied; the client logs what actually became effective.
     A NEW scenario also rotates the logical run: the outgoing run's identity-chain files
     (segments/epochs/restores/recording_segments) are archived under archive/<old_run>/chain-<n>/
@@ -1875,7 +1880,7 @@ def session_start(map_name: str = 'Maps/Arrogance',
                     'archive': _archive_summary(archive)}
         if option_lines:
             _write_start_options(option_lines)
-    a = VcmiAgent(str(_dir()), target, log=False)
+    a = VcmiAgent(str(_dir()), target, log=False, display_index=display_index)
     try:
         if not a.start():
             return {'ok': False, 'error': 'client did not start',
@@ -5945,7 +5950,7 @@ def _pid_alive(pid) -> bool:
 
 
 @mcp.tool()
-def recording_start(fps: int = 60, height: int = 768, crf: int = 10) -> dict:
+def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -6111,6 +6116,9 @@ def recording_stop() -> dict:
             'fps_target': meta.get('fps_target'), 'fps_actual': meta.get('fps_actual'),
             'canvas': meta.get('canvas'), 'bytes': meta.get('bytes'),
             'cache_removed': meta.get('cache_removed'), 'video': meta.get('video'),
+            'capture_backend': meta.get('capture_backend'),
+            'source_duplicates': meta.get('source_duplicates'),
+            'wgc_error': meta.get('wgc_error'), 'wgc_errors': meta.get('wgc_errors'),
             'dir': str(out), 'elapsed': meta.get('elapsed'), 'recovered': recovered,
             'identity': record.get('identity') or {}, 'run_id': record.get('run_id'),
             'branch_id': record.get('branch_id'), 'epoch': record.get('epoch'),
@@ -6823,6 +6831,11 @@ def main(argv: list[str] | None = None) -> int:
     Called by the ``tools/mcp_server_v2.py`` shim (both for ``--selftest`` and as the
     long-running stdio server), so the historical command line is unchanged.
     """
+    # Mixed-DPI host: set per-monitor-v2 BEFORE vcmi_shot is imported for screenshots, otherwise
+    # the MCP process reports a virtualized 1536x1152 client on a 96-DPI VDD while WGC/recorder
+    # use physical 1024x768 pixels. The recorder child does the same in overlay_recorder.
+    from auto_heros3.recording.dpi import enable_per_monitor_v2
+    enable_per_monitor_v2()
     ap = argparse.ArgumentParser()
     ap.add_argument('--selftest', action='store_true')
     a = ap.parse_args(argv)

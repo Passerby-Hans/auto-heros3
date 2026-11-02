@@ -646,7 +646,7 @@
       "type": "integer"
      },
      "height": {
-      "default": 768,
+      "default": 1080,
       "title": "Height",
       "type": "integer"
      },
@@ -832,6 +832,18 @@
       ],
       "default": null,
       "title": "Unit Time Seconds"
+     },
+     "display_index": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Display Index"
      }
     },
     "type": "object",

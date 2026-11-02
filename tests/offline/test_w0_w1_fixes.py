@@ -43,9 +43,10 @@ class FakeSessionAgent:
 
     started = 0
 
-    def __init__(self, dirpath, map_name=None, log=False):
+    def __init__(self, dirpath, map_name=None, log=False, display_index=None):
         self.dir = Path(dirpath)
         self.map_name = map_name
+        self.display_index = display_index
         self.contract = {'match': True, 'protocol_ok': True, 'built_from_commit': 'c0ffee',
                          'repo_head': 'c0ffee', 'source_matches_head': True}
         self.session = types.SimpleNamespace(session_id='fake-session', client_pid=424242)

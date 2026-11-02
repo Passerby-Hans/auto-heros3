@@ -30,6 +30,8 @@ oldest lines are trimmed first when a section overflows, so the newest reasoning
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.wintypes as wt
 import datetime
 import json
 import shutil
@@ -59,7 +61,13 @@ ROOT = repo_root(_HERE)
 if ROOT != _REPO:  # pragma: no cover - a layout/resolver disagreement must fail loudly
     raise RuntimeError(f'repository root disagreement: bootstrap={_REPO} paths={ROOT}')
 
+from auto_heros3.recording.dpi import enable_per_monitor_v2  # noqa: E402
+# Must run before vcmi_shot is imported: vcmi_shot itself calls the legacy system-DPI-aware
+# API at import, which virtualizes a 96-DPI VDD window on a 150%-DPI host.
+_DPI_PER_MONITOR_V2 = enable_per_monitor_v2()
 import vcmi_shot  # noqa: E402
+from auto_heros3.recording.wgc_source import (  # noqa: E402
+    WgcFrameSource, WgcUnavailable, binding_available)
 from PIL import Image, ImageDraw, ImageFont, ImageStat  # noqa: E402
 
 BG = (13, 17, 24)
@@ -629,12 +637,44 @@ class HealthRecorder:
         return summary
 
 
+def _window_alive(hwnd: int) -> bool:
+    try:
+        return bool(vcmi_shot.user32.IsWindow(hwnd)) and bool(vcmi_shot.user32.IsWindowVisible(hwnd))
+    except Exception:
+        return False
+
+
+def _window_on_screen(hwnd: int) -> bool:
+    """True when the window intersects the virtual desktop.
+
+    The legacy product parks VCMI completely outside the desktop.  WGC can return a private
+    surface there, but it may stop updating (observed as a static frame and a huge
+    source_duplicates count), so ``auto`` keeps PrintWindow for a fully off-screen window and
+    uses WGC only for on-screen/VDD placements.
+    """
+    try:
+        wr = wt.RECT()
+        if not vcmi_shot.user32.GetWindowRect(hwnd, ctypes.byref(wr)):
+            return False
+        vx = vcmi_shot.user32.GetSystemMetrics(76)
+        vy = vcmi_shot.user32.GetSystemMetrics(77)
+        vw = vcmi_shot.user32.GetSystemMetrics(78)
+        vh = vcmi_shot.user32.GetSystemMetrics(79)
+        return (wr.right > vx and wr.left < vx + vw
+                and wr.bottom > vy and wr.top < vy + vh)
+    except Exception:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', required=True, help='bridge state dir (state.json / overlay.jsonl)')
     ap.add_argument('--out', required=True, help='output directory for the video')
     ap.add_argument('--fps', type=int, default=60)
-    ap.add_argument('--height', type=int, default=768, help='canvas height: 768 or 1080')
+    ap.add_argument('--height', type=int, default=1080, help='canvas height: 768 or 1080 (default 1080)')
+    ap.add_argument('--capture', choices=('auto', 'wgc', 'gdi'), default='auto',
+                    help='game frame source: auto prefers WGC (Windows Graphics Capture) '
+                         'and falls back to PrintWindow; gdi forces the legacy path')
     ap.add_argument('--crf', type=int, default=10, help='x264 CRF; 0 = lossless')
     ap.add_argument('--preset', default='veryfast')
     ap.add_argument('--keep-frames', action='store_true',
@@ -687,9 +727,19 @@ def main() -> int:
     panel_age = 0.0
     missed = 0
     first_frame = True
+    wgc: WgcFrameSource | None = None
+    last_game: Image.Image | None = None
+    last_serial = 0
+    source_duplicates = 0
+    capture_backend = 'gdi'
+    wgc_error = None
+    source_errors: list[str] = []
     try:
         while not stop_file.exists():
             if hwnd is None:
+                if wgc is not None:
+                    wgc.close()
+                    wgc = None
                 wins = vcmi_shot.find_window()
                 hwnd = wins[0][0] if wins else None
                 if hwnd is None:
@@ -697,13 +747,58 @@ def main() -> int:
                     health.sample_lost(time.time() - started, 'window_missing')
                     time.sleep(0.2)
                     continue
-            try:
-                game = vcmi_shot.grab(hwnd)
-            except Exception:
-                hwnd = None
-                health.sample_lost(time.time() - started, 'grab_error')
-                time.sleep(0.2)
-                continue
+            if wgc is None and args.capture in ('auto', 'wgc') and _window_alive(int(hwnd)):
+                if args.capture == 'auto' and not _window_on_screen(int(hwnd)):
+                    capture_backend = 'gdi'
+                    if not getattr(args, '_offscreen_note', False):
+                        health.add_note('window is fully off-screen; auto keeps GDI/PrintWindow')
+                        args._offscreen_note = True
+                elif not binding_available():
+                    if args.capture == 'wgc':
+                        raise WgcUnavailable('windows-capture is not installed')
+                else:
+                    try:
+                        cw, ch, _, _ = vcmi_shot.client_geometry(hwnd)
+                        candidate = WgcFrameSource(hwnd, (cw, ch))
+                        candidate.start()
+                        wgc = candidate
+                        capture_backend = 'wgc'
+                        health.add_note(f'WGC capture active ({cw}x{ch} client)')
+                    except Exception as exc:  # noqa: BLE001
+                        wgc_error = f'{type(exc).__name__}: {exc}'
+                        if args.capture == 'wgc':
+                            raise
+                        capture_backend = 'gdi'
+                        health.add_note(f'WGC unavailable, falling back to GDI: {wgc_error}')
+            if wgc is not None:
+                item = wgc.latest()
+                if item is not None and item.serial != last_serial:
+                    last_serial = item.serial
+                    last_game = item.image
+                    game = item.image
+                elif last_game is not None:
+                    game = last_game
+                    source_duplicates += 1
+                else:
+                    health.sample_lost(time.time() - started, 'wgc_warmup')
+                    time.sleep(0.01)
+                    continue
+                if not _window_alive(int(hwnd)):
+                    health.sample_lost(time.time() - started, 'window_lost')
+                    wgc.close()
+                    wgc = None
+                    hwnd = None
+                    continue
+            else:
+                try:
+                    game = vcmi_shot.grab(hwnd)
+                    last_game = game
+                except Exception:
+                    hwnd = None
+                    health.sample_lost(time.time() - started, 'grab_error')
+                    time.sleep(0.2)
+                    continue
+
             now = time.time()
             if now - panel_age > 0.25:
                 panel_image = panel.render(now - started, frames)
@@ -746,6 +841,13 @@ def main() -> int:
                     duplicated += 1
     finally:
         # Health evidence is emitted first: it must survive even if the encoder shutdown raises.
+        if wgc is not None:
+            try:
+                source_errors = wgc.errors()
+                wgc.close()
+            except Exception:
+                pass
+            wgc = None
         try:
             health.close()
         except Exception:
@@ -771,6 +873,10 @@ def main() -> int:
                 'fps_actual': round(frames / elapsed, 2) if elapsed else 0,
                 'height': height, 'canvas': f'{total_w}x{height}', 'crf': args.crf,
                 'missed_slots': missed, 'duplicated_frames': duplicated,
+                'source_duplicates': source_duplicates,
+                'capture_backend': capture_backend, 'capture_mode': args.capture,
+                'wgc_error': wgc_error, 'wgc_errors': source_errors,
+                'dpi_per_monitor_v2': bool(_DPI_PER_MONITOR_V2),
                 'video': str(video) if encode_done(video) else None,
                 'bytes': video.stat().st_size if video.exists() else 0,
                 'elapsed': round(elapsed, 1), 'cache_removed': removed,

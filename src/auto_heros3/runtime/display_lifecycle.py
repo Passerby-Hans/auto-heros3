@@ -730,7 +730,8 @@ def classify_install(before: Snapshot, after: Snapshot, *,
 
 
 def _manifest_ownership_errors(snapshot: Snapshot, manifest: OwnershipManifest,
-                               candidate: CandidateSpec) -> list[str]:
+                               candidate: CandidateSpec,
+                               require_display: bool = True) -> list[str]:
     try:
         manifest.validate()
     except ManifestError as exc:
@@ -738,16 +739,16 @@ def _manifest_ownership_errors(snapshot: Snapshot, manifest: OwnershipManifest,
     errors = []
     device = snapshot.device(manifest.device_instance_id)
     if device is None or not device.present:
-        errors.append(f"owned device {manifest.device_instance_id} is absent from before snapshot")
+        errors.append(f"owned device {manifest.device_instance_id} is absent from snapshot")
         return errors
     if not manifest.owns_device(device):
         errors.append(f"manifest does not own device {device.instance_id}")
     if not candidate.matches(device):
         errors.append(f"device {device.instance_id} is not a candidate VDD")
-    if manifest.display_device:
+    if require_display and manifest.display_device:
         display = snapshot.display(manifest.display_device)
         if display is None:
-            errors.append(f"owned display {manifest.display_device!r} is absent from before snapshot")
+            errors.append(f"owned display {manifest.display_device!r} is absent from snapshot")
         elif not manifest.owns_display(display):
             errors.append(f"manifest display {display.device} is inactive or mapped elsewhere")
     return errors
@@ -820,6 +821,134 @@ def classify_rollback(before: Snapshot, after: Snapshot, manifest: OwnershipMani
                     before=before, after=after)
 
 
+def classify_detach(before: Snapshot, after: Snapshot, manifest: OwnershipManifest, *,
+                    candidate: CandidateSpec = DEFAULT_CANDIDATE,
+                    command: CommandRecord | None = None) -> Decision:
+    """Classify a DESKTOP detach (display path), not a PnP/package removal.
+
+    Detach must leave the owned PnP device present/running; it only removes the active display
+    path.  A device that disappears is a failure of this operation, not a successful detach.
+    """
+    errors = _validate_pair(before, after)
+    if errors:
+        return _invalid("detach", errors)
+    ownership_errors = _manifest_ownership_errors(before, manifest, candidate)
+    if ownership_errors:
+        return Decision("detach", "refused_unowned", False, tuple(ownership_errors),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if not manifest.display_device:
+        return Decision("detach", "refused_unowned", False,
+                        ("manifest has no owned display target",),
+                        device_instance_id=manifest.device_instance_id,
+                        before=before, after=after)
+    before_display = before.display(manifest.display_device)
+    if before_display is None or not before_display.active_path:
+        return Decision("detach", "not_attached", False,
+                        (f"owned display {manifest.display_device} was not active before detach",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    after_device = after.device(manifest.device_instance_id)
+    if after_device is None or not after_device.present:
+        return Decision("detach", "device_lost", False,
+                        (f"owned device {manifest.device_instance_id} disappeared during a "
+                         "desktop detach (PnP removal is a separate operation)",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if _primary_signature(before) != _primary_signature(after):
+        return Decision("detach", "primary_changed", False,
+                        (f"primary changed during detach {_primary_signature(before)} -> "
+                         f"{_primary_signature(after)}",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    after_display = after.display(manifest.display_device)
+    if after_display is not None and after_display.active_path:
+        return Decision("detach", "detach_failed", False,
+                        (f"owned display {after_display.device} is still active after detach",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device,
+                        receipt=DevconReceipt.parse(command), before=before, after=after)
+    reasons = [f"owned display {manifest.display_device} is no longer active",
+               f"owned device {manifest.device_instance_id} remains present",
+               "primary display signature unchanged"]
+    return Decision("detach", "detached", True, tuple(reasons),
+                    device_instance_id=manifest.device_instance_id,
+                    display_device=manifest.display_device,
+                    receipt=DevconReceipt.parse(command), before=before, after=after)
+
+
+def classify_attach(before: Snapshot, after: Snapshot, manifest: OwnershipManifest, *,
+                    candidate: CandidateSpec = DEFAULT_CANDIDATE,
+                    expected_mode: Mapping[str, int] | None = None,
+                    command: CommandRecord | None = None) -> Decision:
+    """Classify re-attaching the owned display path; the device must already be present."""
+    errors = _validate_pair(before, after)
+    if errors:
+        return _invalid("attach", errors)
+    ownership_errors = _manifest_ownership_errors(before, manifest, candidate,
+                                                  require_display=False)
+    if ownership_errors:
+        return Decision("attach", "refused_unowned", False, tuple(ownership_errors),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if not manifest.display_device:
+        return Decision("attach", "refused_unowned", False,
+                        ("manifest has no owned display target",),
+                        device_instance_id=manifest.device_instance_id,
+                        before=before, after=after)
+    before_display = before.display(manifest.display_device)
+    after_display = after.display(manifest.display_device)
+    if after_device := after.device(manifest.device_instance_id):
+        if not after_device.present:
+            return Decision("attach", "device_lost", False,
+                            (f"owned device {manifest.device_instance_id} is no longer present",),
+                            device_instance_id=manifest.device_instance_id,
+                            display_device=manifest.display_device, before=before, after=after)
+    else:
+        return Decision("attach", "device_lost", False,
+                        (f"owned device {manifest.device_instance_id} is absent",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if _primary_signature(before) != _primary_signature(after):
+        return Decision("attach", "primary_changed", False,
+                        (f"primary changed during attach {_primary_signature(before)} -> "
+                         f"{_primary_signature(after)}",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if after_display is None or not after_display.active_path:
+        return Decision("attach", "attach_failed", False,
+                        (f"owned display {manifest.display_device} is not active after attach",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if not manifest.owns_display(after_display):
+        return Decision("attach", "display_mismatch", False,
+                        (f"display {after_display.device} is mapped to "
+                         f"{after_display.adapter_instance_id!r}, not "
+                         f"{manifest.device_instance_id}",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if before_display is not None and before_display.active_path:
+        return Decision("attach", "already_attached", True,
+                        (f"owned display {manifest.display_device} was already active",),
+                        device_instance_id=manifest.device_instance_id,
+                        display_device=manifest.display_device, before=before, after=after)
+    if expected_mode:
+        expected = {key: _as_int(value) for key, value in expected_mode.items()}
+        mismatch = {key: (expected[key], after_display.mode().get(key))
+                    for key in expected if after_display.mode().get(key) != expected[key]}
+        if mismatch:
+            return Decision("attach", "display_mode_mismatch", False,
+                            (f"mode mismatch {mismatch}",),
+                            device_instance_id=manifest.device_instance_id,
+                            display_device=manifest.display_device, before=before, after=after)
+    reasons = [f"owned display {manifest.display_device} is active and mapped to "
+               f"{manifest.device_instance_id}",
+               "primary display signature unchanged"]
+    return Decision("attach", "attached", True, tuple(reasons),
+                    device_instance_id=manifest.device_instance_id,
+                    display_device=manifest.display_device, before=before, after=after)
+
+
 def classify_remove_receipt(command: CommandRecord) -> DevconReceipt:
     """Convenience: parse a DevCon remove/install receipt without any state proof."""
     receipt = DevconReceipt.parse(command)
@@ -834,5 +963,5 @@ __all__ = [
     "Snapshot", "OwnershipManifest", "CommandRecord", "DevconReceipt", "Decision",
     "LifecycleError", "SnapshotError", "ManifestError", "load_snapshot",
     "load_manifest", "write_manifest", "classify_install", "classify_rollback",
-    "classify_remove_receipt",
+    "classify_detach", "classify_attach", "classify_remove_receipt",
 ]

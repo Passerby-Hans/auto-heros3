@@ -260,11 +260,56 @@ def test_receipts_and_rollback() -> None:
           changed.status == 'rollback_failed' and not changed.ok)
 
 
+def test_detach_attach_classification() -> None:
+    snap = installed_after()
+    manifest = L.OwnershipManifest.from_snapshot(snap, run_id='run-da')
+    detached = S([physical(), D()], [primary_display()])
+    ok = L.classify_detach(snap, detached, manifest)
+    check('L30 desktop detach keeps the PnP device and removes only the display path',
+          ok.status == 'detached' and ok.ok
+          and ok.device_instance_id == 'ROOT\\DISPLAY\\0002'
+          and ok.display_device == '\\\\.\\DISPLAY32')
+    still_active = L.classify_detach(snap, snap, manifest)
+    check('L31 a still-active display is detach_failed', still_active.status == 'detach_failed'
+          and not still_active.ok)
+    device_lost = L.classify_detach(snap, S([physical()], [primary_display()]), manifest)
+    check('L32 a disappeared PnP device during detach is device_lost, not detached',
+          device_lost.status == 'device_lost' and not device_lost.ok)
+    attach_before = S([physical(), D()], [primary_display()])
+    attach_ok = L.classify_attach(attach_before, snap, manifest,
+                                  expected_mode={'width': 1920, 'height': 1080,
+                                                 'refresh_num': 60, 'refresh_den': 1})
+    check('L33 attach restores the same display target/mode',
+          attach_ok.status == 'attached' and attach_ok.ok
+          and attach_ok.display_device == '\\\\.\\DISPLAY32')
+    already = L.classify_attach(snap, snap, manifest)
+    check('L34 an already-active display is already_attached, not a new operation',
+          already.status == 'already_attached' and already.ok)
+    wrong = S([physical(), D()],
+              [primary_display(), P(adapter='ROOT\\DISPLAY\\9999')])
+    mismatch = L.classify_attach(attach_before, wrong, manifest)
+    check('L35 display mapped to another instance is display_mismatch',
+          mismatch.status == 'display_mismatch' and not mismatch.ok)
+    bad_primary = S([physical(), D()],
+                    [primary_display().__class__(device='\\\\.\\DISPLAY32', primary=True,
+                                                 width=1920, height=1080, refresh_num=60,
+                                                 adapter_instance_id='ROOT\\DISPLAY\\0002')])
+    changed = L.classify_attach(attach_before, bad_primary, manifest)
+    check('L36 attach with a changed primary is primary_changed',
+          changed.status == 'primary_changed' and not changed.ok)
+    other = L.OwnershipManifest.from_snapshot(snap, run_id='run-other-da')
+    object.__setattr__(other, 'device_instance_id', 'ROOT\\DISPLAY\\0009')
+    refused = L.classify_detach(snap, detached, other)
+    check('L37 detach refuses a manifest that does not own the device',
+          refused.status == 'refused_unowned' and not refused.ok)
+
+
 def main() -> int:
     test_identity_and_snapshot_validation()
     test_manifest_ownership()
     test_install_classification()
     test_receipts_and_rollback()
+    test_detach_attach_classification()
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f'\n{passed}/{len(RESULTS)} checks passed')
     return 0 if passed == len(RESULTS) else 1

@@ -199,6 +199,7 @@ class VcmiAgent:
         self.proc = None
         self.hwnd: int | None = None
         self._settings_backup: tuple[Path, bytes] | None = None
+        self._settings_backup_file = self.dir / 'vcmi-settings-backup.bin'
         self.session: Session | None = None
         self._pending_seq = 0
         self._seq_offset: dict[int, int] = {}
@@ -418,6 +419,8 @@ class VcmiAgent:
                 '--agent-view', q(self.dir)]
         if self.map_name:
             args += ['--agent-start', q(self.map_name)]
+        # Recover a backup left by a crashed/previous MCP process before taking a new snapshot.
+        self._restore_video_settings()
         self._patch_video_settings()
         cmdline = (f"& {q(CONANRUN)}; $env:AUTO_HEROS3_CHEAT_FILE={q(cheat_path)}; "
                    f"& {args[0]} " + ' '.join(args[1:]))
@@ -545,22 +548,51 @@ class VcmiAgent:
         video['displayIndex'] = int(self.display_index)
         video['fullscreen'] = False
         video['resolution'] = {'width': 1024, 'height': 768}
+        # The product session is session-muted by _place_and_mute; set in-game volumes so the
+        # process-loopback recorder has real music/sfx to capture, then restore these bytes on stop.
+        general = data.setdefault('general', {})
+        if isinstance(general, dict):
+            general.setdefault('music', 30)
+            general.setdefault('sound', 40)
+            if general['music'] == 0:
+                general['music'] = 30
+            if general['sound'] == 0:
+                general['sound'] = 40
         payload = json.dumps(data, ensure_ascii=False, indent=4).encode('utf-8')
         try:
             path.write_bytes(payload)
         except OSError as exc:
             raise BridgeError(f'cannot write VCMI settings for display placement: {exc}') from exc
         self._settings_backup = (path, raw)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self._settings_backup_file.write_bytes(raw)
+        except OSError as exc:
+            # Keep the in-memory backup: stop()/atexit can still restore it.
+            self._print(f'[agent] WARNING: cannot persist settings backup: {exc}')
         atexit.register(self._restore_video_settings)
         self._print(f'[agent] targeted display {self.display_index}: patched {path}')
 
     def _restore_video_settings(self) -> None:
-        if self._settings_backup is None:
+        path, raw = VCMI_SETTINGS, None
+        if self._settings_backup is not None:
+            path, raw = self._settings_backup
+            self._settings_backup = None
+        elif self._settings_backup_file.exists():
+            # A different VcmiAgent instance (session_stop constructs a fresh one) or an
+            # MCP restart must still restore the user's settings.
+            try:
+                raw = self._settings_backup_file.read_bytes()
+            except OSError:
+                raw = None
+        if raw is None:
             return
-        path, raw = self._settings_backup
-        self._settings_backup = None
         try:
             path.write_bytes(raw)
+            try:
+                self._settings_backup_file.unlink()
+            except OSError:
+                pass
             self._print(f'[agent] restored VCMI settings {path}')
         except OSError as exc:                      # pragma: no cover - best effort
             self._print(f'[agent] WARNING: cannot restore VCMI settings: {exc}')

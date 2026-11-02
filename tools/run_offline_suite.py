@@ -72,6 +72,7 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_display_lifecycle.py",
     "test_wgc_source.py",
     "test_p5_placement.py",
+    "test_audio_mux.py",
 )
 
 # LIVE suites: listed for transparency only; they start the real client / write real save

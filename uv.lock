@@ -65,6 +65,7 @@ dependencies = [
     { name = "packaging" },
     { name = "pefile" },
     { name = "pillow" },
+    { name = "process-audio-capture" },
     { name = "protobuf" },
     { name = "psutil" },
     { name = "pycaw" },
@@ -122,6 +123,7 @@ requires-dist = [
     { name = "packaging", specifier = "==26.3" },
     { name = "pefile", specifier = "==2024.8.26" },
     { name = "pillow", specifier = "==13.0.0" },
+    { name = "process-audio-capture", specifier = "==1.0.0" },
     { name = "protobuf", specifier = "==7.36.2" },
     { name = "psutil", specifier = "==7.2.2" },
     { name = "pycaw", specifier = "==20260927" },
@@ -575,6 +577,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/af/c30dd9ef6a3dce84ecb1b2393cac629047a32e66279056c6cb46c3ffd65c/pillow-13.0.0-cp314-cp314t-win32.whl", hash = "sha256:06903aac074d00c988e77a1fc435286dc498506d4ca8d6f69df9babddf4ecc15", size = 6517204, upload-time = "2026-10-16T22:17:03.722Z" },
     { url = "https://files.pythonhosted.org/packages/85/d5/ef3a8ae7609c8ab26570abf18194882534b480d245a9148b895a2262c004/pillow-13.0.0-cp314-cp314t-win_amd64.whl", hash = "sha256:9a635068d9793c7f0d929f39f18b58f1bd86c236e8e7b64167b86af9232ebca0", size = 7286695, upload-time = "2026-10-16T22:17:05.543Z" },
     { url = "https://files.pythonhosted.org/packages/84/3c/0861db0c69a03689ebe3e7599d35668a414deb5aaafd8255215e4e62e3d3/pillow-13.0.0-cp314-cp314t-win_arm64.whl", hash = "sha256:0d1a9cf7bc6917538b20f8d06b9ab2147e542f68849e96fc58eb66bdf6acc692", size = 2698098, upload-time = "2026-10-16T22:17:07.674Z" },
+]
+
+[[package]]
+name = "process-audio-capture"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/0b/e472720cf338708e0b381b35a4fde4bd3f6b4e59f9472c51cf099217c516/process_audio_capture-1.0.0.tar.gz", hash = "sha256:311c45bd9de57bd3f749669cb88b4a47c5c775cfe6d29484e34317fc002ef22f", size = 25126, upload-time = "2025-12-03T15:19:53.046Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1f/c0/cdd16212c799cb79778ab3ee591a29aa10ea98cc89e4435bb6fbf2cb47f3/process_audio_capture-1.0.0-py3-none-any.whl", hash = "sha256:7654f26fb54f8dab47fa92f50d31b7c4c68cfac9cb7aceafb3cc6637fb2d1595", size = 22401, upload-time = "2025-12-03T15:19:51.853Z" },
 ]
 
 [[package]]

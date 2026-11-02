@@ -47,10 +47,16 @@ def test_patch_restore() -> None:
             check('patched_resolution_4x3',
                   patched['video']['resolution'] == {'width': 1024, 'height': 768},
                   str(patched['video'].get('resolution')))
+            check('patched_music_sound_nonzero',
+                  patched['general']['music'] == 30 and patched['general']['sound'] == 40,
+                  str(patched.get('general')))
             check('other_settings_preserved', patched['other'] == {'keep': True})
-            agent._restore_video_settings()
-            check('restore_exact_bytes', path.read_bytes() == raw,
-                  'bytes differ after restore')
+            # session_stop constructs a fresh agent: the persisted backup must restore even
+            # when the instance that patched settings is gone.
+            fresh = A.VcmiAgent(Path(td) / 'bridge', log=False)
+            fresh._restore_video_settings()
+            check('restore_exact_bytes_fresh_agent', path.read_bytes() == raw,
+                  'bytes differ after fresh-agent restore')
             agent._restore_video_settings()  # idempotent
             check('restore_idempotent', path.read_bytes() == raw)
         finally:

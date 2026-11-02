@@ -6119,6 +6119,8 @@ def recording_stop() -> dict:
             'capture_backend': meta.get('capture_backend'),
             'source_duplicates': meta.get('source_duplicates'),
             'wgc_error': meta.get('wgc_error'), 'wgc_errors': meta.get('wgc_errors'),
+            'audio_muxed': meta.get('audio_muxed'), 'audio_error': meta.get('audio_error'),
+            'audio': meta.get('audio'),
             'dir': str(out), 'elapsed': meta.get('elapsed'), 'recovered': recovered,
             'identity': record.get('identity') or {}, 'run_id': record.get('run_id'),
             'branch_id': record.get('branch_id'), 'epoch': record.get('epoch'),

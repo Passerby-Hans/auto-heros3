@@ -68,6 +68,7 @@ dependencies = [
     "uvicorn==0.54.0",
     "winsdk==1.0.0b10",
     "windows-capture==2.0.1",
+    "process-audio-capture==1.0.0",
 ]
 
 [tool.uv]

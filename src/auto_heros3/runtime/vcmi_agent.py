@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import os
 import re
 import subprocess
 import sys
@@ -200,6 +201,10 @@ class VcmiAgent:
         self.hwnd: int | None = None
         self._settings_backup: tuple[Path, bytes] | None = None
         self._settings_backup_file = self.dir / 'vcmi-settings-backup.bin'
+        self.audio_sink_path = self.dir / 'game-audio.raw'
+        self.audio_ready_path = self.dir / 'audio-relay.ready'
+        self.audio_relay_proc: subprocess.Popen | None = None
+        self.audio_pipe_name: str | None = None
         self.session: Session | None = None
         self._pending_seq = 0
         self._seq_offset: dict[int, int] = {}
@@ -351,6 +356,59 @@ class VcmiAgent:
             'source_matches_head': source_matches_head,
         }
 
+    # ------------------------------------------------------------------ audio relay
+    def _start_audio_relay(self) -> None:
+        """Create the SDL disk-audio pipe relay before the client starts.
+
+        SDL opens its disk file with a deny-read share mode.  The relay receives the same PCM
+        through a named pipe and appends it to a normal raw file; the recorder can read that file
+        while the game is running.  No physical audio endpoint is touched.
+        """
+        self.dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.audio_sink_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self.audio_ready_path.unlink()
+        except FileNotFoundError:
+            pass
+        self.audio_pipe_name = f'auto_heros3_audio_{os.getpid()}_{time.time_ns()}'
+        cmd = [sys.executable, '-X', 'utf8',
+               str(ROOT / 'src' / 'auto_heros3' / 'recording' / 'audio_relay.py'),
+               '--pipe', self.audio_pipe_name, '--out', str(self.audio_sink_path),
+               '--ready', str(self.audio_ready_path)]
+        self.audio_relay_proc = subprocess.Popen(
+            cmd, cwd=str(ROOT), creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            if self.audio_ready_path.exists():
+                self._print(f'[agent] audio relay ready pipe={self.audio_pipe_name}')
+                return
+            if self.audio_relay_proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        self._stop_audio_relay()
+        raise BridgeError('audio relay did not become ready')
+
+    def _stop_audio_relay(self) -> None:
+        proc = self.audio_relay_proc
+        self.audio_relay_proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            self.audio_ready_path.unlink()
+        except OSError:
+            pass
+
     def start(self, timeout: float = 120.0) -> bool:
         self.dir.mkdir(parents=True, exist_ok=True)
         # Host command safety: validate the map name *before* any process/file side effects.
@@ -422,7 +480,16 @@ class VcmiAgent:
         # Recover a backup left by a crashed/previous MCP process before taking a new snapshot.
         self._restore_video_settings()
         self._patch_video_settings()
-        cmdline = (f"& {q(CONANRUN)}; $env:AUTO_HEROS3_CHEAT_FILE={q(cheat_path)}; "
+        try:
+            self._start_audio_relay()
+        except Exception:
+            self._restore_video_settings()
+            raise
+        audio_pipe_path = '\\\\.\\pipe\\' + str(self.audio_pipe_name)
+        cmdline = (f"& {q(CONANRUN)}; "
+                   f"$env:SDL_AUDIODRIVER='disk'; "
+                   f"$env:SDL_DISKAUDIOFILE={q(audio_pipe_path)}; "
+                   f"$env:AUTO_HEROS3_CHEAT_FILE={q(cheat_path)}; "
                    f"& {args[0]} " + ' '.join(args[1:]))
         self.proc = None
         try:
@@ -432,6 +499,7 @@ class VcmiAgent:
                                          creationflags=CREATE_NO_WINDOW,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
+            self._stop_audio_relay()
             self._restore_video_settings()
             raise
         self._print(f'[agent] launcher pid={self.proc.pid}')
@@ -485,6 +553,8 @@ class VcmiAgent:
                        created_at=time.time())
         rect = self._window_rect()
         sess.notes.append(f'window_rect={rect} offscreen={self.window_is_offscreen()}')
+        sess.notes.append(f'audio_sink=disk raw={self.audio_sink_path} '
+                          f'format=s16le/44100/2 physical_endpoint_untouched=true')
         if self.display_index is not None:
             sess.notes.append(f'target_display_index={self.display_index} '
                               f'first_placement_kept=true')
@@ -519,37 +589,38 @@ class VcmiAgent:
                 self._kill_owned(sess)
             except Exception:                   # pragma: no cover - best effort
                 pass
+        self._stop_audio_relay()
         self._restore_video_settings()
         self.proc = None
 
     def _patch_video_settings(self) -> None:
-        """Temporarily point VCMI at the requested SDL display, preserving exact bytes.
+        """Temporarily set display/audio launch settings, preserving exact bytes.
 
-        Product placement must happen at first window creation; moving the SDL window after it
-        appears is not equivalent.  These values are read by the launcher before the client
-        creates its window and are restored after the owned client is stopped (or on abort).
+        Display placement must happen at first window creation.  Independently of placement, the
+        audio section raises the in-game music/sound only when the user has them at 0, so the SDL
+        disk sink has real game audio to write; the exact original bytes are restored after the
+        owned client stops (or on abort).  No physical endpoint is muted here.
         """
-        if self.display_index is None:
-            return
         if self._settings_backup is not None:
             return
         path = VCMI_SETTINGS
         try:
             raw = path.read_bytes()
         except OSError as exc:
-            raise BridgeError(f'cannot read VCMI settings for display placement: {exc}') from exc
+            raise BridgeError(f'cannot read VCMI settings for session launch: {exc}') from exc
         try:
             data = json.loads(raw.decode('utf-8-sig'))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise BridgeError(f'cannot parse VCMI settings for display placement: {exc}') from exc
-        video = data.setdefault('video', {})
-        if not isinstance(video, dict):
-            raise BridgeError('VCMI video settings is not an object')
-        video['displayIndex'] = int(self.display_index)
-        video['fullscreen'] = False
-        video['resolution'] = {'width': 1024, 'height': 768}
-        # The product session is session-muted by _place_and_mute; set in-game volumes so the
-        # process-loopback recorder has real music/sfx to capture, then restore these bytes on stop.
+            raise BridgeError(f'cannot parse VCMI settings for session launch: {exc}') from exc
+        if self.display_index is not None:
+            video = data.setdefault('video', {})
+            if not isinstance(video, dict):
+                raise BridgeError('VCMI video settings is not an object')
+            video['displayIndex'] = int(self.display_index)
+            video['fullscreen'] = False
+            video['resolution'] = {'width': 1024, 'height': 768}
+        # The game writes its audio to the SDL disk sink, never to the physical endpoint.  Raise
+        # only zero volumes (a user who chose e.g. 10 keeps 10); restore exact bytes later.
         general = data.setdefault('general', {})
         if isinstance(general, dict):
             general.setdefault('music', 30)
@@ -562,7 +633,7 @@ class VcmiAgent:
         try:
             path.write_bytes(payload)
         except OSError as exc:
-            raise BridgeError(f'cannot write VCMI settings for display placement: {exc}') from exc
+            raise BridgeError(f'cannot write VCMI settings for session launch: {exc}') from exc
         self._settings_backup = (path, raw)
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -571,7 +642,7 @@ class VcmiAgent:
             # Keep the in-memory backup: stop()/atexit can still restore it.
             self._print(f'[agent] WARNING: cannot persist settings backup: {exc}')
         atexit.register(self._restore_video_settings)
-        self._print(f'[agent] targeted display {self.display_index}: patched {path}')
+        self._print(f'[agent] patched settings {path}; display_index={self.display_index}')
 
     def _restore_video_settings(self) -> None:
         path, raw = VCMI_SETTINGS, None
@@ -663,6 +734,7 @@ class VcmiAgent:
         result = {'owned_pid': None, 'killed': False, 'leftover': [], 'session_removed': False}
         if sess is None:
             result['detail'] = 'no session file'
+            self._stop_audio_relay()
             self._restore_video_settings()
             return result
         result['owned_pid'] = sess.client_pid
@@ -684,6 +756,7 @@ class VcmiAgent:
                 pass
             self.session = None
         self._stop_watch.set()
+        self._stop_audio_relay()
         self._restore_video_settings()
         self.proc = None
         return result

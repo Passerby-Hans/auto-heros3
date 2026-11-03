@@ -259,8 +259,11 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
     `height` 默认 1080；游戏窗在屏上时默认用 WGC 捕获客户端区域，完全离屏时自动回退 PrintWindow。
     实测是“基本60 capture”（约54–56 callback/s，CFR60 容器含显式重复槽），不是稳定 60 个不同游戏画面；
     `recording_stop()`/`meta.json` 会披露 `capture_backend`、`source_duplicates`、WGC 错误，不能把容器头当源60。
-    音频默认 `auto`：用 WASAPI process loopback 抓游戏进程音乐/音效，同时临时 mute 默认输出端点保持本地安静；
-    成品有 AAC 音轨时 `audio_muxed=true`，失败会保留 video-only 并披露 `audio_error`。录音期间本地其他声音也会被静音。
+    音频默认走 **SDL disk → named pipe relay**：VCMI 启动时把游戏音乐/音效写入管道，relay 落到
+    `game-audio.raw`，不经过物理输出端点；recorder 从 `recording_start` 的字节偏移开始读取并 mux 成 AAC。
+    其他办公音频不被静音。若用户游戏音量是 0，启动时会临时提升到 30/40 并在 stop 时逐字节恢复；
+    成品有音轨时 `audio_muxed=true`，失败会保留 video-only 并披露 `audio_error`。legacy
+    `--audio-source loopback` 会 mute 默认端点，不适合边录边办公。
 11. 结束：`session_stop()`（只关闭本会话拥有的客户端）。
 
 > 游戏由 MCP server 自动以**屏幕外**窗口（虚拟桌面之外，如 -1600,0）、**静音**方式启动，不抢你的鼠标和焦点。
@@ -648,10 +651,12 @@ In your MCP client:
     "basic-60 capture" (~54–56 callbacks/s, CFR60 output with explicit duplicate slots), not 60 distinct
     game frames. `recording_stop()`/`meta.json` disclose `capture_backend`, `source_duplicates`, and WGC
     errors; a 60 fps container header alone is never evidence of source 60 fps.
-    Audio defaults to `auto`: process-loopback captures the game's music/SFX while the default output
-    endpoint is temporarily muted for local quiet. A real AAC track is reported as `audio_muxed=true`;
-    on failure the clip stays video-only with an explicit `audio_error`. Other local audio is also muted
-    while recording.
+    Audio defaults to the **SDL disk → named-pipe relay**: VCMI writes game music/SFX to a pipe,
+    a relay writes `game-audio.raw`, and no physical output endpoint is used; the recorder reads from
+    the `recording_start` byte offset and muxes AAC. Office/other app audio is not muted. Zero in-game
+    music/sound is temporarily raised to 30/40 for the session and restored byte-for-byte on stop. A
+    real track is reported as `audio_muxed=true`; failure stays video-only with `audio_error`. Legacy
+    `--audio-source loopback` mutes the default endpoint and is not suitable while using office audio.
 11. Finish with `session_stop()` (only closes the client owned by this session).
 
 > The MCP server starts the game **off-screen** (outside the virtual desktop, e.g. -1600,0) and **muted**, so

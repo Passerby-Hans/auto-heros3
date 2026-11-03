@@ -15,7 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'src'))
 
-from auto_heros3.recording.audio_capture import mux_audio_file  # noqa: E402
+from auto_heros3.recording.audio_capture import (  # noqa: E402
+    mux_audio_file, mux_raw_audio_file, analyze_raw_pcm)
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -66,8 +67,36 @@ def test_mux() -> None:
         check('mux_command_reported', bool(cmd) and 'ffmpeg' in cmd)
 
 
+def test_raw_mux() -> None:
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        video = root / 'v.mp4'
+        raw = root / 'a.raw'
+        out = root / 'out.mp4'
+        subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x240:d=1',
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', str(video)], check=True)
+        data = bytearray()
+        for i in range(44100):
+            v = int(0.2 * 32767 * math.sin(2 * math.pi * 440 * i / 44100))
+            data += struct.pack('<hh', v, v)
+        raw.write_bytes(bytes(data))
+        peak, rms, nonzero, duration = analyze_raw_pcm(raw)
+        check('raw_analysis_signal', peak > 0.1 and rms > 0 and nonzero >= 0.9,
+              f'peak={peak} rms={rms} nz={nonzero}')
+        check('raw_analysis_duration', 0.9 <= duration <= 1.1, str(duration))
+        ok, err, cmd = mux_raw_audio_file(video, raw, out, delay_ms=0)
+        check('raw_mux_success', ok and err is None and out.exists(), str(err))
+        info = ffprobe(out)
+        kinds = sorted(s.get('codec_type') for s in info.get('streams', []))
+        check('raw_mux_has_video_audio', kinds == ['audio', 'video'], str(kinds))
+
+
 def main() -> int:
     test_mux()
+    test_raw_mux()
     for name, ok, detail in RESULTS:
         print(('PASS ' if ok else 'FAIL ') + name + (f'  ({detail})' if detail else ''))
     failed = [r for r in RESULTS if not r[1]]

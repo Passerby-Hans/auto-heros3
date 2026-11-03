@@ -6000,6 +6000,21 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
     if not overlay_path.exists():
         overlay_path.write_text('', encoding='utf-8')
     _overlay('event', f'录制开始 {fps}fps/{height}p')
+    # AV.1c preflight: explicitly tell the caller when game mute/volume would yield silence.
+    # Do not silently encode a video-only clip without a visible warning.
+    try:
+        from auto_heros3.recording.audio_capture import game_volume_settings
+        music, sound = game_volume_settings()
+    except Exception:
+        music, sound = None, None
+    raw_sink = _dir() / 'game-audio.raw'
+    audio_expected = raw_sink.exists()
+    audio_warning = None
+    if music == 0 or sound == 0:
+        audio_warning = f'game music/sound is music={music}/sound={sound}; recording will be silent'
+    elif not audio_expected:
+        audio_warning = ('SDL disk audio sink game-audio.raw not found; recording will be '
+                         'video-only unless the game was launched with the disk sink')
     log = (out / 'recorder.log').open('w', encoding='utf-8')
     cmd = [sys.executable, '-X', 'utf8', str(ROOT / 'tools' / 'vcmi_overlay_recorder.py'),
            '--dir', str(_dir()), '--out', str(out), '--fps', str(int(fps)),
@@ -6019,7 +6034,10 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
                      'segment_id': f"{identity.get('run_id')}/rec-{stamp}",
                      'canvas': canvas, 'fps': int(fps), 'height': int(height),
                      'crf': int(crf), 'recorder_pid': proc.pid,
-                     'output_dir': str(out)})
+                     'audio_expected': audio_expected,
+                     'audio_warning': audio_warning,
+                     'audio_settings': {'music': music, 'sound': sound},
+                     'audio_sink': 'sdl-disk', 'output_dir': str(out)})
     identity.update(_recording_identity_extra(identity))
     for key in ('client_pid', 'window_rect', 'exe_sha256', 'protocol',
                 'contract_built_from_commit', 'contract_exe_sha256_match', 'offscreen'):
@@ -6028,6 +6046,9 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
     _atomic_write_json(_recording_state_path(),
                        {'pid': proc.pid, 'dir': str(out), 'started': started_at,
                         'fps': int(fps), 'height': int(height), 'crf': int(crf),
+                        'audio_expected': audio_expected,
+                        'audio_warning': audio_warning,
+                        'audio_settings': {'music': music, 'sound': sound},
                         'identity': identity, 'run_id': identity.get('run_id'),
                         'branch_id': identity.get('branch_id'),
                         'epoch': identity.get('epoch'),
@@ -6037,6 +6058,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
                         'identity_file': str(out / 'identity.json')})
     return {'ok': True, 'dir': str(out), 'pid': proc.pid, 'fps': int(fps),
             'canvas': canvas, 'crf': int(crf),
+            'audio_expected': audio_expected, 'audio_warning': audio_warning,
+            'audio_settings': {'music': music, 'sound': sound},
             'identity': identity, 'run_id': identity.get('run_id'),
             'branch_id': identity.get('branch_id'), 'epoch': identity.get('epoch'),
             'segment_id': identity.get('segment_id'),

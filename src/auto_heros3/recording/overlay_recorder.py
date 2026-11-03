@@ -70,7 +70,7 @@ import vcmi_shot  # noqa: E402
 from auto_heros3.recording.wgc_source import (  # noqa: E402
     WgcFrameSource, WgcUnavailable, binding_available)
 from auto_heros3.recording.audio_capture import (  # noqa: E402
-    AudioCaptureSession, AudioUnavailable, binding_available as audio_binding_available)
+    AudioCaptureSession, DiskAudioSink, AudioUnavailable, binding_available as audio_binding_available)
 from PIL import Image, ImageDraw, ImageFont, ImageStat  # noqa: E402
 
 BG = (13, 17, 24)
@@ -679,8 +679,10 @@ def main() -> int:
                     help='game frame source: auto prefers WGC (Windows Graphics Capture) '
                          'and falls back to PrintWindow; gdi forces the legacy path')
     ap.add_argument('--audio', choices=('auto', 'off', 'required'), default='auto',
-                    help='process-loopback game audio: auto captures when a VCMI audio session '
-                         'exists, off disables it, required fails if it cannot start')
+                    help='game audio: auto/required capture; off disables it')
+    ap.add_argument('--audio-source', choices=('disk', 'loopback'), default='disk',
+                    help='disk = VCMI SDL disk sink (no physical playback); loopback = '
+                         'per-process WASAPI + endpoint mute (legacy)')
     ap.add_argument('--crf', type=int, default=10, help='x264 CRF; 0 = lossless')
     ap.add_argument('--preset', default='veryfast')
     ap.add_argument('--keep-frames', action='store_true',
@@ -763,21 +765,21 @@ def main() -> int:
                     continue
             if audio is None and not audio_tried and args.audio != 'off' and _window_alive(int(hwnd)):
                 audio_tried = True
-                if not audio_binding_available():
-                    audio_error = 'process-audio-capture is not installed'
-                    if args.audio == 'required':
-                        raise AudioUnavailable(audio_error)
-                else:
-                    try:
+                try:
+                    if args.audio_source == 'disk':
+                        audio = DiskAudioSink(Path(args.dir), out, log=print)
+                    else:
+                        if not audio_binding_available():
+                            raise AudioUnavailable('process-audio-capture is not installed')
                         audio = AudioCaptureSession(int(hwnd), out / 'audio.wav',
                                                    log=print)
-                        audio_meta = audio.start()
-                        audio_session = audio
-                    except Exception as exc:  # noqa: BLE001
-                        audio_error = f'{type(exc).__name__}: {exc}'
-                        audio = None
-                        if args.audio == 'required':
-                            raise
+                    audio_meta = audio.start()
+                    audio_session = audio
+                except Exception as exc:  # noqa: BLE001
+                    audio_error = f'{type(exc).__name__}: {exc}'
+                    audio = None
+                    if args.audio == 'required':
+                        raise
             if wgc is None and args.capture in ('auto', 'wgc') and _window_alive(int(hwnd)):
                 if args.capture == 'auto' and not _window_on_screen(int(hwnd)):
                     capture_backend = 'gdi'
@@ -940,6 +942,7 @@ def main() -> int:
                 'capture_backend': capture_backend, 'capture_mode': args.capture,
                 'wgc_error': wgc_error, 'wgc_errors': source_errors,
                 'dpi_per_monitor_v2': bool(_DPI_PER_MONITOR_V2),
+                'audio_source': args.audio_source,
                 'audio_muxed': audio_muxed,
                 'audio_error': audio_error if audio_meta is None else (audio_meta.mix_error or audio_meta.error),
                 'audio': asdict(audio_meta) if audio_meta is not None else None,

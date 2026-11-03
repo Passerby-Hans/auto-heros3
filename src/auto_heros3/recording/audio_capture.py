@@ -47,14 +47,135 @@ def _endpoint():
     return AudioUtilities.GetSpeakers().EndpointVolume
 
 
-def mux_audio_file(video: Path, wav: Path, out: Path, delay_ms: int = 0) -> tuple[bool, str | None, str]:
-    """Mux a process-loopback WAV under an existing video (video copy + AAC audio)."""
+def game_volume_settings() -> tuple[int | None, int | None]:
+    """(music, sound) from VCMI settings.json, or (None, None) if unavailable."""
+    try:
+        from auto_heros3.runtime.vcmi_agent import VCMI_SETTINGS
+        data = json.loads(Path(VCMI_SETTINGS).read_text(encoding='utf-8-sig'))
+        general = data.get('general') or {}
+        return general.get('music'), general.get('sound')
+    except Exception:
+        return None, None
+
+
+def mux_raw_audio_file(video: Path, raw: Path, out: Path, delay_ms: int = 0) -> tuple[bool, str | None, str]:
+    """Mux headerless VCMI SDL disk PCM (s16le/44100/2) under an encoded video."""
     ffmpeg = shutil.which('ffmpeg') or r'C:\Users\Hans\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe'
     if not Path(ffmpeg).exists():
         return False, 'ffmpeg not found', ''
-    if delay_ms < 0:
+    af = f'adelay={max(0, delay_ms)}|{max(0, delay_ms)},apad'
+    cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+           '-i', str(video), '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', str(raw),
+           '-filter_complex', f'[1:a]{af}[a]',
+           '-map', '0:v:0', '-map', '[a]', '-c:v', 'copy',
+           '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', str(out)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except Exception as exc:  # noqa: BLE001
+        return False, f'{type(exc).__name__}: {exc}', ' '.join(cmd)
+    if p.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+        return False, (p.stderr[-800:] or f'ffmpeg rc={p.returncode}'), ' '.join(cmd)
+    return True, None, ' '.join(cmd)
+
+
+def analyze_raw_pcm(raw: Path) -> tuple[float, float, float, float]:
+    """(peak, rms, nonzero_s, duration_s) for headerless s16le/44100/2."""
+    import numpy as np
+    p = subprocess.run([shutil.which('ffmpeg') or 'ffmpeg', '-v', 'error',
+                        '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', str(raw),
+                        '-f', 'f32le', '-ac', '1', '-ar', '16000', '-'],
+                       capture_output=True, timeout=120)
+    if p.returncode != 0 or not p.stdout:
+        return 0.0, 0.0, 0.0, 0.0
+    arr = np.frombuffer(p.stdout, dtype='<f4')
+    peak = float(np.abs(arr).max()) if arr.size else 0.0
+    rms = float((arr.astype('float64') ** 2).mean() ** 0.5) if arr.size else 0.0
+    step = max(1, int(0.1 * 16000))
+    windows = [arr[i:i + step] for i in range(0, max(0, arr.size - step + 1), step)]
+    nonzero = round(sum(1 for w in windows if float(np.abs(w).max()) > 1e-4) * 0.1, 2)
+    return peak, rms, nonzero, round(arr.size / 16000, 3)
+
+
+class DiskAudioSink:
+    """Read VCMI's SDL disk-driver raw file; never touches the physical endpoint.
+
+    VCMI is launched with ``SDL_AUDIODRIVER=disk`` and ``SDL_DISKAUDIOFILE=<bridge>/game-audio.raw``.
+    The mixer writes headerless s16le/44100/2 in real time.  A recording starts at a byte offset
+    (audio from before recording_start is discarded), and the tail is copied into the clip dir.
+    """
+
+    def __init__(self, state_dir: Path, out_dir: Path, log=print):
+        self.state_dir = Path(state_dir)
+        self.out_dir = Path(out_dir)
+        self.sink_path = self.state_dir / 'game-audio.raw'
+        self.raw_path = self.out_dir / 'audio.raw'
+        self.meta = AudioMeta(source='sdl-disk', raw_format='s16le/44100/2',
+                              wav=str(self.raw_path))
+        self.log = log
+
+    def start(self) -> AudioMeta:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            if self.sink_path.exists():
+                break
+            time.sleep(0.02)
+        if not self.sink_path.exists():
+            raise AudioUnavailable(f'SDL disk sink not found: {self.sink_path}')
+        self.meta.available = True
+        self.meta.captured = True
+        self.meta.start_offset_bytes = int(self.sink_path.stat().st_size)
+        self.meta.start_wall = time.time()
+        self.log(f'[audio] disk sink {self.sink_path} from byte '
+                 f'{self.meta.start_offset_bytes}; endpoint untouched')
+        return self.meta
+
+    def stop(self) -> AudioMeta:
+        if self.meta.stop_wall is not None:
+            return self.meta
+        self.meta.stop_wall = time.time()
+        start = int(self.meta.start_offset_bytes or 0)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.sink_path.open('rb') as src:
+                src.seek(start)
+                data = src.read()
+            self.raw_path.write_bytes(data)
+            self.meta.raw_bytes = len(data)
+            self.meta.bytes = len(data)
+            if data:
+                peak, rms, nonzero, duration = analyze_raw_pcm(self.raw_path)
+                self.meta.peak, self.meta.rms = peak, rms
+                self.meta.nonzero_s, self.meta.duration_s = nonzero, duration
+        except Exception as exc:  # noqa: BLE001
+            self.meta.error = f'sink read: {type(exc).__name__}: {exc}'
+        return self.meta
+
+    def mux_into(self, video: Path, out: Path, video_started_wall: float | None) -> AudioMeta:
+        if not self.meta.raw_bytes:
+            self.meta.mix_error = 'no disk audio bytes'
+            return self.meta
+        if self.meta.peak is not None and self.meta.peak <= 1e-6:
+            self.meta.mix_error = 'captured audio is silent'
+            return self.meta
         delay_ms = 0
-    af = f'adelay={delay_ms}|{delay_ms},apad'
+        if self.meta.start_wall and video_started_wall:
+            delay_ms = max(0, int(round((self.meta.start_wall - video_started_wall) * 1000)))
+        ok, err, cmd = mux_raw_audio_file(video, self.raw_path, out, delay_ms)
+        self.meta.mix_command = cmd
+        self.meta.mix_error = err
+        return self.meta
+
+
+def mux_audio_file(video: Path, wav: Path, out: Path, delay_ms: int = 0) -> tuple[bool, str | None, str]:
+    """Mux a WAV/process-loopback audio file under an existing video (video copy + AAC)."""
+    ffmpeg = shutil.which('ffmpeg') or r'C:\Users\Hans\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe'
+    if not Path(ffmpeg).exists():
+        return False, 'ffmpeg not found', ''
+    af = f'adelay={max(0, delay_ms)}|{max(0, delay_ms)},apad'
     cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
            '-i', str(video), '-i', str(wav),
            '-filter_complex', f'[1:a]{af}[a]',
@@ -94,6 +215,10 @@ class AudioMeta:
     error: str | None = None
     mix_command: str | None = None
     mix_error: str | None = None
+    source: str | None = None
+    raw_format: str | None = None
+    start_offset_bytes: int | None = None
+    raw_bytes: int | None = None
 
 
 class AudioCaptureSession:

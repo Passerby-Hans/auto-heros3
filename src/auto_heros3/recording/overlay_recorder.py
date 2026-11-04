@@ -441,6 +441,31 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+def parse_segment_list(path: Path, base: Path) -> list[tuple[float, float, Path]]:
+    """Parse ffmpeg segment-list CSV: start,end,filename."""
+    out: list[tuple[float, float, Path]] = []
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        parts = line.split(',')
+        if len(parts) < 3:
+            continue
+        try:
+            if parts[0].strip().lower().endswith(('.mp4', '.ts', '.mkv', '.mov')):
+                name = parts[0].strip()
+                start, end = float(parts[1]), float(parts[2])
+            else:
+                start, end = float(parts[0]), float(parts[1])
+                name = ','.join(parts[2:]).strip()
+        except ValueError:
+            continue
+        p = Path(name)
+        if not p.is_absolute():
+            p = base / p
+        out.append((start, end, p))
+    return out
+
+
 # ---------------------------------------------------------------- recording health (pure parts)
 def region_luma(img: Image.Image, box: tuple[int, int, int, int] | None = None,
                 thumb: tuple[int, int] = HEALTH_THUMB) -> float | None:
@@ -691,6 +716,9 @@ def main() -> int:
                          'per-process WASAPI + endpoint mute (legacy)')
     ap.add_argument('--crf', type=int, default=10, help='x264 CRF; 0 = lossless')
     ap.add_argument('--preset', default='veryfast')
+    ap.add_argument('--rollover-seconds', type=float, default=0.0,
+                    help='if >0, write time-based video segments (post-muxed with audio); '
+                         '0 keeps one video.mp4')
     ap.add_argument('--keep-frames', action='store_true',
                     help='legacy: keep JPEG frames (off by default; streaming only)')
     ap.add_argument('--stop-file', default=None)
@@ -723,7 +751,33 @@ def main() -> int:
            '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{total_w}x{height}',
            '-r', str(args.fps), '-i', '-',
            '-c:v', 'libx264', '-preset', args.preset, '-crf', str(args.crf),
-           '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(video)]
+           '-pix_fmt', 'yuv420p']
+    rollover = args.rollover_seconds > 0
+    segment_dir = out / 'segments'
+    segment_list_file = out / 'segments.csv'
+    segment_files: list[Path] = []
+    if rollover:
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            segment_list_file.unlink()
+        except OSError:
+            pass
+        keyframe_expr = f'expr:gte(t,n_forced*{args.rollover_seconds:g})'
+        keyint = max(1, int(round(args.rollover_seconds * args.fps)))
+        # ffmpeg's segment muxer only cuts on keyframes.  With a keyframe at every target
+        # interval, using half that interval as the segment threshold yields one target-sized
+        # group per output (without break_non_keyframes gaps).
+        segment_time = max(0.5, args.rollover_seconds / 2.0)
+        cmd += ['-force_key_frames', keyframe_expr, '-sc_threshold', '0',
+                '-x264-params', f'keyint={keyint}:min-keyint={keyint}:scenecut=0',
+                '-g', str(keyint),
+                '-f', 'segment', '-segment_time', f'{segment_time:g}',
+                '-reset_timestamps', '1', '-segment_format', 'mp4',
+                '-segment_list', str(segment_list_file), '-segment_list_type', 'csv',
+                str(segment_dir / 'part-%05d.mp4')]
+        video = segment_dir / 'part-00000.mp4'
+    else:
+        cmd += ['-movflags', '+faststart', str(video)]
     encoder_log_path = out / 'encoder.log'
     encoder_log = encoder_log_path.open('w', encoding='utf-8')
     encoder = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -919,10 +973,54 @@ def main() -> int:
             except OSError:
                 tail = ''
             encoder_error = f'encoder rc={encoder_rc}: {tail.strip()}'
-        # Mix the captured game audio under the already encoded CFR video.  Keep the original
-        # video-only file if muxing fails; never delete evidence and never claim audio success.
+        # Mix the captured game audio under the already encoded CFR video.  In rollover mode each
+        # time segment gets its own raw-PCM slice; keep video-only segments if muxing fails.
         audio_muxed = False
-        if audio_meta is not None and audio_meta.captured and audio_session is not None:
+        segments_meta: list[dict] = []
+        if rollover:
+            infos = parse_segment_list(segment_list_file, segment_dir)
+            for idx, (seg_start, seg_end, seg_path) in enumerate(infos):
+                seg_audio_ok = False
+                seg_audio_error = None
+                if audio_meta is not None and audio_meta.captured and audio_session is not None:
+                    av = seg_path.with_name(seg_path.stem + '.av.mp4')
+                    try:
+                        sm = audio_session.mux_segment_into(seg_path, av, started,
+                                                            seg_start, seg_end)
+                        seg_audio_error = sm.mix_error
+                    except Exception as exc:  # noqa: BLE001
+                        seg_audio_error = f'{type(exc).__name__}: {exc}'
+                    if seg_audio_error is None and av.exists():
+                        try:
+                            video_only = seg_path.with_name(seg_path.stem + '-video-only.mp4')
+                            seg_path.replace(video_only)
+                            av.replace(seg_path)
+                            seg_audio_ok = True
+                        except OSError as exc:
+                            seg_audio_error = f'replace: {exc}'
+                            try:
+                                av.unlink()
+                            except OSError:
+                                pass
+                    else:
+                        try:
+                            av.unlink()
+                        except OSError:
+                            pass
+                segments_meta.append({
+                    'index': idx, 'start_s': round(seg_start, 3), 'end_s': round(seg_end, 3),
+                    'duration_s': round(seg_end - seg_start, 3),
+                    'video': str(seg_path), 'audio_muxed': seg_audio_ok,
+                    'audio_error': seg_audio_error,
+                    'bytes': seg_path.stat().st_size if seg_path.exists() else 0})
+            video = infos[0][2] if infos else video
+            video_ok = bool(infos) and encoder_rc == 0 and all(
+                encode_done(Path(s['video'])) for s in segments_meta)
+            audio_muxed = bool(segments_meta) and all(s['audio_muxed'] for s in segments_meta)
+            if not audio_muxed and args.audio != 'off':
+                audio_error = next((s['audio_error'] for s in segments_meta
+                                    if s['audio_error']), 'segment audio not muxed')
+        elif audio_meta is not None and audio_meta.captured and audio_session is not None:
             av = out / 'video.av.mp4'
             try:
                 audio_meta = audio_session.mux_into(video, av, started)
@@ -956,9 +1054,13 @@ def main() -> int:
             stop_file.unlink()
         except OSError:
             pass
-        video_ok = encode_done(video) and encoder_rc == 0
+        if not rollover:
+            video_ok = encode_done(video) and encoder_rc == 0
         meta = {'ok': video_ok, 'encoder_returncode': encoder_rc,
                 'encoder_error': encoder_error, 'encoder_log': str(encoder_log_path),
+                'rollover_seconds': args.rollover_seconds if rollover else 0,
+                'segments': segments_meta,
+                'segment_list': str(segment_list_file) if rollover else None,
                 'frames': frames, 'fps_target': args.fps,
                 'fps_actual': round(frames / elapsed, 2) if elapsed else 0,
                 'height': height, 'canvas': f'{total_w}x{height}', 'crf': args.crf,

@@ -654,6 +654,11 @@
       "default": 10,
       "title": "Crf",
       "type": "integer"
+     },
+     "rollover_seconds": {
+      "default": 0.0,
+      "title": "Rollover Seconds",
+      "type": "number"
      }
     },
     "type": "object",

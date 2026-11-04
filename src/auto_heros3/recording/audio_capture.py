@@ -180,6 +180,36 @@ class DiskAudioSink:
             self.meta.error = f'sink read: {type(exc).__name__}: {exc}'
         return self.meta
 
+    def mux_segment_into(self, video: Path, out: Path, video_started_wall: float,
+                         seg_start_s: float, seg_end_s: float) -> AudioMeta:
+        """Mux the raw-PCM slice belonging to one video segment."""
+        meta = AudioMeta(source='sdl-disk-segment')
+        if not self.meta.raw_bytes:
+            meta.mix_error = 'no disk audio bytes'
+            return meta
+        if self.meta.clock_ok is False:
+            meta.mix_error = (f'raw audio short by {self.meta.shortfall_s}s vs video; '
+                              'refusing to hide it with apad')
+            return meta
+        delay_s = max(0.0, (self.meta.start_wall or video_started_wall) - video_started_wall)
+        src_start = max(0.0, seg_start_s - delay_s)
+        src_end = max(0.0, seg_end_s - delay_s)
+        duration = src_end - src_start
+        if duration <= 0:
+            meta.mix_error = f'empty audio slice [{src_start}, {src_end}]'
+            return meta
+        head_delay_ms = max(0, int(round((delay_s - seg_start_s) * 1000)))
+        ok, err, cmd = mux_raw_audio_segment(video, self.raw_path, out, head_delay_ms,
+                                             src_start, duration)
+        meta.available = self.meta.available
+        meta.captured = self.meta.captured
+        meta.wav = str(out)
+        meta.bytes = out.stat().st_size if out.exists() else None
+        meta.duration_s = duration
+        meta.mix_command = cmd
+        meta.mix_error = err
+        return meta
+
     def mux_into(self, video: Path, out: Path, video_started_wall: float | None) -> AudioMeta:
         if not self.meta.raw_bytes:
             self.meta.mix_error = 'no disk audio bytes'
@@ -198,6 +228,38 @@ class DiskAudioSink:
         self.meta.mix_command = cmd
         self.meta.mix_error = err
         return self.meta
+
+
+def mux_raw_audio_segment(video: Path, raw: Path, out: Path, delay_ms: int = 0,
+                          start_s: float = 0.0, duration_s: float | None = None) -> tuple[bool, str | None, str]:
+    """Mux one raw-PCM time slice under a video segment."""
+    ffmpeg = shutil.which('ffmpeg') or r'C:\Users\Hans\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe'
+    if not Path(ffmpeg).exists():
+        return False, 'ffmpeg not found', ''
+    if duration_s is not None and duration_s <= 0:
+        return False, f'invalid audio segment duration {duration_s}', ''
+    af = f'adelay={max(0, delay_ms)}|{max(0, delay_ms)},apad'
+    cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+           '-i', str(video)]
+    if start_s > 0:
+        cmd += ['-ss', f'{start_s:.6f}']
+    if duration_s is not None:
+        cmd += ['-t', f'{duration_s:.6f}']
+    cmd += ['-f', 's16le', '-ar', '44100', '-ac', '2', '-i', str(raw),
+            '-filter_complex', f'[1:a]{af}[a]',
+            '-map', '0:v:0', '-map', '[a]', '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', str(out)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except Exception as exc:  # noqa: BLE001
+        return False, f'{type(exc).__name__}: {exc}', ' '.join(cmd)
+    if p.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+        return False, (p.stderr[-800:] or f'ffmpeg rc={p.returncode}'), ' '.join(cmd)
+    return True, None, ' '.join(cmd)
 
 
 def mux_audio_file(video: Path, wav: Path, out: Path, delay_ms: int = 0) -> tuple[bool, str | None, str]:

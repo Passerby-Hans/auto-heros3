@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'src'))
 
 from auto_heros3.recording.audio_capture import (  # noqa: E402
-    mux_audio_file, mux_raw_audio_file, analyze_raw_pcm)
+    mux_audio_file, mux_raw_audio_file, analyze_raw_pcm, mux_raw_audio_segment)
+from auto_heros3.recording.overlay_recorder import parse_segment_list  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -94,9 +95,41 @@ def test_raw_mux() -> None:
         check('raw_mux_has_video_audio', kinds == ['audio', 'video'], str(kinds))
 
 
+def test_segment_contract() -> None:
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        video = root / 'seg.mp4'
+        raw = root / 'raw.raw'
+        out = root / 'seg.av.mp4'
+        subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i',
+                        'color=c=black:s=320x240:d=2', '-c:v', 'libx264',
+                        '-pix_fmt', 'yuv420p', '-y', str(video)], check=True)
+        data = bytearray()
+        for i in range(44100 * 4):
+            v = int(0.2 * 32767 * math.sin(2 * math.pi * 440 * i / 44100))
+            data += struct.pack('<hh', v, v)
+        raw.write_bytes(bytes(data))
+        ok, err, _cmd = mux_raw_audio_segment(video, raw, out, 0, start_s=1.0,
+                                              duration_s=1.0)
+        check('segment_mux_success', ok and err is None and out.exists(), str(err))
+        info = ffprobe(out)
+        kinds = sorted(s.get('codec_type') for s in info.get('streams', []))
+        check('segment_mux_has_video_audio', kinds == ['audio', 'video'], str(kinds))
+        csv = root / 'segments.csv'
+        csv.write_text('part-00000.mp4,0.000000,2.000000\n', encoding='utf-8')
+        parsed = parse_segment_list(csv, root)
+        check('segment_csv_filename_first',
+              len(parsed) == 1 and parsed[0][0] == 0.0 and parsed[0][1] == 2.0,
+              str(parsed))
+
+
 def main() -> int:
     test_mux()
     test_raw_mux()
+    test_segment_contract()
     for name, ok, detail in RESULTS:
         print(('PASS ' if ok else 'FAIL ') + name + (f'  ({detail})' if detail else ''))
     failed = [r for r in RESULTS if not r[1]]

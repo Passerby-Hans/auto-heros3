@@ -5950,7 +5950,8 @@ def _pid_alive(pid) -> bool:
 
 
 @mcp.tool()
-def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
+def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
+                    rollover_seconds: float = 0.0) -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -6019,6 +6020,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
     cmd = [sys.executable, '-X', 'utf8', str(ROOT / 'tools' / 'vcmi_overlay_recorder.py'),
            '--dir', str(_dir()), '--out', str(out), '--fps', str(int(fps)),
            '--height', str(int(height)), '--crf', str(int(crf))]
+    if rollover_seconds and rollover_seconds > 0:
+        cmd += ['--rollover-seconds', str(float(rollover_seconds))]
     proc = subprocess.Popen(cmd, cwd=str(ROOT),
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                             stdout=log, stderr=subprocess.STDOUT)
@@ -6037,7 +6040,9 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
                      'audio_expected': audio_expected,
                      'audio_warning': audio_warning,
                      'audio_settings': {'music': music, 'sound': sound},
-                     'audio_sink': 'sdl-disk', 'output_dir': str(out)})
+                     'audio_sink': 'sdl-disk',
+                     'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
+                     'output_dir': str(out)})
     identity.update(_recording_identity_extra(identity))
     for key in ('client_pid', 'window_rect', 'exe_sha256', 'protocol',
                 'contract_built_from_commit', 'contract_exe_sha256_match', 'offscreen'):
@@ -6049,6 +6054,7 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
                         'audio_expected': audio_expected,
                         'audio_warning': audio_warning,
                         'audio_settings': {'music': music, 'sound': sound},
+                        'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
                         'identity': identity, 'run_id': identity.get('run_id'),
                         'branch_id': identity.get('branch_id'),
                         'epoch': identity.get('epoch'),
@@ -6060,6 +6066,7 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10) -> dict:
             'canvas': canvas, 'crf': int(crf),
             'audio_expected': audio_expected, 'audio_warning': audio_warning,
             'audio_settings': {'music': music, 'sound': sound},
+            'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
             'identity': identity, 'run_id': identity.get('run_id'),
             'branch_id': identity.get('branch_id'), 'epoch': identity.get('epoch'),
             'segment_id': identity.get('segment_id'),
@@ -6144,6 +6151,9 @@ def recording_stop() -> dict:
             'wgc_error': meta.get('wgc_error'), 'wgc_errors': meta.get('wgc_errors'),
             'audio_muxed': meta.get('audio_muxed'), 'audio_error': meta.get('audio_error'),
             'audio': meta.get('audio'),
+            'rollover_seconds': meta.get('rollover_seconds', 0),
+            'segments': meta.get('segments') or [],
+            'segment_list': meta.get('segment_list'),
             'dir': str(out), 'elapsed': meta.get('elapsed'), 'recovered': recovered,
             'identity': record.get('identity') or {}, 'run_id': record.get('run_id'),
             'branch_id': record.get('branch_id'), 'epoch': record.get('epoch'),

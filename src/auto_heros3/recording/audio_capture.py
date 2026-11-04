@@ -133,19 +133,45 @@ class DiskAudioSink:
                  f'{self.meta.start_offset_bytes}; endpoint untouched')
         return self.meta
 
-    def stop(self) -> AudioMeta:
+    def stop(self, video_started_wall: float | None = None) -> AudioMeta:
         if self.meta.stop_wall is not None:
             return self.meta
         self.meta.stop_wall = time.time()
         start = int(self.meta.start_offset_bytes or 0)
+        target = None
+        if video_started_wall is not None and self.meta.start_wall is not None:
+            video_duration = max(0.0, self.meta.stop_wall - video_started_wall)
+            audio_delay = max(0.0, self.meta.start_wall - video_started_wall)
+            target = int(max(0.0, video_duration - audio_delay) * 176400)
+            self.meta.video_duration_s = round(video_duration, 3)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        wait_start = time.time()
+        deadline = wait_start + 10.0
+        size = 0
         try:
+            if target is not None:
+                # The relay may still be draining pipe-buffered samples.  Wait briefly for the
+                # sink to cover the video interval, then copy only that interval (never post-stop
+                # audio); do not let apad hide a real shortfall.
+                while time.time() < deadline:
+                    size = self.sink_path.stat().st_size
+                    if size >= start + target:
+                        break
+                    time.sleep(0.05)
+            self.meta.drain_wait_s = round(time.time() - wait_start, 3)
+            size = self.sink_path.stat().st_size
+            available = max(0, size - start)
+            n = available if target is None else min(target, available)
+            n -= n % 4
             with self.sink_path.open('rb') as src:
                 src.seek(start)
-                data = src.read()
+                data = src.read(n)
             self.raw_path.write_bytes(data)
             self.meta.raw_bytes = len(data)
             self.meta.bytes = len(data)
+            if target is not None:
+                self.meta.shortfall_s = round((target - len(data)) / 176400, 3)
+                self.meta.clock_ok = self.meta.shortfall_s <= 0.25
             if data:
                 peak, rms, nonzero, duration = analyze_raw_pcm(self.raw_path)
                 self.meta.peak, self.meta.rms = peak, rms
@@ -157,6 +183,10 @@ class DiskAudioSink:
     def mux_into(self, video: Path, out: Path, video_started_wall: float | None) -> AudioMeta:
         if not self.meta.raw_bytes:
             self.meta.mix_error = 'no disk audio bytes'
+            return self.meta
+        if self.meta.clock_ok is False:
+            self.meta.mix_error = (f'raw audio short by {self.meta.shortfall_s}s vs video; '
+                                   'refusing to hide it with apad')
             return self.meta
         if self.meta.peak is not None and self.meta.peak <= 1e-6:
             self.meta.mix_error = 'captured audio is silent'
@@ -219,6 +249,10 @@ class AudioMeta:
     raw_format: str | None = None
     start_offset_bytes: int | None = None
     raw_bytes: int | None = None
+    video_duration_s: float | None = None
+    shortfall_s: float | None = None
+    drain_wait_s: float | None = None
+    clock_ok: bool | None = None
 
 
 class AudioCaptureSession:

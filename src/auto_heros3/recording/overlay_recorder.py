@@ -435,6 +435,12 @@ def encode_done(video: Path) -> bool:
     return video.exists() and video.stat().st_size > 0
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    tmp.replace(path)
+
+
 # ---------------------------------------------------------------- recording health (pure parts)
 def region_luma(img: Image.Image, box: tuple[int, int, int, int] | None = None,
                 thumb: tuple[int, int] = HEALTH_THUMB) -> float | None:
@@ -718,8 +724,10 @@ def main() -> int:
            '-r', str(args.fps), '-i', '-',
            '-c:v', 'libx264', '-preset', args.preset, '-crf', str(args.crf),
            '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(video)]
+    encoder_log_path = out / 'encoder.log'
+    encoder_log = encoder_log_path.open('w', encoding='utf-8')
     encoder = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                               stderr=encoder_log)
     panel = Panel(panel_w, height, state_dir)
     canvas = Image.new('RGB', (total_w, height), BG)
     panel_image = panel.render(0.0, 0)
@@ -876,7 +884,10 @@ def main() -> int:
         # Health evidence is emitted first: it must survive even if the encoder shutdown raises.
         if audio is not None:
             try:
-                audio_meta = audio.stop()
+                if isinstance(audio, DiskAudioSink):
+                    audio_meta = audio.stop(started)
+                else:
+                    audio_meta = audio.stop()
             except Exception as exc:  # noqa: BLE001
                 audio_error = f'audio stop: {type(exc).__name__}: {exc}'
             audio = None
@@ -895,8 +906,19 @@ def main() -> int:
             encoder.stdin.close()
         except Exception:
             pass
-        encoder.wait(timeout=300)
+        encoder_rc = encoder.wait(timeout=300)
         elapsed = time.time() - started
+        try:
+            encoder_log.close()
+        except Exception:
+            pass
+        encoder_error = None
+        if encoder_rc != 0:
+            try:
+                tail = encoder_log_path.read_text(encoding='utf-8', errors='replace')[-1200:]
+            except OSError:
+                tail = ''
+            encoder_error = f'encoder rc={encoder_rc}: {tail.strip()}'
         # Mix the captured game audio under the already encoded CFR video.  Keep the original
         # video-only file if muxing fails; never delete evidence and never claim audio success.
         audio_muxed = False
@@ -934,7 +956,10 @@ def main() -> int:
             stop_file.unlink()
         except OSError:
             pass
-        meta = {'ok': encode_done(video), 'frames': frames, 'fps_target': args.fps,
+        video_ok = encode_done(video) and encoder_rc == 0
+        meta = {'ok': video_ok, 'encoder_returncode': encoder_rc,
+                'encoder_error': encoder_error, 'encoder_log': str(encoder_log_path),
+                'frames': frames, 'fps_target': args.fps,
                 'fps_actual': round(frames / elapsed, 2) if elapsed else 0,
                 'height': height, 'canvas': f'{total_w}x{height}', 'crf': args.crf,
                 'missed_slots': missed, 'duplicated_frames': duplicated,
@@ -946,11 +971,11 @@ def main() -> int:
                 'audio_muxed': audio_muxed,
                 'audio_error': audio_error if audio_meta is None else (audio_meta.mix_error or audio_meta.error),
                 'audio': asdict(audio_meta) if audio_meta is not None else None,
-                'video': str(video) if encode_done(video) else None,
+                'video': str(video) if video_ok else None,
                 'bytes': video.stat().st_size if video.exists() else 0,
                 'elapsed': round(elapsed, 1), 'cache_removed': removed,
                 'health_file': str(out / 'health.jsonl')}
-        (out / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False))
+        _atomic_write_json(out / 'meta.json', meta)
     return 0
 
 

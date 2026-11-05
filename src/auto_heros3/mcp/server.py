@@ -5960,6 +5960,141 @@ def _obs_recorder_exe() -> Path:
     return base / 'obs-media-selftest.exe'
 
 
+def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
+                         max_time_sec: int) -> tuple[object, dict]:
+    """Create/connect/prepare/start one native recorder process for a run."""
+    from auto_heros3.recording.obs_backend import ObsRecorder
+    client = ObsRecorder(_obs_recorder_exe(), obs_dir=Path(r'C:\Program Files\obs-studio'),
+                         log_path=Path(out) / 'server.log')
+    try:
+        client.connect()
+        prep = client.prepare(Path(out), window_pid=int(client_pid), audio_raw=Path(audio_raw),
+                              max_time_sec=int(max_time_sec), duration_ms=0)
+        if not prep.get('ok'):
+            raise RuntimeError(f"prepare failed: {prep.get('error')}")
+        start = client.start_recording()
+        if not start.get('ok'):
+            raise RuntimeError(f"start failed: {start.get('error')}")
+        return client, prep
+    except Exception:
+        try:
+            client.close(force=True)
+        except Exception:
+            pass
+        raise
+
+
+def _libobs_mark_run_failed(out: Path, reason: str) -> None:
+    try:
+        from auto_heros3.recording.recording_manifest import RecordingManifest
+        m = RecordingManifest.load(Path(out) / 's4b')
+        state = m.data.get('state')
+        if state in ('complete', 'partial', 'failed'):
+            return
+        m.transition_run('failed', reason=reason)
+    except Exception:
+        pass
+
+
+def _libobs_run_snapshot(out: Path, manifest_state: str | None = None) -> dict:
+    files = []
+    for p in sorted(Path(out).rglob('*.mp4')):
+        files.append({'name': p.name, 'path': str(p), 'bytes': p.stat().st_size})
+    return {'dir': str(out), 'manifest': str(Path(out) / 's4b' / 'manifest.json'),
+            'manifest_state': manifest_state, 'files': files}
+
+
+def _libobs_watchdog(rec: dict) -> None:
+    stop_event = rec.get('watchdog_stop')
+    if stop_event is None:
+        return
+    while not stop_event.wait(0.75):
+        if rec.get('stop_requested') or rec.get('restarting'):
+            continue
+        client = rec.get('client')
+        proc = rec.get('proc')
+        if client is None:
+            continue
+        if proc is not None and proc.poll() is None:
+            continue
+        if proc is None and client.alive():
+            continue
+        _libobs_restart_after_death(rec, proc.returncode if proc is not None else None)
+
+
+def _libobs_restart_after_death(rec: dict, returncode) -> None:
+    lock = rec.get('restart_lock')
+    if lock is None:
+        return
+    with lock:
+        if rec.get('stop_requested') or not rec.get('config'):
+            return
+        proc = rec.get('proc')
+        client = rec.get('client')
+        if proc is not None and proc.poll() is None:
+            return
+        if proc is None and client is not None and client.alive():
+            return
+        old_out = Path(rec.get('dir') or '')
+        old_run_id = rec.get('recording_run_id')
+        _libobs_mark_run_failed(old_out, f'native_recorder_died rc={returncode}')
+        old_snap = _libobs_run_snapshot(old_out, 'failed')
+        old_snap['recording_run_id'] = old_run_id
+        rec.setdefault('runs', []).append(old_snap)
+        cfg = dict(rec.get('config') or {})
+        n = int(rec.get('restart_count') or 0) + 1
+        new_out = old_out.parent / f'{old_out.name}-r{n}'
+        new_out.mkdir(parents=True, exist_ok=True)
+        from auto_heros3.recording.recording_manifest import RecordingManifest
+        new_run_id = f'{old_run_id or "obs"}-r{n}'
+        try:
+            m = RecordingManifest.create(
+                new_out / 's4b', recording_run_id=new_run_id,
+                owner_token=f'mcp-{os.getpid()}-{new_run_id}', backend='libobs',
+                game_identity=rec.get('identity') or {},
+                metadata={'restart_of': old_run_id, 'restart_count': n})
+            client, prep = _libobs_start_client(
+                new_out, client_pid=int(cfg['client_pid']), audio_raw=Path(cfg['audio_raw']),
+                max_time_sec=int(cfg['max_time_sec']))
+            m.transition_run('recording')
+        except Exception as exc:  # noqa: BLE001
+            _libobs_mark_run_failed(new_out, f'restart_failed: {type(exc).__name__}: {exc}')
+            rec.update({'client': None, 'proc': None, 'active': False, 'restarting': False,
+                        'recording_failed': f'restart_failed: {type(exc).__name__}: {exc}',
+                        'last_error': str(exc), 'dir': new_out,
+                        'manifest': str(new_out / 's4b' / 'manifest.json')})
+            try:
+                stop_event = rec.get('watchdog_stop')
+                if stop_event is not None:
+                    stop_event.set()
+            except Exception:
+                pass
+            _release_recording_lock()
+            _overlay('event', f'libobs 录制重启失败: {exc}')
+            return
+        rec.update({'client': client, 'proc': client.proc, 'dir': new_out,
+                    'manifest': new_out / 's4b' / 'manifest.json',
+                    'recording_run_id': new_run_id, 'restarting': False,
+                    'restart_count': n, 'active': True,
+                    'config': cfg, 'last_restart': {
+                        'from': old_run_id, 'to': new_run_id,
+                        'native_returncode': returncode, 'time': time.time()}})
+        rec.setdefault('runs', []).append(_libobs_run_snapshot(
+            new_out, 'recording') | {'recording_run_id': new_run_id})
+        try:
+            _atomic_write_json(_recording_state_path(),
+                               {'pid': client.pid,
+                                'dir': str(new_out), 'started': rec.get('started', time.time()),
+                                'backend': 'libobs', 'client_pid': cfg['client_pid'],
+                                'recording_run_id': new_run_id,
+                                'manifest': str(new_out / 's4b' / 'manifest.json'),
+                                'restart_count': n,
+                                'runs': rec.get('runs')})
+        except Exception:
+            pass
+        _overlay('event', f'libobs 录制器退出 rc={returncode}，已重启 r{n} 继续录制')
+
+
 def _recording_start_libobs(fps: int, height: int, crf: int,
                             rollover_seconds: float) -> dict:
     """Start the native libobs IPC recorder (experimental S3b path)."""
@@ -5991,18 +6126,9 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         _release_recording_lock()
         return {'ok': False, 'error': f'manifest_create: {type(exc).__name__}: {exc}'}
     try:
-        from auto_heros3.recording.obs_backend import ObsRecorder
-        client = ObsRecorder(exe, obs_dir=Path(r'C:\Program Files\obs-studio'),
-                             log_path=out / 'server.log')
-        client.connect()
-        prep = client.prepare(out, window_pid=int(client_pid), audio_raw=audio_raw,
-                              max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
-                              duration_ms=0)
-        if not prep.get('ok'):
-            raise RuntimeError(f"prepare failed: {prep.get('error')}")
-        start = client.start_recording()
-        if not start.get('ok'):
-            raise RuntimeError(f"start failed: {start.get('error')}")
+        client, prep = _libobs_start_client(
+            out, client_pid=int(client_pid), audio_raw=audio_raw,
+            max_time_sec=int(rollover_seconds) if rollover_seconds else 900)
         run_manifest.transition_run('recording')
     except Exception as exc:  # noqa: BLE001
         try:
@@ -6010,37 +6136,49 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
                 run_manifest.transition_run('failed', reason=str(exc))
         except Exception:
             pass
-        try:
-            client.close(force=True)  # type: ignore[possibly-undefined]
-        except Exception:
-            pass
         _release_recording_lock()
         return {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'dir': str(out)}
     identity.update({'recording_started_at': time.time(), 'backend': 'libobs',
                      'recording_run_id': recording_run_id,
                      'segment_id': f"{identity.get('run_id')}/obs-{stamp}",
-                     'output_dir': str(out), 'obs_pid': client.proc.pid if client.proc else None,
+                     'output_dir': str(out), 'obs_pid': client.pid,
                      'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0})
     _atomic_write_json(out / 'identity.json', identity)
-    _RUNTIME.recorder.update({'proc': client.proc, 'dir': out, 'started': time.time(),
-                              'backend': 'libobs', 'client': client,
-                              'manifest': manifest_dir / 'manifest.json',
-                              'recording_run_id': recording_run_id})
+    config = {'fps': int(fps), 'height': int(height), 'crf': int(crf),
+              'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
+              'client_pid': int(client_pid), 'audio_raw': str(audio_raw),
+              'max_time_sec': int(rollover_seconds) if rollover_seconds else 900}
+    rec = _RUNTIME.recorder
+    rec.clear()
+    rec.update({'proc': client.proc, 'dir': out, 'started': time.time(),
+                'backend': 'libobs', 'client': client,
+                'manifest': manifest_dir / 'manifest.json',
+                'recording_run_id': recording_run_id,
+                'config': config, 'identity': identity, 'active': True,
+                'restart_count': 0, 'stop_requested': False,
+                'watchdog_stop': threading.Event(), 'restart_lock': threading.Lock(),
+                'runs': [_libobs_run_snapshot(out, 'recording') |
+                         {'recording_run_id': recording_run_id}]})
     _atomic_write_json(_recording_state_path(),
-                       {'pid': client.proc.pid if client.proc else None, 'dir': str(out),
+                       {'pid': client.pid, 'dir': str(out),
                         'started': time.time(), 'backend': 'libobs', 'identity': identity,
                         'client_pid': client_pid, 'run_id': identity.get('run_id'),
                         'recording_run_id': recording_run_id,
-                        'manifest': str(manifest_dir / 'manifest.json')})
+                        'manifest': str(manifest_dir / 'manifest.json'),
+                        'restart_count': 0, 'runs': rec['runs']})
+    watchdog = threading.Thread(target=_libobs_watchdog, args=(rec,), daemon=True,
+                                name='obs-recorder-watchdog')
+    rec['watchdog'] = watchdog
+    watchdog.start()
     _overlay('event', f'libobs 录制开始 {fps}fps/{height}p')
     return {'ok': True, 'backend': 'libobs', 'dir': str(out),
-            'pid': client.proc.pid if client.proc else None,
+            'pid': client.pid,
             'client_pid': client_pid, 'session_id': prep.get('session_id'),
             'window': prep.get('window'), 'audio_raw': str(audio_raw),
             'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
             'recording_run_id': recording_run_id,
             'manifest': str(manifest_dir / 'manifest.json'),
-            'identity': identity, 'segments': []}
+            'identity': identity, 'segments': [], 'restart_count': 0}
 
 
 def _libobs_recover_state(record: dict) -> dict:
@@ -6106,11 +6244,39 @@ def _libobs_recover_state(record: dict) -> dict:
 
 
 def _recording_stop_libobs() -> dict:
-    client = _RUNTIME.recorder.get('client')
-    out = _RUNTIME.recorder.get('dir')
+    rec = _RUNTIME.recorder
+    client = rec.get('client')
+    out = rec.get('dir')
+    rec['stop_requested'] = True
+    stop_event = rec.get('watchdog_stop')
+    if stop_event is not None:
+        stop_event.set()
+    watchdog = rec.get('watchdog')
+    if watchdog is not None:
+        try:
+            watchdog.join(timeout=3.0)
+        except Exception:
+            pass
+    restart_lock = rec.get('restart_lock')
+    runs = list(rec.get('runs') or [])
     if client is None:
-        return {'ok': False, 'error': 'obs_client_missing'}
+        if out:
+            _libobs_mark_run_failed(Path(out), 'native_stop_without_client')
+            runs.append(_libobs_run_snapshot(Path(out), 'failed') |
+                        {'recording_run_id': rec.get('recording_run_id')})
+        _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
+                                  'active': False})
+        try:
+            _recording_state_path().unlink()
+        except OSError:
+            pass
+        _release_recording_lock()
+        return {'ok': False, 'backend': 'libobs', 'partial': True, 'dir': str(out),
+                'error': rec.get('recording_failed') or 'obs_client_missing',
+                'runs': runs, 'restart_count': int(rec.get('restart_count') or 0)}
     try:
+        if restart_lock is not None:
+            restart_lock.acquire()
         status = client.status()
         stop = client.stop()
         client.shutdown()
@@ -6120,13 +6286,31 @@ def _recording_stop_libobs() -> dict:
             client.close(force=True)
         except Exception:
             pass
-        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'dir': str(out)}
-    _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None})
-    try:
-        _recording_state_path().unlink()
-    except OSError:
-        pass
-    _release_recording_lock()
+        if restart_lock is not None and restart_lock.locked():
+            try:
+                restart_lock.release()
+            except RuntimeError:
+                pass
+        if out:
+            _libobs_mark_run_failed(Path(out), f'native_stop_failed: {type(exc).__name__}: {exc}')
+            runs.append(_libobs_run_snapshot(Path(out), 'failed') |
+                        {'recording_run_id': rec.get('recording_run_id')})
+        _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
+                                  'active': False})
+        try:
+            _recording_state_path().unlink()
+        except OSError:
+            pass
+        _release_recording_lock()
+        return {'ok': False, 'backend': 'libobs', 'partial': True, 'dir': str(out),
+                'error': f'{type(exc).__name__}: {exc}', 'runs': runs,
+                'restart_count': int(rec.get('restart_count') or 0)}
+    finally:
+        if restart_lock is not None and restart_lock.locked():
+            try:
+                restart_lock.release()
+            except RuntimeError:
+                pass
     files = stop.get('files') or []
     manifest_path = Path(out) / 's4b' / 'manifest.json'
     manifest_summary = {}
@@ -6154,20 +6338,64 @@ def _recording_stop_libobs() -> dict:
         manifest_summary = m.summary()
     except Exception as exc:  # noqa: BLE001
         manifest_summary = {'state': 'manifest_error', 'error': f'{type(exc).__name__}: {exc}'}
+    def _norm_file(item, base_dir: Path) -> dict:
+        d = dict(item) if isinstance(item, dict) else {'name': Path(str(item)).name}
+        name = d.get('name') or Path(str(d.get('path', ''))).name
+        path = Path(d.get('path') or (Path(base_dir) / str(name)))
+        if not path.exists() and name:
+            found = list(Path(base_dir).rglob(str(name)))
+            if found:
+                path = found[0]
+        d['name'] = name
+        d['path'] = str(path)
+        d['bytes'] = int(d.get('size_bytes') or d.get('bytes') or
+                         (path.stat().st_size if path.exists() else 0))
+        return d
+    current_files = [_norm_file(x, Path(out)) for x in files]
+    all_files = []
+    seen = set()
+    for run in runs:
+        base = Path(run.get('dir') or out)
+        for item in run.get('files') or []:
+            norm = _norm_file(item, base)
+            key = norm.get('path') or norm.get('name')
+            if key and key not in seen:
+                seen.add(key)
+                all_files.append(norm)
+    for item in current_files:
+        key = item.get('path') or item.get('name')
+        if key and key not in seen:
+            seen.add(key)
+            all_files.append(item)
+    runs.append({'dir': str(out), 'manifest': str(manifest_path),
+                 'manifest_state': manifest_summary.get('state'),
+                 'recording_run_id': manifest_summary.get('recording_run_id'),
+                 'checks_ok': stop.get('checks_ok'), 'files': current_files})
+    partial_runs = [r for r in runs if r.get('manifest_state') in ('failed', 'partial')]
     result = {'ok': bool(stop.get('checks_ok')), 'backend': 'libobs',
               'dir': str(out), 'checks_ok': stop.get('checks_ok'),
-              'files': files, 'selftest': stop.get('selftest'),
+              'files': all_files, 'current_files': current_files,
+              'selftest': stop.get('selftest'),
               'manifest': stop.get('manifest'), 'status': status, 'native': stop,
-              'segments': files,
-              'audio_muxed': bool(files), 'recovered': False,
+              'segments': all_files, 'runs': runs, 'partial_runs': partial_runs,
+              'audio_muxed': bool(all_files), 'recovered': False,
+              'restart_count': int(rec.get('restart_count') or 0),
               'recording_run_id': manifest_summary.get('recording_run_id'),
               'python_manifest': str(manifest_path) if manifest_path.exists() else None,
               'manifest_state': manifest_summary.get('state'),
               'manifest_summary': manifest_summary}
+    _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
+                              'active': False, 'watchdog_stop': None,
+                              'watchdog': None, 'restart_lock': None})
+    try:
+        _recording_state_path().unlink()
+    except OSError:
+        pass
     try:
         _atomic_write_json(Path(out) / 'obs-result.json', result)
     except OSError:
         pass
+    _release_recording_lock()
     return result
 
 

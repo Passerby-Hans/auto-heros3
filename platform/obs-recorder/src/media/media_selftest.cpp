@@ -240,6 +240,7 @@ struct Options {
     int duration_ms = 17000;
     int max_time_sec = 5;
     std::string json_out;
+    std::string log_file;             // --log: self-redirect stdout (used by WMI launch)
     RunMode mode = RunMode::InMemory;
     bool duration_explicit = false;
     bool max_time_explicit = false;
@@ -2995,6 +2996,19 @@ bool PipeWrite(HANDLE pipe, const std::string& text)
            written == payload.size();
 }
 
+bool ClientProcessAlive(DWORD pid)
+{
+    if (pid == 0)
+        return true;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h)
+        return false;
+    DWORD code = 0;
+    const bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+}
+
 std::string NormalizePipeName(const std::string& requested)
 {
     std::string name = requested;
@@ -3059,9 +3073,27 @@ int RunServeMode(State& s, const std::string& requested_pipe)
         std::printf("SERVE_CLIENT connected requests_so_far=%d\n", sess.requests);
         std::fflush(stdout);
 
+        DWORD client_pid = 0;
+        if (GetNamedPipeClientProcessId(pipe, &client_pid))
+            std::printf("SERVE_CLIENT pid=%lu\n", client_pid);
+        else
+            std::printf("SERVE_CLIENT pid=unknown win32=%lu\n", GetLastError());
+        std::fflush(stdout);
+        uint64_t last_client_check_ns = 0;
+
         std::string rx;
         bool client_gone = false;
         while (!stop_serving && !client_gone) {
+            const uint64_t now_ns = os_gettime_ns();
+            if (client_pid != 0 && now_ns - last_client_check_ns >= 100000000ULL) {
+                last_client_check_ns = now_ns;
+                if (!ClientProcessAlive(client_pid)) {
+                    std::printf("SERVE_CLIENT process_exited pid=%lu\n", client_pid);
+                    std::fflush(stdout);
+                    client_gone = true;
+                    break;
+                }
+            }
             // Auto-stop timer is serviced even while no request is in flight.
             if (sess.phase == ServePhase::Recording && sess.auto_stop_deadline_ns &&
                 os_gettime_ns() >= sess.auto_stop_deadline_ns) {
@@ -3148,13 +3180,24 @@ int RunServeMode(State& s, const std::string& requested_pipe)
                 }
             }
         }
-        if (client_gone && !stop_serving && sess.phase == ServePhase::Recording) {
-            std::string error;
-            sess.last_error_code = "client_disconnected";
-            sess.last_error_message = "IPC client disconnected while recording; recording was stopped";
-            ServeFinishRecording(sess, s, false, error);
-            std::printf("IPC_EVENT client_disconnected_finalized report_rc=%d\n", sess.report_rc);
-            std::fflush(stdout);
+        if (client_gone && !stop_serving) {
+            if (sess.phase == ServePhase::Recording) {
+                std::string error;
+                sess.last_error_code = "client_disconnected";
+                sess.last_error_message = "IPC client disconnected while recording; recording was stopped";
+                std::printf("IPC_EVENT client_gone_finalize_begin\n");
+                std::fflush(stdout);
+                ServeFinishRecording(sess, s, false, error);
+                std::printf("IPC_EVENT client_disconnected_finalized report_rc=%d\n", sess.report_rc);
+                std::printf("IPC_EVENT client_gone_finalize_end phase=%s selftest=%s manifest=%s\n",
+                            ServePhaseName(sess.phase), sess.selftest_path.c_str(),
+                            sess.manifest_path.c_str());
+                std::fflush(stdout);
+            }
+            // MCP death means no controller remains.  Save what was captured, then exit
+            // instead of accepting a new client and pretending the interrupted run is live.
+            stop_serving = true;
+            exit_rc = 0;
         }
         DisconnectNamedPipe(pipe);
     }
@@ -3241,6 +3284,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.max_time_explicit = true;
         } else if (a == "--json-out") {
             opt.json_out = next("--json-out");
+        } else if (a == "--log") {
+            opt.log_file = next("--log");
         } else if (a == "--serve") {
             opt.serve = true;
         } else if (a == "--pipe") {
@@ -3334,6 +3379,12 @@ int main(int argc, char** argv)
     int exit_code = 0;
     if (!ParseArgs(argc, argv, state.opt, exit_code)) {
         return exit_code;
+    }
+    if (!state.opt.log_file.empty()) {
+        if (!std::freopen(state.opt.log_file.c_str(), "w", stdout)) {
+            std::fprintf(stderr, "cannot open --log file: %s\n", state.opt.log_file.c_str());
+            return 2;
+        }
     }
 
     // Keep a copy of libobs log lines in memory (also forwarded to stdout) so

@@ -146,7 +146,7 @@ class DiskAudioSink:
             self.meta.video_duration_s = round(video_duration, 3)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         wait_start = time.time()
-        deadline = wait_start + 10.0
+        deadline = wait_start + 30.0
         size = 0
         try:
             if target is not None:

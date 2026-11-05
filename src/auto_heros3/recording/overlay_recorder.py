@@ -1048,6 +1048,9 @@ def main() -> int:
             if size_limit_exceeded:
                 video_ok = False
             audio_muxed = bool(segments_meta) and all(s['audio_muxed'] for s in segments_meta)
+            if args.audio != 'off' and audio_meta is not None and not audio_muxed:
+                # Audio was expected: video-only segments must not be reported as an overall PASS.
+                video_ok = False
             if not audio_muxed and args.audio != 'off':
                 audio_error = next((s['audio_error'] for s in segments_meta
                                     if s['audio_error']), 'segment audio not muxed')

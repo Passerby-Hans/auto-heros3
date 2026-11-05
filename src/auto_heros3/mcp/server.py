@@ -5949,9 +5949,111 @@ def _pid_alive(pid) -> bool:
         return False
 
 
+def _obs_recorder_exe() -> Path:
+    env = os.environ.get('AUTO_HEROS3_OBS_RECORDER_EXE')
+    if env:
+        return Path(env)
+    return ROOT / 'platform' / 'obs-recorder' / 'build-media' / 'bin' / 'obs-media-selftest.exe'
+
+
+def _recording_start_libobs(fps: int, height: int, crf: int,
+                            rollover_seconds: float) -> dict:
+    """Start the native libobs IPC recorder (experimental S3b path)."""
+    exe = _obs_recorder_exe()
+    if not exe.exists():
+        return {'ok': False, 'error': 'obs_recorder_missing', 'path': str(exe)}
+    identity = _evidence_identity()
+    client_pid = identity.get('client_pid')
+    if not client_pid:
+        return {'ok': False, 'error': 'no_owned_client', 'identity': identity}
+    audio_raw = _dir() / 'game-audio.raw'
+    if not audio_raw.exists():
+        return {'ok': False, 'error': 'game_audio_raw_missing', 'path': str(audio_raw)}
+    lock = _acquire_recording_lock(identity)
+    if not lock.get('ok'):
+        return {'ok': False, 'error': lock.get('error'), 'owner': lock.get('lock_owner')}
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    out = _recordings_root() / f'obs-{stamp}'
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        from auto_heros3.recording.obs_backend import ObsRecorder
+        client = ObsRecorder(exe, obs_dir=Path(r'C:\Program Files\obs-studio'),
+                             log_path=out / 'server.log')
+        client.connect()
+        prep = client.prepare(out, window_pid=int(client_pid), audio_raw=audio_raw,
+                              max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
+                              duration_ms=0)
+        if not prep.get('ok'):
+            raise RuntimeError(f"prepare failed: {prep.get('error')}")
+        start = client.start_recording()
+        if not start.get('ok'):
+            raise RuntimeError(f"start failed: {start.get('error')}")
+    except Exception as exc:  # noqa: BLE001
+        try:
+            client.close(force=True)  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
+        _release_recording_lock()
+        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'dir': str(out)}
+    identity.update({'recording_started_at': time.time(), 'backend': 'libobs',
+                     'segment_id': f"{identity.get('run_id')}/obs-{stamp}",
+                     'output_dir': str(out), 'obs_pid': client.proc.pid if client.proc else None,
+                     'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0})
+    _atomic_write_json(out / 'identity.json', identity)
+    _RUNTIME.recorder.update({'proc': client.proc, 'dir': out, 'started': time.time(),
+                              'backend': 'libobs', 'client': client})
+    _atomic_write_json(_recording_state_path(),
+                       {'pid': client.proc.pid if client.proc else None, 'dir': str(out),
+                        'started': time.time(), 'backend': 'libobs', 'identity': identity,
+                        'client_pid': client_pid, 'run_id': identity.get('run_id')})
+    _overlay('event', f'libobs 录制开始 {fps}fps/{height}p')
+    return {'ok': True, 'backend': 'libobs', 'dir': str(out),
+            'pid': client.proc.pid if client.proc else None,
+            'client_pid': client_pid, 'session_id': prep.get('session_id'),
+            'window': prep.get('window'), 'audio_raw': str(audio_raw),
+            'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
+            'identity': identity, 'segments': []}
+
+
+def _recording_stop_libobs() -> dict:
+    client = _RUNTIME.recorder.get('client')
+    out = _RUNTIME.recorder.get('dir')
+    if client is None:
+        return {'ok': False, 'error': 'obs_client_missing'}
+    try:
+        status = client.status()
+        stop = client.stop()
+        client.shutdown()
+        client.close()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            client.close(force=True)
+        except Exception:
+            pass
+        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'dir': str(out)}
+    _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None})
+    try:
+        _recording_state_path().unlink()
+    except OSError:
+        pass
+    _release_recording_lock()
+    result = {'ok': bool(stop.get('checks_ok')), 'backend': 'libobs',
+              'dir': str(out), 'checks_ok': stop.get('checks_ok'),
+              'files': stop.get('files') or [], 'selftest': stop.get('selftest'),
+              'manifest': stop.get('manifest'), 'status': status, 'native': stop,
+              'segments': stop.get('files') or [],
+              'audio_muxed': bool(stop.get('files')), 'recovered': False}
+    try:
+        _atomic_write_json(Path(out) / 'obs-result.json', result)
+    except OSError:
+        pass
+    return result
+
+
 @mcp.tool()
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
-                    rollover_seconds: float = 0.0) -> dict:
+                    rollover_seconds: float = 0.0,
+                    backend: str = 'legacy') -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -5960,7 +6062,15 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     fps: target frame rate (default 60).  height: canvas height, 768 (1366x768) or
     1080 (1920x1080).  crf: x264 quality; 10 is visually near-lossless, 0 = lossless.
     Frames are streamed straight into the encoder - no intermediate files to clean up.
+    backend='legacy' uses the Python overlay recorder; backend='libobs' uses the native
+    libobs IPC experiment (auto-heros3-recorder.exe / obs-media-selftest.exe).
     """
+    if backend not in ('legacy', 'libobs'):
+        return {'ok': False, 'error': 'invalid_backend', 'backend': backend}
+    if backend == 'libobs':
+        return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds))
+    if _RUNTIME.recorder.get('client') is not None:
+        return {'ok': False, 'error': 'recording_active', 'backend': 'libobs'}
     import subprocess
     # Singleton: the recorder writes frames into one encoder, so a second instance corrupts the
     # clip (seen in practice: two recorders -> 0-byte video).  The state file survives an MCP
@@ -6081,6 +6191,8 @@ def recording_stop() -> dict:
     state file exists, the recorder is stopped through its STOP file / process identity instead
     of failing, so a long recording is never orphaned.
     """
+    if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
+        return _recording_stop_libobs()
     proc = _RUNTIME.recorder.get('proc')
     record = _read_recording_state()
     recovered = proc is None

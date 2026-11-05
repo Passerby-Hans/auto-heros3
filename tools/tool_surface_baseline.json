@@ -659,6 +659,11 @@
       "default": 0.0,
       "title": "Rollover Seconds",
       "type": "number"
+     },
+     "backend": {
+      "default": "legacy",
+      "title": "Backend",
+      "type": "string"
      }
     },
     "type": "object",

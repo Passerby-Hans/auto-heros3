@@ -5960,8 +5960,15 @@ def _obs_recorder_exe() -> Path:
     return base / 'obs-media-selftest.exe'
 
 
+def _size_cap_mb(max_segment_gb: float) -> int:
+    """Conservative MiB threshold so keyframe-aligned mp4_output stays under the GB cap."""
+    if not max_segment_gb or max_segment_gb <= 0:
+        return 0
+    return max(1, int(float(max_segment_gb) * 1_000_000_000 / (1024 * 1024) * 0.98))
+
+
 def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
-                         max_time_sec: int) -> tuple[object, dict]:
+                         max_time_sec: int, max_size_mb: int = 0) -> tuple[object, dict]:
     """Create/connect/prepare/start one native recorder process for a run."""
     from auto_heros3.recording.obs_backend import ObsRecorder
     client = ObsRecorder(_obs_recorder_exe(), obs_dir=Path(r'C:\Program Files\obs-studio'),
@@ -5969,7 +5976,8 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
     try:
         client.connect()
         prep = client.prepare(Path(out), window_pid=int(client_pid), audio_raw=Path(audio_raw),
-                              max_time_sec=int(max_time_sec), duration_ms=0)
+                              max_time_sec=int(max_time_sec), max_size_mb=int(max_size_mb),
+                              duration_ms=0)
         if not prep.get('ok'):
             raise RuntimeError(f"prepare failed: {prep.get('error')}")
         start = client.start_recording()
@@ -6055,7 +6063,7 @@ def _libobs_restart_after_death(rec: dict, returncode) -> None:
                 metadata={'restart_of': old_run_id, 'restart_count': n})
             client, prep = _libobs_start_client(
                 new_out, client_pid=int(cfg['client_pid']), audio_raw=Path(cfg['audio_raw']),
-                max_time_sec=int(cfg['max_time_sec']))
+                max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0))
             m.transition_run('recording')
         except Exception as exc:  # noqa: BLE001
             _libobs_mark_run_failed(new_out, f'restart_failed: {type(exc).__name__}: {exc}')
@@ -6096,7 +6104,7 @@ def _libobs_restart_after_death(rec: dict, returncode) -> None:
 
 
 def _recording_start_libobs(fps: int, height: int, crf: int,
-                            rollover_seconds: float) -> dict:
+                            rollover_seconds: float, max_segment_gb: float = 1.5) -> dict:
     """Start the native libobs IPC recorder (experimental S3b path)."""
     exe = _obs_recorder_exe()
     if not exe.exists():
@@ -6128,7 +6136,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     try:
         client, prep = _libobs_start_client(
             out, client_pid=int(client_pid), audio_raw=audio_raw,
-            max_time_sec=int(rollover_seconds) if rollover_seconds else 900)
+            max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
+            max_size_mb=_size_cap_mb(max_segment_gb))
         run_manifest.transition_run('recording')
     except Exception as exc:  # noqa: BLE001
         try:
@@ -6147,7 +6156,9 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     config = {'fps': int(fps), 'height': int(height), 'crf': int(crf),
               'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
               'client_pid': int(client_pid), 'audio_raw': str(audio_raw),
-              'max_time_sec': int(rollover_seconds) if rollover_seconds else 900}
+              'max_time_sec': int(rollover_seconds) if rollover_seconds else 900,
+              'max_size_mb': _size_cap_mb(max_segment_gb),
+              'max_segment_gb': float(max_segment_gb)}
     rec = _RUNTIME.recorder
     rec.clear()
     rec.update({'proc': client.proc, 'dir': out, 'started': time.time(),
@@ -6176,6 +6187,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
             'client_pid': client_pid, 'session_id': prep.get('session_id'),
             'window': prep.get('window'), 'audio_raw': str(audio_raw),
             'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
+            'max_segment_gb': float(max_segment_gb),
+            'max_size_mb': _size_cap_mb(max_segment_gb),
             'recording_run_id': recording_run_id,
             'manifest': str(manifest_dir / 'manifest.json'),
             'identity': identity, 'segments': [], 'restart_count': 0}
@@ -6372,14 +6385,21 @@ def _recording_stop_libobs() -> dict:
                  'recording_run_id': manifest_summary.get('recording_run_id'),
                  'checks_ok': stop.get('checks_ok'), 'files': current_files})
     partial_runs = [r for r in runs if r.get('manifest_state') in ('failed', 'partial')]
-    result = {'ok': bool(stop.get('checks_ok')), 'backend': 'libobs',
-              'dir': str(out), 'checks_ok': stop.get('checks_ok'),
+    cap_gb = float((rec.get('config') or {}).get('max_segment_gb') or 0)
+    cap_bytes = int(cap_gb * 1_000_000_000) if cap_gb > 0 else 0
+    oversized = [f for f in all_files if cap_bytes and int(f.get('bytes') or 0) > cap_bytes]
+    checks_ok = bool(stop.get('checks_ok')) and not oversized
+    result = {'ok': checks_ok, 'backend': 'libobs',
+              'dir': str(out), 'checks_ok': checks_ok,
+              'native_checks_ok': stop.get('checks_ok'),
               'files': all_files, 'current_files': current_files,
               'selftest': stop.get('selftest'),
               'manifest': stop.get('manifest'), 'status': status, 'native': stop,
               'segments': all_files, 'runs': runs, 'partial_runs': partial_runs,
               'audio_muxed': bool(all_files), 'recovered': False,
               'restart_count': int(rec.get('restart_count') or 0),
+              'max_segment_gb': cap_gb, 'max_size_mb': (rec.get('config') or {}).get('max_size_mb'),
+              'size_cap_bytes': cap_bytes, 'size_cap_exceeded': oversized,
               'recording_run_id': manifest_summary.get('recording_run_id'),
               'python_manifest': str(manifest_path) if manifest_path.exists() else None,
               'manifest_state': manifest_summary.get('state'),
@@ -6402,7 +6422,8 @@ def _recording_stop_libobs() -> dict:
 @mcp.tool()
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
-                    backend: str = 'legacy') -> dict:
+                    backend: str = 'legacy',
+                    max_segment_gb: float = 1.5) -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -6417,7 +6438,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     if backend not in ('legacy', 'libobs'):
         return {'ok': False, 'error': 'invalid_backend', 'backend': backend}
     if backend == 'libobs':
-        return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds))
+        return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds),
+                                           float(max_segment_gb))
     if _RUNTIME.recorder.get('client') is not None:
         return {'ok': False, 'error': 'recording_active', 'backend': 'libobs'}
     import subprocess

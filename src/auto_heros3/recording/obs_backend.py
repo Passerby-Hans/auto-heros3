@@ -192,8 +192,10 @@ class ObsRecorder:
     def prepare(self, out_dir: Path, *, window_pid: int | None = None,
                 window_title: str | None = None, window_class: str | None = None,
                 window_exe: str | None = None, audio_raw: Path | None = None,
-                max_time_sec: int = 900, duration_ms: int = 0) -> dict:
+                max_time_sec: int = 900, max_size_mb: int = 0,
+                duration_ms: int = 0) -> dict:
         args: dict[str, Any] = {'out_dir': str(out_dir), 'max_time_sec': int(max_time_sec),
+                                'max_size_mb': int(max_size_mb),
                                 'duration_ms': int(duration_ms)}
         if window_pid:
             args['window_pid'] = int(window_pid)

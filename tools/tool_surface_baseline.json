@@ -664,6 +664,11 @@
       "default": "legacy",
       "title": "Backend",
       "type": "string"
+     },
+     "max_segment_gb": {
+      "default": 1.5,
+      "title": "Max Segment Gb",
+      "type": "number"
      }
     },
     "type": "object",

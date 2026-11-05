@@ -239,6 +239,7 @@ struct Options {
     std::string out_dir;
     int duration_ms = 17000;
     int max_time_sec = 5;
+    int max_size_mb = 0;   // 0 disables size-triggered splitting
     std::string json_out;
     std::string log_file;             // --log: self-redirect stdout (used by WMI launch)
     RunMode mode = RunMode::InMemory;
@@ -1079,13 +1080,14 @@ bool CreateEncodersAndOutput(State& s, const std::string& first_file_path)
     obs_data_set_bool(osettings, "allow_spaces", false);
     obs_data_set_bool(osettings, "split_file", true);
     obs_data_set_int(osettings, "max_time_sec", s.opt.max_time_sec);
-    obs_data_set_int(osettings, "max_size_mb", 0);
+    obs_data_set_int(osettings, "max_size_mb", s.opt.max_size_mb);
     obs_data_set_bool(osettings, "allow_overwrite", true);
     obs_data_set_string(osettings, "muxer_settings", "");
     s.output_settings = osettings;
     s.output = obs_output_create("mp4_output", (prefix + " Split MP4").c_str(), s.output_settings, nullptr);
     AddStep(s, "create_mp4_output", s.output != nullptr,
-            "mp4_output split_file=true max_time_sec=" + std::to_string(s.opt.max_time_sec));
+            "mp4_output split_file=true max_time_sec=" + std::to_string(s.opt.max_time_sec) +
+                " max_size_mb=" + std::to_string(s.opt.max_size_mb));
     if (!s.output) {
         s.failure_exit_code = 4;
         return false;
@@ -1565,7 +1567,7 @@ bool StopOutput(State& s)
     }
 
     s.files = ListMp4Files(s.opt.out_dir);
-    AddStep(s, "split_files_ge_3", s.files.size() >= 3,
+    AddStep(s, "split_files_ge_3", s.files.size() >= (s.opt.max_size_mb > 0 ? 1 : 3),
             std::to_string(s.files.size()) + " mp4 file(s) in " + s.opt.out_dir);
     return true;
 }
@@ -1751,6 +1753,8 @@ void WriteReport(State& s, int exit_code)
     w.value_bool(true);
     w.key("max_time_sec");
     w.value_int(s.opt.max_time_sec);
+    w.key("max_size_mb");
+    w.value_int(s.opt.max_size_mb);
     w.key("record_duration_ms");
     w.value_int(s.opt.duration_ms);
     if (s.opt.mode == RunMode::WindowWgc) {
@@ -2388,6 +2392,8 @@ void WriteManifest(State& s, ServeSession& sess)
     w.value_int(s.opt.duration_ms);
     w.key("max_time_sec");
     w.value_int(s.opt.max_time_sec);
+    w.key("max_size_mb");
+    w.value_int(s.opt.max_size_mb);
     w.key("window_pid");
     w.value_int(s.opt.window_pid);
     w.key("window_title");
@@ -2560,6 +2566,8 @@ std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
         w.value_bool(s.opt.audio_start_zero);
         w.key("max_time_sec");
         w.value_int(s.opt.max_time_sec);
+        w.key("max_size_mb");
+        w.value_int(s.opt.max_size_mb);
         w.key("duration_ms");
         w.value_int(s.opt.duration_ms);
         w.end_object();
@@ -2658,6 +2666,12 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
         return ReplyError(sess, req, "invalid_args", err);
     if (found && (max_time < 1 || max_time > 3600))
         return ReplyError(sess, req, "invalid_args", "\"max_time_sec\" must be 1..3600");
+    long long max_size_mb = 0;
+    found = false;
+    if (!GetIntArg(req, "max_size_mb", &max_size_mb, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (found && (max_size_mb < 0 || max_size_mb > 4096))
+        return ReplyError(sess, req, "invalid_args", "\"max_size_mb\" must be 0..4096");
     long long duration_ms = 0;
     found = false;
     if (!GetIntArg(req, "duration_ms", &duration_ms, &found, err))
@@ -2708,6 +2722,7 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     s.opt.window_exe = exe;
     s.opt.window_pid = static_cast<int>(pid);
     s.opt.max_time_sec = static_cast<int>(max_time);
+    s.opt.max_size_mb = static_cast<int>(max_size_mb);
     s.opt.duration_ms = static_cast<int>(duration_ms);
     s.opt.json_out.clear();
     s.opt.mode = RunMode::WindowWgc;
@@ -2748,6 +2763,8 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
         w.end_object();
         w.key("max_time_sec");
         w.value_int(s.opt.max_time_sec);
+        w.key("max_size_mb");
+        w.value_int(s.opt.max_size_mb);
         w.key("duration_ms");
         w.value_int(s.opt.duration_ms);
         w.key("auto_stop");
@@ -2835,6 +2852,8 @@ std::string ServeStart(ServeSession& sess, State& s, const IpcRequest& req)
         w.end_object();
         w.key("max_time_sec");
         w.value_int(s.opt.max_time_sec);
+        w.key("max_size_mb");
+        w.value_int(s.opt.max_size_mb);
         w.key("duration_ms");
         w.value_int(s.opt.duration_ms);
         w.key("auto_stop");
@@ -3226,7 +3245,7 @@ void PrintUsage()
                 "  --audio-raw PATH      also add native raw-file audio source (s16le/44100/2)\n"
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
-                "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n"
+                "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n  --max-size-mb N      size split threshold in MiB (0 disables; IPC allows 1..4096)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
                 "  --serve              S3a: run the named-pipe IPC server (libobs stays initialized)\n"
                 "  --pipe NAME          S3a: pipe name (default auto-heros3-media-<pid>)\n"
@@ -3282,6 +3301,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
         } else if (a == "--max-time-sec") {
             opt.max_time_sec = std::atoi(next("--max-time-sec").c_str());
             opt.max_time_explicit = true;
+        } else if (a == "--max-size-mb") {
+            opt.max_size_mb = std::atoi(next("--max-size-mb").c_str());
         } else if (a == "--json-out") {
             opt.json_out = next("--json-out");
         } else if (a == "--log") {
@@ -3358,6 +3379,11 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
     }
     if (opt.max_time_sec < 1 || opt.max_time_sec > 60) {
         std::fprintf(stderr, "--max-time-sec out of range\n");
+        exit_code = 2;
+        return false;
+    }
+    if (opt.max_size_mb < 0 || opt.max_size_mb > 4096) {
+        std::fprintf(stderr, "--max-size-mb out of range (0..4096)\n");
         exit_code = 2;
         return false;
     }

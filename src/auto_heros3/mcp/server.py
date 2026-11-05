@@ -6131,6 +6131,25 @@ def recording_stop() -> dict:
         meta = json.loads((out / 'meta.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         pass
+    partial_manifest = None
+    if not meta:
+        try:
+            partial_manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            partial_manifest = None
+    if partial_manifest is not None:
+        # A crashed recorder may leave a sealed-but-unfinalized segment set.  List it as partial;
+        # never invent a successful video/meta or reuse it as a fresh recording.
+        _RUNTIME.recorder.update({'proc': None, 'dir': None})
+        try:
+            _recording_state_path().unlink()
+        except OSError:
+            pass
+        _release_recording_lock()
+        return {'ok': False, 'partial': True, 'error': 'recorder_meta_missing',
+                'dir': str(out), 'manifest': str(out / 'manifest.json'),
+                'segments': partial_manifest.get('segments') or [],
+                'manifest_status': partial_manifest.get('status')}
     started_at = record.get('started') or _RUNTIME.recorder.get('started')
     _RUNTIME.recorder.update({'proc': None, 'dir': None})
     try:
@@ -6154,6 +6173,8 @@ def recording_stop() -> dict:
             'rollover_seconds': meta.get('rollover_seconds', 0),
             'segments': meta.get('segments') or [],
             'segment_list': meta.get('segment_list'),
+            'manifest': meta.get('manifest'),
+            'size_limit_exceeded': bool(meta.get('size_limit_exceeded')),
             'dir': str(out), 'elapsed': meta.get('elapsed'), 'recovered': recovered,
             'identity': record.get('identity') or {}, 'run_id': record.get('run_id'),
             'branch_id': record.get('branch_id'), 'epoch': record.get('epoch'),

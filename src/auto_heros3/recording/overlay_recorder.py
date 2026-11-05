@@ -441,6 +441,11 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+def _append_jsonl(path: Path, data: dict) -> None:
+    with path.open('a', encoding='utf-8') as f:
+        f.write(json.dumps(data, ensure_ascii=False) + '\n')
+
+
 def parse_segment_list(path: Path, base: Path) -> list[tuple[float, float, Path]]:
     """Parse ffmpeg segment-list CSV: start,end,filename."""
     out: list[tuple[float, float, Path]] = []
@@ -719,6 +724,8 @@ def main() -> int:
     ap.add_argument('--rollover-seconds', type=float, default=0.0,
                     help='if >0, write time-based video segments (post-muxed with audio); '
                          '0 keeps one video.mp4')
+    ap.add_argument('--rollover-max-bytes', type=int, default=1_500_000_000,
+                    help='maximum published segment size in decimal bytes; 0 disables the check')
     ap.add_argument('--keep-frames', action='store_true',
                     help='legacy: keep JPEG frames (off by default; streaming only)')
     ap.add_argument('--stop-file', default=None)
@@ -756,6 +763,13 @@ def main() -> int:
     segment_dir = out / 'segments'
     segment_list_file = out / 'segments.csv'
     segment_files: list[Path] = []
+    manifest_file = out / 'manifest.json'
+    journal_file = out / 'journal.jsonl'
+    manifest: dict = {'schema_version': 1, 'kind': 'rollover',
+                      'status': 'recording',
+                      'rollover_seconds': args.rollover_seconds if rollover else 0,
+                      'max_segment_bytes': args.rollover_max_bytes,
+                      'segments': [], 'started': time.time()}
     if rollover:
         segment_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -776,6 +790,10 @@ def main() -> int:
                 '-segment_list', str(segment_list_file), '-segment_list_type', 'csv',
                 str(segment_dir / 'part-%05d.mp4')]
         video = segment_dir / 'part-00000.mp4'
+        _atomic_write_json(manifest_file, manifest)
+        _append_jsonl(journal_file, {'event': 'recording_started',
+                                     'rollover_seconds': args.rollover_seconds,
+                                     'max_segment_bytes': args.rollover_max_bytes})
     else:
         cmd += ['-movflags', '+faststart', str(video)]
     encoder_log_path = out / 'encoder.log'
@@ -977,6 +995,7 @@ def main() -> int:
         # time segment gets its own raw-PCM slice; keep video-only segments if muxing fails.
         audio_muxed = False
         segments_meta: list[dict] = []
+        size_limit_exceeded = False
         if rollover:
             infos = parse_segment_list(segment_list_file, segment_dir)
             for idx, (seg_start, seg_end, seg_path) in enumerate(infos):
@@ -1012,10 +1031,22 @@ def main() -> int:
                     'duration_s': round(seg_end - seg_start, 3),
                     'video': str(seg_path), 'audio_muxed': seg_audio_ok,
                     'audio_error': seg_audio_error,
-                    'bytes': seg_path.stat().st_size if seg_path.exists() else 0})
+                    'bytes': seg_path.stat().st_size if seg_path.exists() else 0,
+                    'size_exceeded': bool(seg_path.exists() and args.rollover_max_bytes > 0
+                                          and seg_path.stat().st_size > args.rollover_max_bytes)})
+                manifest['segments'] = segments_meta
+                _atomic_write_json(manifest_file, manifest)
+                _append_jsonl(journal_file, {'event': 'segment_sealed', 'index': idx,
+                                             'start_s': round(seg_start, 3),
+                                             'end_s': round(seg_end, 3),
+                                             'bytes': segments_meta[-1]['bytes'],
+                                             'audio_muxed': seg_audio_ok})
             video = infos[0][2] if infos else video
             video_ok = bool(infos) and encoder_rc == 0 and all(
                 encode_done(Path(s['video'])) for s in segments_meta)
+            size_limit_exceeded = any(s.get('size_exceeded') for s in segments_meta)
+            if size_limit_exceeded:
+                video_ok = False
             audio_muxed = bool(segments_meta) and all(s['audio_muxed'] for s in segments_meta)
             if not audio_muxed and args.audio != 'off':
                 audio_error = next((s['audio_error'] for s in segments_meta
@@ -1054,6 +1085,14 @@ def main() -> int:
             stop_file.unlink()
         except OSError:
             pass
+        if rollover:
+            manifest['status'] = 'complete' if video_ok else 'partial'
+            manifest['finished'] = time.time()
+            manifest['segments'] = segments_meta
+            _atomic_write_json(manifest_file, manifest)
+            _append_jsonl(journal_file, {'event': 'recording_finished',
+                                         'status': manifest['status'],
+                                         'segments': len(segments_meta)})
         if not rollover:
             video_ok = encode_done(video) and encoder_rc == 0
         meta = {'ok': video_ok, 'encoder_returncode': encoder_rc,
@@ -1061,6 +1100,8 @@ def main() -> int:
                 'rollover_seconds': args.rollover_seconds if rollover else 0,
                 'segments': segments_meta,
                 'segment_list': str(segment_list_file) if rollover else None,
+                'manifest': str(manifest_file) if rollover else None,
+                'size_limit_exceeded': bool(size_limit_exceeded),
                 'frames': frames, 'fps_target': args.fps,
                 'fps_actual': round(frames / elapsed, 2) if elapsed else 0,
                 'height': height, 'canvas': f'{total_w}x{height}', 'crf': args.crf,

@@ -1,28 +1,37 @@
-// S1b media self-test host for auto-heros3.
+// S1b/S1c media self-test host for auto-heros3.
 //
 // What this executable does (and only this):
 //   1. links against libobs 32.1.0 through a generated import library
 //      (obs.lib built from the installed obs.dll) and the OBS 32.1.0 source
 //      headers (vendor/obs-studio/libobs + generated obsconfig.h);
-//   2. obs_startup() + explicit selective module load (obs-ffmpeg.dll,
-//      obs-x264.dll, obs-outputs.dll only; never obs_load_all_modules, no
-//      Qt/UI/frontend plugin);
+//   2. obs_startup() + explicit selective module load (never
+//      obs_load_all_modules, no Qt/UI/frontend plugin):
+//        - always: obs-ffmpeg.dll, obs-x264.dll, obs-outputs.dll
+//        - window mode only: win-capture.dll, loaded *after* obs_reset_video()
+//          so the plugin detects the D3D11 graphics context and enables WGC
+//          (plugins/win-capture/plugin-main.c obs_module_load:
+//          graphics_uses_d3d11 + win_version_compare(win1903) -> wgc_supported);
 //   3. obs_reset_audio(44100 Hz stereo) + obs_reset_video(1920x1080@60, I420,
 //      D3D11 graphics module from the installed OBS bin directory);
-//   4. registers and creates one in-memory test source
-//      ("a3_test_av_source", asynchronous video + PCM audio, see
-//      gen_av_source.cpp), puts it in a scene and assigns the scene to main
-//      canvas channel 0 (obs_set_output_source);
+//   4. creates one source, puts it in a scene and assigns the scene to main
+//      canvas channel 0 (obs_set_output_source):
+//        - default mode "in-memory": synthetic async I420 video + 440 Hz PCM
+//          (S1b; src/media/gen_av_source.cpp);
+//        - mode "window": real OBS "window_capture" source forced to method=2
+//          (WGC), client_area=true, capture_audio=false, targeting a window
+//          found with libobs' ms_find_window()/ms_get_window_*() helpers
+//          (S1c). No audio capture and no audio playback.
 //   5. creates H.264 (obs_x264) + AAC (ffmpeg_aac) encoders and an
-//      "mp4_output" (Hybrid MP4) output with split_file=true/max_time_sec=5,
-//      records for the requested duration (default 17 s) and stops cleanly;
+//      "mp4_output" (Hybrid MP4) output with split_file=true and the requested
+//      max_time_sec, records for the requested duration and stops cleanly;
 //   6. writes a machine-readable report (selftest.json) next to the produced
-//      MP4s: loaded modules, output settings actually applied, output
-//      signals/events, frame/byte counters, produced files, and the process
-//      module list (used to show no WASAPI/MMDevAPI audio endpoint was opened).
+//      MP4s: loaded modules, applied source/encoder/output settings, output and
+//      source signals/events, frame/byte counters, produced files, the process
+//      module list (no WASAPI/MMDevAPI endpoint) and, in window mode, the
+//      actual capture method reported by the win-capture plugin log.
 //
-// There is no screen capture, no audio capture, no audio monitoring/playback,
-// no physical audio output and no OBS UI/WebSocket anywhere in this path.
+// There is no audio monitoring/playback, no physical audio output and no OBS
+// UI/WebSocket anywhere in this path.
 #include <windows.h>
 
 #include <tlhelp32.h>
@@ -33,11 +42,16 @@
 #include <obs-source.h>
 
 #include <util/platform.h>
+#include <util/windows/window-helpers.h>
+
+#include <util/base.h>
+#include <util/dstr.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,8 +144,93 @@ std::string LowerCopy(std::string s)
 }
 
 // ---------------------------------------------------------------------------
+// libobs log capture (for actual capture-method evidence)
+//
+// The win-capture plugin logs "[window-capture: 'name'] update settings:
+// method selected: ... method chosen: ..." (plugins/win-capture/window-capture.c
+// log_settings()).  We install a log handler that both forwards to the previous
+// (default stdout) handler and keeps a copy in memory, so the host can record
+// the *actual* method chosen by the plugin ("WGC" vs "BitBlt") in selftest.json
+// instead of only grepping stdout externally.  base_set_log_handler() /
+// base_get_log_handler() are exported by obs.dll (libobs/util/base.h).
+// ---------------------------------------------------------------------------
+
+std::mutex g_log_mutex;
+std::vector<std::string> g_log_lines;
+log_handler_t g_prev_log_handler = nullptr;
+void* g_prev_log_handler_param = nullptr;
+
+void CaptureLogHandler(int lvl, const char* msg, va_list args, void* param)
+{
+    {
+        va_list copy;
+        va_copy(copy, args);
+        char buf[8192];
+        const int n = std::vsnprintf(buf, sizeof(buf), msg, copy);
+        va_end(copy);
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        if (g_log_lines.size() < 200000) {
+            g_log_lines.emplace_back(n > 0 ? std::string(buf, static_cast<size_t>(std::min<int>(n, static_cast<int>(sizeof(buf)) - 1))) : std::string());
+        }
+    }
+    if (g_prev_log_handler) {
+        g_prev_log_handler(lvl, msg, args, g_prev_log_handler_param);
+    }
+}
+
+void InstallLogCapture()
+{
+    base_get_log_handler(&g_prev_log_handler, &g_prev_log_handler_param);
+    base_set_log_handler(CaptureLogHandler, nullptr);
+}
+
+void UninstallLogCapture()
+{
+    base_set_log_handler(g_prev_log_handler, g_prev_log_handler_param);
+}
+
+std::vector<std::string> LogSnapshot()
+{
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return g_log_lines;
+}
+
+std::string FindLogLineValue(const std::vector<std::string>& lines, const std::string& needle,
+                             const std::string& value_prefix)
+{
+    for (const auto& line : lines) {
+        const size_t pos = line.find(needle);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        const size_t vpos = line.find(value_prefix, pos);
+        if (vpos == std::string::npos) {
+            continue;
+        }
+        std::string value = line.substr(vpos + value_prefix.size());
+        const size_t end = value.find_first_of("\r\n");
+        if (end != std::string::npos) {
+            value.resize(end);
+        }
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+            value.pop_back();
+        }
+        return value;
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // run state
 // ---------------------------------------------------------------------------
+
+enum class RunMode {
+    InMemory, // S1b: synthetic async AV source
+    WindowWgc // S1c: real OBS window_capture source, forced WGC method
+};
 
 struct Options {
     std::string obs_dir = "C:\\Program Files\\obs-studio";
@@ -139,6 +238,15 @@ struct Options {
     int duration_ms = 17000;
     int max_time_sec = 5;
     std::string json_out;
+    RunMode mode = RunMode::InMemory;
+    bool duration_explicit = false;
+    bool max_time_explicit = false;
+
+    // window mode target selection (S1c)
+    std::string window_title = "VCMI WGC Synthetic";
+    std::string window_class;
+    std::string window_exe;
+    int window_pid = 0;
 };
 
 struct Step {
@@ -190,6 +298,8 @@ struct State {
     obs_output_t* output = nullptr;
     obs_data_t* output_settings = nullptr;
     signal_handler_t* output_signals = nullptr;
+    signal_handler_t* source_signals = nullptr; // window_capture hooked/unhooked
+    obs_sceneitem_t* scene_item = nullptr;      // owned by the scene
 
     uint64_t t_start_ns = 0;
     uint64_t t_output_active_ns = 0;
@@ -217,7 +327,38 @@ struct State {
     std::string monitoring_device_name;
     std::string monitoring_device_id;
     int source_monitoring_type = -1;
+
+    // S1c window-capture evidence
+    bool win_capture_module_loaded = false;
+    bool window_found = false;
+    uintptr_t window_hwnd = 0;
+    int window_pid_found = 0;
+    std::string window_title_found;
+    std::string window_class_found;
+    std::string window_exe_found;
+    std::string window_lookup; // how the target was resolved
+    std::string applied_source_settings_json;
+    std::string capture_method_selected;
+    std::string capture_method_chosen;
+    bool capture_signal_hooked = false;
+    bool capture_proc_hooked = false;
+    std::string capture_state_title;
+    std::string capture_state_class;
+    std::string capture_state_exe;
+    uint32_t capture_width = 0;
+    uint32_t capture_height = 0;
+    std::vector<std::string> capture_log_lines;
+
+    // exit code to use when a specific step fails (0 => stage default)
+    int failure_exit_code = 0;
 };
+
+// defined in the evidence/helpers section below
+void AddStep(State& s, const std::string& name, bool ok, const std::string& detail = "");
+
+std::atomic<bool> g_window_hooked {false};
+std::mutex g_hook_mutex;
+std::string g_hook_detail;
 
 std::mutex g_events_mutex;
 std::vector<Event> g_events;
@@ -269,6 +410,208 @@ void OnOutputFileChanged(void*, calldata_t* cd)
 {
     const char* next = calldata_string(cd, "next_file");
     RecordEvent("output_file_changed", next ? next : "<null>");
+}
+
+// Source signal callbacks for the win-capture "window_capture" source
+// (plugins/win-capture/window-capture.c wc_create() declares
+// "void hooked(ptr source, string title, string class, string executable)" and
+// "void unhooked(ptr source)"; the signals fire when the capture object is
+// initialised successfully).
+void OnWindowHooked(void*, calldata_t* cd)
+{
+    const char* title = calldata_string(cd, "title");
+    const char* cls = calldata_string(cd, "class");
+    const char* exe = calldata_string(cd, "executable");
+    std::string detail = std::string("title='") + (title ? title : "") + "' class='" +
+                         (cls ? cls : "") + "' exe='" + (exe ? exe : "") + "'";
+    {
+        std::lock_guard<std::mutex> lock(g_hook_mutex);
+        g_hook_detail = detail;
+    }
+    g_window_hooked.store(true);
+    RecordEvent("window_capture_hooked", detail);
+}
+
+void OnWindowUnhooked(void*, calldata_t*)
+{
+    RecordEvent("window_capture_unhooked", "");
+}
+
+std::string WindowTitle(HWND hwnd)
+{
+    struct dstr str = {};
+    ms_get_window_title(&str, hwnd);
+    std::string out = str.array ? str.array : "";
+    dstr_free(&str);
+    return out;
+}
+
+std::string WindowClass(HWND hwnd)
+{
+    struct dstr str = {};
+    ms_get_window_class(&str, hwnd);
+    std::string out = str.array ? str.array : "";
+    dstr_free(&str);
+    return out;
+}
+
+std::string WindowExe(HWND hwnd)
+{
+    struct dstr str = {};
+    if (!ms_get_window_exe(&str, hwnd)) {
+        dstr_free(&str);
+        return {};
+    }
+    std::string out = str.array ? str.array : "";
+    dstr_free(&str);
+    return out;
+}
+
+// The OBS window source settings store the target as an escaped
+// "title:class:exe" string (libobs/util/windows/window-helpers.c
+// ms_build_window_strings()/decode_str(): '#' -> "#22", ':' -> "#3A"; emptied
+// fields are kept as empty strings).  Passing the class is mandatory for the
+// WGC path: window-capture.c wc_tick() calls ms_find_window_top_level() for
+// METHOD_WGC, and that helper returns NULL when class is NULL.
+std::string EncodeWindowField(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char c : value) {
+        if (c == '#') {
+            out += "#22";
+        } else if (c == ':') {
+            out += "#3A";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+std::string BuildObsWindowString(const std::string& title, const std::string& cls, const std::string& exe)
+{
+    return EncodeWindowField(title) + ":" + EncodeWindowField(cls) + ":" + EncodeWindowField(exe);
+}
+
+struct PidWindowFind {
+    DWORD pid = 0;
+    std::string want_title;
+    std::string want_class;
+    HWND result = nullptr;
+};
+
+BOOL CALLBACK PidWindowFindProc(HWND hwnd, LPARAM param)
+{
+    auto* find = reinterpret_cast<PidWindowFind*>(param);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != find->pid) {
+        return TRUE;
+    }
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+        return TRUE;
+    }
+    if (!find->want_title.empty() && astrcmpi(WindowTitle(hwnd).c_str(), find->want_title.c_str()) != 0) {
+        return TRUE;
+    }
+    if (!find->want_class.empty() && astrcmpi(WindowClass(hwnd).c_str(), find->want_class.c_str()) != 0) {
+        return TRUE;
+    }
+    find->result = hwnd;
+    return FALSE;
+}
+
+// Resolves the capture target through libobs' window helpers, records the
+// attributes read back through ms_get_window_*() and (for window_capture
+// matching) builds the escaped window string.  Returns false with an explicit
+// window_not_found step when no matching window exists.
+bool FindTargetWindow(State& s)
+{
+    HWND hwnd = nullptr;
+    std::string prio_name;
+
+    if (s.opt.window_pid > 0) {
+        PidWindowFind find;
+        find.pid = static_cast<DWORD>(s.opt.window_pid);
+        find.want_title = s.opt.window_title;
+        find.want_class = s.opt.window_class;
+        EnumWindows(PidWindowFindProc, reinterpret_cast<LPARAM>(&find));
+        hwnd = find.result;
+        s.window_lookup = "EnumWindows(pid=" + std::to_string(s.opt.window_pid) + ", title='" +
+                          s.opt.window_title + "', class='" + s.opt.window_class + "')";
+    } else {
+        // ms_find_window(mode, priority, class, title, exe): pick the match
+        // priority from the fields the caller supplied.
+        enum window_priority priority = WINDOW_PRIORITY_TITLE;
+        const char* cls = nullptr;
+        const char* title = nullptr;
+        const char* exe = nullptr;
+        if (!s.opt.window_title.empty()) {
+            title = s.opt.window_title.c_str();
+            priority = WINDOW_PRIORITY_TITLE;
+            prio_name = "title";
+        } else if (!s.opt.window_class.empty()) {
+            cls = s.opt.window_class.c_str();
+            priority = WINDOW_PRIORITY_CLASS;
+            prio_name = "class";
+        } else if (!s.opt.window_exe.empty()) {
+            exe = s.opt.window_exe.c_str();
+            priority = WINDOW_PRIORITY_EXE;
+            prio_name = "exe";
+        } else {
+            s.failure_exit_code = 7;
+            AddStep(s, "window_find", false,
+                    "no window selector supplied (need --window-title/--window-class/--window-exe/--window-pid)");
+            return false;
+        }
+        hwnd = ms_find_window(INCLUDE_MINIMIZED, priority, cls, title, exe);
+        s.window_lookup = std::string("ms_find_window(priority=") + prio_name + ", title='" +
+                          s.opt.window_title + "', class='" + s.opt.window_class + "', exe='" +
+                          s.opt.window_exe + "')";
+    }
+
+    if (!hwnd) {
+        s.failure_exit_code = 7;
+        AddStep(s, "window_find", false, "window_not_found: " + s.window_lookup);
+        std::printf("WINDOW_NOT_FOUND lookup=%s\n", s.window_lookup.c_str());
+        std::fflush(stdout);
+        return false;
+    }
+
+    s.window_found = true;
+    s.window_hwnd = reinterpret_cast<uintptr_t>(hwnd);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    s.window_pid_found = static_cast<int>(pid);
+    s.window_title_found = WindowTitle(hwnd);
+    s.window_class_found = WindowClass(hwnd);
+    s.window_exe_found = WindowExe(hwnd);
+
+    bool expected_ok = true;
+    std::string mismatch;
+    if (!s.opt.window_title.empty() && astrcmpi(s.window_title_found.c_str(), s.opt.window_title.c_str()) != 0) {
+        expected_ok = false;
+        mismatch += " title expected='" + s.opt.window_title + "' actual='" + s.window_title_found + "'";
+    }
+    if (!s.opt.window_class.empty() && astrcmpi(s.window_class_found.c_str(), s.opt.window_class.c_str()) != 0) {
+        expected_ok = false;
+        mismatch += " class expected='" + s.opt.window_class + "' actual='" + s.window_class_found + "'";
+    }
+    if (!s.opt.window_exe.empty() && astrcmpi(s.window_exe_found.c_str(), s.opt.window_exe.c_str()) != 0) {
+        expected_ok = false;
+        mismatch += " exe expected='" + s.opt.window_exe + "' actual='" + s.window_exe_found + "'";
+    }
+
+    AddStep(s, "window_find", expected_ok,
+            "hwnd=" + std::to_string(s.window_hwnd) + " pid=" + std::to_string(s.window_pid_found) +
+                " title='" + s.window_title_found + "' class='" + s.window_class_found + "' exe='" +
+                s.window_exe_found + "'" + mismatch);
+    if (!expected_ok) {
+        s.failure_exit_code = 7;
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +697,7 @@ std::string CurrentEncoderLastError(obs_encoder_t* encoder)
     return err ? err : "";
 }
 
-void AddStep(State& s, const std::string& name, bool ok, const std::string& detail = "")
+void AddStep(State& s, const std::string& name, bool ok, const std::string& detail)
 {
     s.steps.push_back(Step{name, ok, detail});
     std::printf("STEP %-32s %s%s%s\n", name.c_str(), ok ? "PASS" : "FAIL",
@@ -394,6 +737,24 @@ void Cleanup(State& s)
     if (s.obs_started && s.scene) {
         obs_set_output_source(0, nullptr);
         trace("detached_output_source");
+
+        // The main canvas also keeps a strong reference to scene sources
+        // (PROGRAM canvas has SCENE_REF, libobs/obs-canvas.c
+        // obs_canvas_insert_source); remove the scene from the canvas so it can
+        // actually be destroyed before obs_shutdown().  This matters for
+        // plugin-provided sources (win-capture window_capture): plugin modules
+        // are unloaded inside obs_shutdown() before sources are freed, so a
+        // window_capture source must be torn down while win-capture.dll code is
+        // still mapped.
+        obs_canvas_scene_remove(s.scene);
+        trace("scene_removed_from_canvas");
+    }
+
+    if (s.source_signals) {
+        signal_handler_disconnect(s.source_signals, "hooked", OnWindowHooked, nullptr);
+        signal_handler_disconnect(s.source_signals, "unhooked", OnWindowUnhooked, nullptr);
+        s.source_signals = nullptr;
+        trace("source_signals_disconnected");
     }
 
     if (s.output_signals) {
@@ -422,12 +783,12 @@ void Cleanup(State& s)
         trace("audio_encoder_released");
     }
 
-    // Release the host references to the scene and to the test source.  The
-    // scene source itself is also strongly referenced by the main canvas
-    // (SCENE_REF / PROGRAM canvas flag), so scene + item + source objects are
-    // finally destroyed inside obs_shutdown() when the canvas is released.
-    // That is the normal OBS lifecycle; the test source's worker thread was
-    // stopped above so nothing can push media into libobs during teardown.
+    // Release the host references to the source and the scene.  Because the
+    // scene was removed from the canvas above, this is the last reference and
+    // libobs defers the actual destroy to its destruction task thread; flush
+    // that queue while video/audio/graphics are still alive so plugin source
+    // destroy callbacks (window_capture queues its graphics destroy here) run
+    // before obs_shutdown() unloads the plugin modules.
     if (s.source) {
         obs_source_release(s.source);
         s.source = nullptr;
@@ -445,6 +806,25 @@ void Cleanup(State& s)
     }
 
     if (s.obs_started) {
+        // Cascade: scene destroy -> item release -> source destroy -> (for
+        // window_capture) a graphics task.  obs_wait_for_destroy_queue() flushes
+        // graphics+audio task queues and the destroy queue once; a few rounds
+        // are required for the cascade.  In-memory mode additionally verifies
+        // its own source destroy callback ran (AvSourceData counter cleared).
+        int flush_iters = 0;
+        const int max_flush = (s.opt.mode == RunMode::InMemory) ? 50 : 10;
+        while (flush_iters < max_flush) {
+            obs_wait_for_destroy_queue();
+            ++flush_iters;
+            if (s.opt.mode == RunMode::InMemory && !a3::GetAvSourceStats().created) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+        std::printf("CLEANUP destroy_flush_iters=%d\n", flush_iters);
+        std::fflush(stdout);
+        trace("destroy_queue_flushed");
+
         obs_shutdown();
         s.obs_started = false;
         trace("obs_shutdown_done");
@@ -452,55 +832,77 @@ void Cleanup(State& s)
     trace("end");
 }
 
-bool LoadSelectiveModules(State& s)
+ModuleResult LoadOneModule(State& s, const char* file)
 {
     const std::string bin_dir = JoinPath(s.opt.obs_dir, "obs-plugins\\64bit");
     const std::string data_root = JoinPath(s.opt.obs_dir, "data\\obs-plugins");
+
+    ModuleResult mr;
+    mr.file = file;
+    mr.path = JoinPath(bin_dir, file);
+    // Module data directory convention: <data>/obs-plugins/<module-name>
+    // (see libobs/obs-module.c make_data_directory()/make_data_dir()).
+    std::string stem = file;
+    const size_t dot = stem.rfind('.');
+    if (dot != std::string::npos) {
+        stem.resize(dot);
+    }
+    mr.data_path = JoinPath(data_root, stem);
+
+    if (!FileExists(mr.path)) {
+        mr.open_rc = -404;
+        std::printf("MODULE %-20s missing=%s\n", file, mr.path.c_str());
+        std::fflush(stdout);
+        s.modules.push_back(mr);
+        return mr;
+    }
+
+    obs_module_t* module = nullptr;
+    mr.open_rc = obs_open_module(&module, mr.path.c_str(), mr.data_path.c_str());
+    if (mr.open_rc == MODULE_SUCCESS && module) {
+        mr.init_ok = obs_init_module(module);
+        std::printf("MODULE %-20s open=ok init=%s\n", file, mr.init_ok ? "ok" : "FAILED");
+    } else {
+        std::printf("MODULE %-20s open=FAILED rc=%d\n", file, mr.open_rc);
+    }
+    std::fflush(stdout);
+    s.modules.push_back(mr);
+    return mr;
+}
+
+bool LoadBaseModules(State& s)
+{
     // Explicit whitelist only.  obs_load_all_modules() would also load the Qt
     // UI/frontend plugins and other unrelated modules; S0 already showed that
     // must be avoided for a headless host.
     const char* kFiles[] = {"obs-ffmpeg.dll", "obs-x264.dll", "obs-outputs.dll"};
-
-    for (const char* file : kFiles) {
-        ModuleResult mr;
-        mr.file = file;
-        mr.path = JoinPath(bin_dir, file);
-        // Module data directory convention: <data>/obs-plugins/<module-name>
-        // (see libobs/obs-module.c make_data_directory()/make_data_dir()).
-        std::string stem = file;
-        const size_t dot = stem.rfind('.');
-        if (dot != std::string::npos) {
-            stem.resize(dot);
-        }
-        mr.data_path = JoinPath(data_root, stem);
-
-        if (!FileExists(mr.path)) {
-            mr.open_rc = -404;
-            s.modules.push_back(mr);
-            continue;
-        }
-
-        obs_module_t* module = nullptr;
-        mr.open_rc = obs_open_module(&module, mr.path.c_str(), mr.data_path.c_str());
-        if (mr.open_rc == MODULE_SUCCESS && module) {
-            mr.init_ok = obs_init_module(module);
-            std::printf("MODULE %-20s open=ok init=%s\n", file, mr.init_ok ? "ok" : "FAILED");
-        } else {
-            std::printf("MODULE %-20s open=FAILED rc=%d\n", file, mr.open_rc);
-        }
-        std::fflush(stdout);
-        s.modules.push_back(mr);
-    }
-
     bool all_ok = true;
-    for (const auto& mr : s.modules) {
+    for (const char* file : kFiles) {
+        const ModuleResult mr = LoadOneModule(s, file);
         all_ok = all_ok && mr.init_ok;
     }
-    if (!all_ok) {
-        return false;
+    if (all_ok) {
+        obs_post_load_modules();
     }
-    obs_post_load_modules();
-    return true;
+    return all_ok;
+}
+
+// win-capture.dll must be loaded AFTER obs_reset_video(): its obs_module_load()
+// calls obs_enter_graphics()/gs_get_device_type() and only enables WGC when the
+// graphics subsystem is already D3D11 (plugins/win-capture/plugin-main.c:
+// graphics_uses_d3d11 + wgc_supported).  Loading it earlier permanently forces
+// the BitBlt fallback for this process.
+bool LoadWinCaptureModule(State& s)
+{
+    const ModuleResult mr = LoadOneModule(s, "win-capture.dll");
+    s.win_capture_module_loaded = mr.init_ok;
+    AddStep(s, "load_win_capture_module", mr.init_ok,
+            std::string("win-capture.dll open_rc=") + std::to_string(mr.open_rc) +
+                " (loaded after obs_reset_video so WGC is enabled)");
+    if (mr.init_ok) {
+        obs_post_load_modules();
+    }
+    return mr.init_ok;
 }
 
 bool InitObs(State& s)
@@ -550,8 +952,9 @@ bool InitObs(State& s)
     }
     obs_add_data_path(libobs_data_path.c_str());
 
-    if (!LoadSelectiveModules(s)) {
+    if (!LoadBaseModules(s)) {
         AddStep(s, "load_selective_modules", false, "at least one whitelisted module failed to initialize");
+        s.failure_exit_code = 3;
         return false;
     }
     AddStep(s, "load_selective_modules", true, "3/3 obs-ffmpeg, obs-x264, obs-outputs");
@@ -584,79 +987,54 @@ bool InitObs(State& s)
     AddStep(s, "obs_reset_video", s.video_reset_ok,
             "1920x1080@60 I420 " + std::string("graphics_module=") + s.graphics_module +
                 " rc=" + std::to_string(video_rc));
-    return s.video_reset_ok;
+    if (!s.video_reset_ok) {
+        s.failure_exit_code = 3;
+        return false;
+    }
+
+    if (s.opt.mode == RunMode::WindowWgc) {
+        if (!LoadWinCaptureModule(s)) {
+            s.failure_exit_code = 3;
+            return false;
+        }
+    }
+    return true;
 }
 
-bool CreatePipeline(State& s, const std::string& first_file_path)
+bool CreateEncodersAndOutput(State& s, const std::string& first_file_path)
 {
-    a3::RegisterAvTestSource();
-    AddStep(s, "register_test_source", true, "obs_register_source_s(a3_test_av_source)");
-
-    obs_data_t* source_settings = obs_data_create();
-    s.source = obs_source_create("a3_test_av_source", "S1b In-Memory Test AV", source_settings, nullptr);
-    obs_data_release(source_settings);
-    AddStep(s, "create_test_source", s.source != nullptr, "async video (I420 1920x1080@60) + PCM audio");
-    if (!s.source) {
-        return false;
-    }
-
-    s.source_monitoring_type = static_cast<int>(obs_source_get_monitoring_type(s.source));
-    const uint32_t source_flags = obs_source_get_output_flags(s.source);
-    AddStep(s, "source_flags", (source_flags & OBS_SOURCE_ASYNC_VIDEO) != 0 &&
-                                   (source_flags & OBS_SOURCE_AUDIO) != 0,
-            "output_flags=0x" + [](uint32_t v) {
-                char buf[16];
-                std::snprintf(buf, sizeof(buf), "%x", v);
-                return std::string(buf);
-            }(source_flags));
-
-    s.scene = obs_scene_create("S1b Scene");
-    AddStep(s, "create_scene", s.scene != nullptr, "obs_scene_create");
-    if (!s.scene) {
-        return false;
-    }
-
-    obs_sceneitem_t* item = obs_scene_add(s.scene, s.source);
-    AddStep(s, "scene_add_source", item != nullptr, "obs_scene_add");
-    if (!item) {
-        return false;
-    }
-
-    obs_set_output_source(0, obs_scene_get_source(s.scene));
-    // obs_get_output_source() returns a strong reference (libobs/obs-canvas.c
-    // obs_view_get_source -> obs_source_get_ref); release it again or the
-    // scene source can never be destroyed and the in-memory source stays alive
-    // until obs_shutdown(), which crashed at teardown.
-    obs_source_t* channel_source = obs_get_output_source(0);
-    AddStep(s, "set_output_source", channel_source == obs_scene_get_source(s.scene),
-            "obs_set_output_source(0, scene)");
-    if (channel_source) {
-        obs_source_release(channel_source);
-    }
+    const bool window_mode = (s.opt.mode == RunMode::WindowWgc);
+    const std::string prefix = window_mode ? "S1c" : "S1b";
 
     // ---- video encoder: x264 H.264 -----------------------------------------
     obs_data_t* vsettings = obs_data_create();
     obs_data_set_string(vsettings, "rate_control", "CBR");
     obs_data_set_int(vsettings, "bitrate", 8000);
-    obs_data_set_int(vsettings, "keyint_sec", 1); // 1 s GOP => split at 5 s boundaries
+    obs_data_set_int(vsettings, "keyint_sec", 1); // 1 s GOP => splits at keyframes
     obs_data_set_string(vsettings, "preset", "veryfast");
     obs_data_set_string(vsettings, "profile", "high");
     obs_data_set_string(vsettings, "x264opts", "scenecut=0");
-    s.video_encoder = obs_video_encoder_create("obs_x264", "S1b H264", vsettings, nullptr);
+    s.video_encoder = obs_video_encoder_create("obs_x264", (prefix + " H264").c_str(), vsettings, nullptr);
     obs_data_release(vsettings);
-    AddStep(s, "create_video_encoder", s.video_encoder != nullptr, "obs_x264 (CBR 8000 kbps, keyint=1 s)");
+    AddStep(s, "create_video_encoder", s.video_encoder != nullptr,
+            "obs_x264 (CBR 8000 kbps, keyint=1 s, veryfast, high)");
     if (!s.video_encoder) {
+        s.failure_exit_code = 4;
         return false;
     }
     obs_encoder_set_video(s.video_encoder, obs_get_video());
 
     // ---- audio encoder: FFmpeg AAC ----------------------------------------
+    // In window mode the window_capture source has capture_audio=false, so this
+    // track stays silent; it is kept so the produced MP4s always have the same
+    // A/V container shape as the product code path.
     obs_data_t* asettings = obs_data_create();
     obs_data_set_int(asettings, "bitrate", 160);
-    s.audio_encoder = obs_audio_encoder_create("ffmpeg_aac", "S1b AAC", asettings, 0, nullptr);
+    s.audio_encoder = obs_audio_encoder_create("ffmpeg_aac", (prefix + " AAC").c_str(), asettings, 0, nullptr);
     obs_data_release(asettings);
     AddStep(s, "create_audio_encoder", s.audio_encoder != nullptr, "ffmpeg_aac (160 kbps, mix 0)");
     if (!s.audio_encoder) {
+        s.failure_exit_code = 4;
         return false;
     }
     obs_encoder_set_audio(s.audio_encoder, obs_get_audio());
@@ -674,10 +1052,11 @@ bool CreatePipeline(State& s, const std::string& first_file_path)
     obs_data_set_bool(osettings, "allow_overwrite", true);
     obs_data_set_string(osettings, "muxer_settings", "");
     s.output_settings = osettings;
-    s.output = obs_output_create("mp4_output", "S1b Split MP4", s.output_settings, nullptr);
+    s.output = obs_output_create("mp4_output", (prefix + " Split MP4").c_str(), s.output_settings, nullptr);
     AddStep(s, "create_mp4_output", s.output != nullptr,
             "mp4_output split_file=true max_time_sec=" + std::to_string(s.opt.max_time_sec));
     if (!s.output) {
+        s.failure_exit_code = 4;
         return false;
     }
 
@@ -699,6 +1078,229 @@ bool CreatePipeline(State& s, const std::string& first_file_path)
             "start/stop/starting/stopping/deactivate/file_changed");
 
     return true;
+}
+
+bool CreateSceneForSource(State& s, const char* scene_name)
+{
+    s.scene = obs_scene_create(scene_name);
+    AddStep(s, "create_scene", s.scene != nullptr, std::string("obs_scene_create('") + scene_name + "')");
+    if (!s.scene) {
+        return false;
+    }
+
+    obs_sceneitem_t* item = obs_scene_add(s.scene, s.source);
+    AddStep(s, "scene_add_source", item != nullptr, "obs_scene_add");
+    if (!item) {
+        return false;
+    }
+    s.scene_item = item;
+
+    obs_set_output_source(0, obs_scene_get_source(s.scene));
+    // obs_get_output_source() returns a strong reference (libobs/obs-canvas.c
+    // obs_view_get_source -> obs_source_get_ref); release it again or the
+    // scene source can never be destroyed and the source stays alive until
+    // obs_shutdown(), which crashed at teardown in the pre-S1b-initial run.
+    obs_source_t* channel_source = obs_get_output_source(0);
+    AddStep(s, "set_output_source", channel_source == obs_scene_get_source(s.scene),
+            "obs_set_output_source(0, scene)");
+    if (channel_source) {
+        obs_source_release(channel_source);
+    }
+    return true;
+}
+
+bool CreatePipeline(State& s, const std::string& first_file_path)
+{
+    // S1b in-memory synthetic media source (no capture at all).
+    AddStep(s, "mode", true, "mode=in-memory (synthetic async I420 video + 440 Hz PCM)");
+    a3::RegisterAvTestSource();
+    AddStep(s, "register_test_source", true, "obs_register_source_s(a3_test_av_source)");
+
+    obs_data_t* source_settings = obs_data_create();
+    s.source = obs_source_create("a3_test_av_source", "S1b In-Memory Test AV", source_settings, nullptr);
+    obs_data_release(source_settings);
+    AddStep(s, "create_test_source", s.source != nullptr, "async video (I420 1920x1080@60) + PCM audio");
+    if (!s.source) {
+        s.failure_exit_code = 4;
+        return false;
+    }
+
+    s.source_monitoring_type = static_cast<int>(obs_source_get_monitoring_type(s.source));
+    const uint32_t source_flags = obs_source_get_output_flags(s.source);
+    AddStep(s, "source_flags", (source_flags & OBS_SOURCE_ASYNC_VIDEO) != 0 &&
+                                   (source_flags & OBS_SOURCE_AUDIO) != 0,
+            "output_flags=0x" + [](uint32_t v) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "%x", v);
+                return std::string(buf);
+            }(source_flags));
+
+    if (!CreateSceneForSource(s, "S1b Scene")) {
+        s.failure_exit_code = 4;
+        return false;
+    }
+    return CreateEncodersAndOutput(s, first_file_path);
+}
+
+// Polls the window_capture source until its capture object is initialised
+// (window-capture.c wc_tick(): first window lookup happens after
+// WC_CHECK_TIMER=1.0 s of ticks, then the WGC capture object is created and the
+// source signals "hooked"), then records the observed dimensions and the actual
+// capture method reported by the plugin log.
+bool WaitForWindowCapture(State& s)
+{
+    const uint64_t start_ns = os_gettime_ns();
+    const uint64_t deadline = start_ns + 12000000000ULL; // 12 s
+    uint32_t width = 0;
+    uint32_t height = 0;
+    while (os_gettime_ns() < deadline) {
+        width = obs_source_get_width(s.source);
+        height = obs_source_get_height(s.source);
+        // "hooked" fires when the capture object was created; the WGC frame
+        // size is only known once the first frame has been delivered, so wait
+        // for both the hook signal and a non-zero source size.
+        if (g_window_hooked.load() && width > 0 && height > 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const uint64_t waited_ms = (os_gettime_ns() - start_ns) / 1000000ULL;
+
+    s.capture_signal_hooked = g_window_hooked.load();
+    s.capture_width = obs_source_get_width(s.source);
+    s.capture_height = obs_source_get_height(s.source);
+
+    // proc handler exposed by window-capture.c:
+    //   "void get_hooked(out bool hooked, out string title, out string class,
+    //                   out string executable)"
+    proc_handler_t* ph = obs_source_get_proc_handler(s.source);
+    calldata_t* cd = calldata_create();
+    if (ph && proc_handler_call(ph, "get_hooked", cd)) {
+        s.capture_proc_hooked = calldata_bool(cd, "hooked");
+        const char* title = calldata_string(cd, "title");
+        const char* cls = calldata_string(cd, "class");
+        const char* exe = calldata_string(cd, "executable");
+        s.capture_state_title = title ? title : "";
+        s.capture_state_class = cls ? cls : "";
+        s.capture_state_exe = exe ? exe : "";
+    }
+    calldata_destroy(cd);
+
+    // Actual capture method comes from the win-capture plugin's own log
+    // (window-capture.c log_settings() prints "method selected:" and
+    // "method chosen:"; choose_method() falls back to BitBlt when WGC is not
+    // supported, so never assume WGC without checking this).
+    const std::vector<std::string> logs = LogSnapshot();
+    s.capture_method_selected = FindLogLineValue(logs, "method selected:", "method selected:");
+    s.capture_method_chosen = FindLogLineValue(logs, "method chosen:", "method chosen:");
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        for (const auto& line : g_log_lines) {
+            if (line.find("window-capture") != std::string::npos ||
+                line.find("method selected:") != std::string::npos ||
+                line.find("method chosen:") != std::string::npos ||
+                line.find("WGC") != std::string::npos ||
+                line.find("BitBlt") != std::string::npos ||
+                line.find("libobs-winrt") != std::string::npos ||
+                line.find("winrt_capture") != std::string::npos) {
+                if (s.capture_log_lines.size() < 300) {
+                    s.capture_log_lines.push_back(line);
+                }
+            }
+        }
+    }
+
+    const bool hooked = s.capture_signal_hooked || s.capture_proc_hooked ||
+                        (s.capture_width > 0 && s.capture_height > 0);
+    AddStep(s, "window_capture_hooked", hooked,
+            "signal_hooked=" + std::to_string(s.capture_signal_hooked ? 1 : 0) +
+                " proc_hooked=" + std::to_string(s.capture_proc_hooked ? 1 : 0) +
+                " waited_ms=" + std::to_string(waited_ms) + " title='" + s.capture_state_title + "'");
+    const bool wgc = (s.capture_method_chosen == "WGC");
+    AddStep(s, "capture_method_wgc", wgc,
+            "method selected='" + s.capture_method_selected + "' chosen='" + s.capture_method_chosen +
+                "' (from win-capture plugin log; BitBlt is a fallback, not WGC)");
+    const bool dimensions_ok = s.capture_width > 0 && s.capture_height > 0;
+    AddStep(s, "capture_dimensions", dimensions_ok,
+            std::to_string(s.capture_width) + "x" + std::to_string(s.capture_height));
+    return hooked && wgc && dimensions_ok;
+}
+
+bool CreateWindowPipeline(State& s, const std::string& first_file_path)
+{
+    AddStep(s, "mode", true, "mode=window (win-capture window_capture forced method=WGC)");
+    if (!FindTargetWindow(s)) {
+        return false;
+    }
+
+    // The window source stores its target as the escaped "title:class:exe"
+    // string from libobs/util/windows/window-helpers.c ms_build_window_strings().
+    // All three fields are filled from the actual HWND attributes read back with
+    // ms_get_window_title/class/exe so the plugin re-finds exactly this window.
+    const std::string window_string =
+        BuildObsWindowString(s.window_title_found, s.window_class_found, s.window_exe_found);
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "window", window_string.c_str());
+    obs_data_set_int(settings, "method", 2);          // METHOD_WGC
+    obs_data_set_int(settings, "priority", 1);        // WINDOW_PRIORITY_TITLE
+    obs_data_set_bool(settings, "client_area", true);
+    obs_data_set_bool(settings, "capture_audio", false);
+    obs_data_set_bool(settings, "cursor", false);
+    // Force SDR: our canvas/output is SDR Rec.709.  Without this, on an HDR
+    // monitor libobs-winrt requests R16G16B16A16_FLOAT frames and reports
+    // GS_CS_709_EXTENDED (winrt-capture.cpp get_pixel_format /
+    // winrt_capture_get_color_space), which is not what this SDR pipeline is
+    // meant to exercise; force_sdr makes WGC deliver BGRA SDR frames.
+    obs_data_set_bool(settings, "force_sdr", true);
+    obs_data_set_bool(settings, "compatibility", false);
+    s.source = obs_source_create("window_capture", "S1c WGC Window", settings, nullptr);
+    obs_data_release(settings);
+    AddStep(s, "create_window_capture_source", s.source != nullptr,
+            "window_capture method=2 (WGC) client_area=true capture_audio=false window='" + window_string + "'");
+    if (!s.source) {
+        s.failure_exit_code = 8;
+        return false;
+    }
+
+    // Read back the applied settings (libobs merges plugin defaults).
+    obs_data_t* applied = obs_source_get_settings(s.source);
+    const char* applied_json = obs_data_get_json(applied);
+    s.applied_source_settings_json = applied_json ? applied_json : "";
+    obs_data_release(applied);
+    s.source_monitoring_type = static_cast<int>(obs_source_get_monitoring_type(s.source));
+
+    // window_capture declares these signals in wc_create(); "hooked" fires when
+    // the capture object was initialised successfully (WGC: after
+    // winrt_capture_init_window()).
+    s.source_signals = obs_source_get_signal_handler(s.source);
+    signal_handler_connect(s.source_signals, "hooked", OnWindowHooked, nullptr);
+    signal_handler_connect(s.source_signals, "unhooked", OnWindowUnhooked, nullptr);
+    AddStep(s, "connect_window_capture_signals", true, "hooked / unhooked");
+
+    if (!CreateSceneForSource(s, "S1c Scene")) {
+        s.failure_exit_code = 8;
+        return false;
+    }
+    if (!WaitForWindowCapture(s)) {
+        s.failure_exit_code = 8;
+        return false;
+    }
+
+    // Scale the captured window to fill the 1920x1080 canvas so nonblack /
+    // frame-change validation covers the whole output frame instead of only the
+    // top-left window-sized region.  This is a test-host presentation choice
+    // (non-uniform stretch) and is recorded in selftest.json.
+    if (s.scene_item && s.capture_width > 0 && s.capture_height > 0) {
+        struct vec2 scale = {};
+        scale.x = 1920.0f / static_cast<float>(s.capture_width);
+        scale.y = 1080.0f / static_cast<float>(s.capture_height);
+        obs_sceneitem_set_scale(s.scene_item, &scale);
+        AddStep(s, "scene_item_scale_fill_canvas", true,
+                "scale=" + std::to_string(scale.x) + "x" + std::to_string(scale.y) +
+                    " (window " + std::to_string(s.capture_width) + "x" +
+                    std::to_string(s.capture_height) + " -> canvas 1920x1080)");
+    }
+    return CreateEncodersAndOutput(s, first_file_path);
 }
 
 bool RunOutput(State& s)
@@ -776,11 +1378,16 @@ bool RunOutput(State& s)
     AddStep(s, "output_stopped", true,
             "drain " + std::to_string((s.t_output_inactive_ns - s.t_stop_request_ns) / 1000000ULL) + " ms");
 
-    // The MP4 files are finalized at this point.  Stop the synthetic media
-    // producer now so nothing is pushed into libobs while the context is being
-    // torn down (the source object itself is released by Cleanup()).
-    a3::StopAvTestSourceThread();
-    AddStep(s, "source_thread_stopped", true, "in-memory AV source worker stopped after output drain");
+    if (s.opt.mode == RunMode::InMemory) {
+        // The MP4 files are finalized at this point.  Stop the synthetic media
+        // producer now so nothing is pushed into libobs while the context is
+        // being torn down (the source object itself is released by Cleanup()).
+        a3::StopAvTestSourceThread();
+        AddStep(s, "source_thread_stopped", true, "in-memory AV source worker stopped after output drain");
+    } else {
+        AddStep(s, "window_capture_after_stop", true,
+                "window_capture source is a synchronous render source (no worker thread of ours)");
+    }
 
     // stop event details (code is set from mp4_output's end_data_capture path)
     s.stop_signal_seen = g_stop_signal_seen.load();
@@ -852,14 +1459,34 @@ void CollectFinalEvidence(State& s)
             "obs_source_get_monitoring_type=" + std::to_string(s.source_monitoring_type) +
                 " (NONE=" + std::to_string(OBS_MONITORING_TYPE_NONE) + ")");
 
-    const a3::AvSourceStats stats = a3::GetAvSourceStats();
-    const uint64_t expected_video_frames =
-        static_cast<uint64_t>(s.opt.duration_ms) * 60ULL / 1000ULL;
-    AddStep(s, "source_pushed_media", stats.created && stats.video_frames_pushed >= expected_video_frames &&
-                                          stats.audio_frames_pushed >= 40000,
-            "video_frames=" + std::to_string(stats.video_frames_pushed) +
-                " audio_chunks=" + std::to_string(stats.audio_chunks_pushed) +
-                " audio_frames=" + std::to_string(stats.audio_frames_pushed));
+    if (s.opt.mode == RunMode::InMemory) {
+        const a3::AvSourceStats stats = a3::GetAvSourceStats();
+        const uint64_t expected_video_frames =
+            static_cast<uint64_t>(s.opt.duration_ms) * 60ULL / 1000ULL;
+        AddStep(s, "source_pushed_media",
+                stats.created && stats.video_frames_pushed >= expected_video_frames &&
+                    stats.audio_frames_pushed >= 40000,
+                "video_frames=" + std::to_string(stats.video_frames_pushed) +
+                    " audio_chunks=" + std::to_string(stats.audio_chunks_pushed) +
+                    " audio_frames=" + std::to_string(stats.audio_frames_pushed));
+    } else {
+        // Window mode: the source is a real OBS window_capture source.  Verify
+        // the applied settings prove WGC + no audio capture, that the source is
+        // still hooked, and that no WASAPI capture stack got loaded (unlike an
+        // audio-capturing configuration).
+        const bool settings_ok = s.applied_source_settings_json.find("\"method\":2") != std::string::npos &&
+                                 s.applied_source_settings_json.find("\"capture_audio\":false") != std::string::npos &&
+                                 s.applied_source_settings_json.find("\"client_area\":true") != std::string::npos;
+        AddStep(s, "window_capture_settings_applied", settings_ok, s.applied_source_settings_json);
+        AddStep(s, "window_capture_still_hooked", s.capture_proc_hooked,
+                "proc get_hooked=" + std::to_string(s.capture_proc_hooked ? 1 : 0) + " title='" +
+                    s.capture_state_title + "' class='" + s.capture_state_class + "'");
+        AddStep(s, "window_capture_no_audio_capture",
+                !HasModule(s.process_modules, "MMDevAPI.dll") &&
+                    !HasModule(s.process_modules, "audioses.dll") &&
+                    !HasModule(s.process_modules, "win-wasapi.dll"),
+                "no MMDevAPI/audioses/win-wasapi module loaded (capture_audio=false)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,7 +1500,8 @@ void WriteReport(State& s, int exit_code)
     w.key("tool");
     w.value_string("obs-media-selftest");
     w.key("mode");
-    w.value_string("s1b-in-memory-av-to-split-mp4");
+    w.value_string(s.opt.mode == RunMode::WindowWgc ? "s1c-wgc-window-capture-to-split-mp4"
+                                                   : "s1b-in-memory-av-to-split-mp4");
     w.key("status");
     w.value_string(exit_code == 0 ? "pass" : "fail");
     w.key("exit_code");
@@ -899,6 +1527,10 @@ void WriteReport(State& s, int exit_code)
         w.value_string(s.opt.obs_dir);
         w.key("graphics_module");
         w.value_string(s.graphics_module);
+        w.key("run_mode");
+        w.value_string(s.opt.mode == RunMode::WindowWgc ? "window" : "in-memory");
+        w.key("win_capture_module_loaded");
+        w.value_bool(s.win_capture_module_loaded);
     }
     w.end_object();
 
@@ -930,6 +1562,19 @@ void WriteReport(State& s, int exit_code)
     w.value_int(s.opt.max_time_sec);
     w.key("record_duration_ms");
     w.value_int(s.opt.duration_ms);
+    if (s.opt.mode == RunMode::WindowWgc) {
+        w.key("window_target");
+        w.begin_object();
+        w.key("window_title");
+        w.value_string(s.opt.window_title);
+        w.key("window_class");
+        w.value_string(s.opt.window_class);
+        w.key("window_exe");
+        w.value_string(s.opt.window_exe);
+        w.key("window_pid");
+        w.value_int(s.opt.window_pid);
+        w.end_object();
+    }
     w.end_object();
 
     w.key("modules");
@@ -984,6 +1629,72 @@ void WriteReport(State& s, int exit_code)
         }
     }
     w.end_array();
+
+    // S1c window-capture evidence (window mode only).  "method_chosen" comes
+    // from the win-capture plugin's own log line, which is the only reliable
+    // way to distinguish WGC from the BitBlt fallback.
+    w.key("window_capture");
+    w.begin_object();
+    w.key("enabled");
+    w.value_bool(s.opt.mode == RunMode::WindowWgc);
+    w.key("module_loaded");
+    w.value_bool(s.win_capture_module_loaded);
+    w.key("lookup");
+    w.value_string(s.window_lookup);
+    w.key("found");
+    w.value_bool(s.window_found);
+    w.key("hwnd");
+    w.value_string([&s] {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(s.window_hwnd));
+        return std::string(buf);
+    }());
+    w.key("pid");
+    w.value_int(s.window_pid_found);
+    w.key("title");
+    w.value_string(s.window_title_found);
+    w.key("class");
+    w.value_string(s.window_class_found);
+    w.key("exe");
+    w.value_string(s.window_exe_found);
+    w.key("source_settings_json");
+    w.value_string(s.applied_source_settings_json);
+    w.key("capture_width");
+    w.value_uint(s.capture_width);
+    w.key("capture_height");
+    w.value_uint(s.capture_height);
+    w.key("canvas_scale");
+    w.begin_object();
+    w.key("x");
+    w.value_double(s.capture_width ? 1920.0 / static_cast<double>(s.capture_width) : 0.0, 4);
+    w.key("y");
+    w.value_double(s.capture_height ? 1080.0 / static_cast<double>(s.capture_height) : 0.0, 4);
+    w.end_object();
+    w.key("hooked_signal");
+    w.value_bool(s.capture_signal_hooked);
+    w.key("hooked_proc");
+    w.value_bool(s.capture_proc_hooked);
+    w.key("hook_title");
+    w.value_string(s.capture_state_title);
+    w.key("hook_class");
+    w.value_string(s.capture_state_class);
+    w.key("hook_exe");
+    w.value_string(s.capture_state_exe);
+    w.key("method_selected");
+    w.value_string(s.capture_method_selected);
+    w.key("method_chosen");
+    w.value_string(s.capture_method_chosen);
+    w.key("capture_audio");
+    w.value_bool(false);
+    w.key("client_area");
+    w.value_bool(true);
+    w.key("log_lines");
+    w.begin_array();
+    for (const auto& line : s.capture_log_lines) {
+        w.value_string(line);
+    }
+    w.end_array();
+    w.end_object();
 
     w.key("media");
     w.begin_object();
@@ -1074,6 +1785,12 @@ void WriteReport(State& s, int exit_code)
     w.value_bool(HasModule(s.process_modules, "wdmaud.drv"));
     w.key("has_avrt");
     w.value_bool(HasModule(s.process_modules, "avrt.dll"));
+    w.key("has_win_capture");
+    w.value_bool(HasModule(s.process_modules, "win-capture.dll"));
+    w.key("has_libobs_winrt");
+    w.value_bool(HasModule(s.process_modules, "libobs-winrt.dll"));
+    w.key("has_libcurl");
+    w.value_bool(HasModule(s.process_modules, "libcurl.dll"));
     w.key("all");
     w.begin_array();
     for (const auto& m : s.process_modules) {
@@ -1105,9 +1822,17 @@ void PrintUsage()
     std::printf("usage: obs-media-selftest.exe --out-dir DIR [options]\n"
                 "  --out-dir DIR        output directory for split MP4s + selftest.json (required)\n"
                 "  --obs-dir DIR        installed OBS root (default: C:\\Program Files\\obs-studio)\n"
-                "  --duration-ms N      record duration in ms (default 17000)\n"
-                "  --max-time-sec N     split max_time_sec (default 5)\n"
-                "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n");
+                "  --mode MODE          in-memory (default, S1b synthetic AV) | window (S1c WGC)\n"
+                "  --window-source      alias for --mode window\n"
+                "  --window-title STR   window mode: target window title (default 'VCMI WGC Synthetic')\n"
+                "  --window-class STR   window mode: target window class (optional)\n"
+                "  --window-exe STR     window mode: target executable name (optional)\n"
+                "  --window-pid N       window mode: restrict to a process id (optional)\n"
+                "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
+                "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n"
+                "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
+                "exit codes: 0 ok, 2 usage, 3 obs/module init, 4 pipeline, 5 output run,\n"
+                "            6 checks, 7 window_not_found, 8 capture/not-WGC failure\n");
 }
 
 bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
@@ -1126,10 +1851,33 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.out_dir = next("--out-dir");
         } else if (a == "--obs-dir") {
             opt.obs_dir = next("--obs-dir");
+        } else if (a == "--mode") {
+            const std::string value = next("--mode");
+            if (value == "in-memory" || value == "memory" || value == "s1b") {
+                opt.mode = RunMode::InMemory;
+            } else if (value == "window" || value == "wgc" || value == "s1c") {
+                opt.mode = RunMode::WindowWgc;
+            } else {
+                std::fprintf(stderr, "invalid --mode: %s (in-memory|window)\n", value.c_str());
+                exit_code = 2;
+                return false;
+            }
+        } else if (a == "--window-source") {
+            opt.mode = RunMode::WindowWgc;
+        } else if (a == "--window-title") {
+            opt.window_title = next("--window-title");
+        } else if (a == "--window-class") {
+            opt.window_class = next("--window-class");
+        } else if (a == "--window-exe") {
+            opt.window_exe = next("--window-exe");
+        } else if (a == "--window-pid") {
+            opt.window_pid = std::atoi(next("--window-pid").c_str());
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
+            opt.duration_explicit = true;
         } else if (a == "--max-time-sec") {
             opt.max_time_sec = std::atoi(next("--max-time-sec").c_str());
+            opt.max_time_explicit = true;
         } else if (a == "--json-out") {
             opt.json_out = next("--json-out");
         } else if (a == "--help" || a == "-h") {
@@ -1145,6 +1893,25 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
         if (exit_code != 0) {
             return false;
         }
+    }
+    if (opt.mode == RunMode::WindowWgc) {
+        if (!opt.duration_explicit) {
+            opt.duration_ms = 8000;
+        }
+        if (!opt.max_time_explicit) {
+            opt.max_time_sec = 3;
+        }
+        if (opt.window_pid <= 0 && opt.window_title.empty() && opt.window_class.empty() &&
+            opt.window_exe.empty()) {
+            std::fprintf(stderr, "window mode needs --window-title/--window-class/--window-exe/--window-pid\n");
+            exit_code = 2;
+            return false;
+        }
+    }
+    if (opt.window_pid < 0) {
+        std::fprintf(stderr, "--window-pid out of range\n");
+        exit_code = 2;
+        return false;
     }
     if (opt.out_dir.empty()) {
         std::fprintf(stderr, "--out-dir is required\n");
@@ -1169,13 +1936,26 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
 
 int main(int argc, char** argv)
 {
+    // Match OBS' own DPI awareness (obs64.exe manifest: Per-Monitor-V2) so the
+    // win-capture window_capture client-area cropping math uses physical pixel
+    // coordinates like the WGC frame does.  Without this the host process is
+    // DPI-unaware and client_area=true can leave the window frame/title bar in
+    // the captured texture (observed on this host with a DPI-unaware Tk window).
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     State state;
     int exit_code = 0;
     if (!ParseArgs(argc, argv, state.opt, exit_code)) {
         return exit_code;
     }
 
-    std::printf("obs-media-selftest: libobs=linked obs_dir=%s out_dir=%s duration_ms=%d max_time_sec=%d\n",
+    // Keep a copy of libobs log lines in memory (also forwarded to stdout) so
+    // the report can record the win-capture plugin's actual "method chosen"
+    // line instead of only relying on external stdout grep.
+    InstallLogCapture();
+
+    std::printf("obs-media-selftest: libobs=linked mode=%s obs_dir=%s out_dir=%s duration_ms=%d max_time_sec=%d\n",
+                state.opt.mode == RunMode::WindowWgc ? "window" : "in-memory",
                 state.opt.obs_dir.c_str(), state.opt.out_dir.c_str(), state.opt.duration_ms,
                 state.opt.max_time_sec);
     std::fflush(stdout);
@@ -1185,6 +1965,7 @@ int main(int argc, char** argv)
         state.steps.push_back(Step{"create_out_dir", false, state.opt.out_dir});
         WriteReport(state, 2);
         Cleanup(state);
+        UninstallLogCapture();
         return 2;
     }
     state.steps.push_back(Step{"create_out_dir", true, state.opt.out_dir});
@@ -1193,20 +1974,34 @@ int main(int argc, char** argv)
 
     int rc = 0;
     if (!InitObs(state)) {
-        rc = 3;
-    } else if (!CreatePipeline(state, first_file)) {
-        rc = 4;
-    } else if (!RunOutput(state)) {
-        rc = 5;
+        rc = state.failure_exit_code ? state.failure_exit_code : 3;
+    } else if (state.opt.mode == RunMode::WindowWgc) {
+        if (!CreateWindowPipeline(state, first_file)) {
+            rc = state.failure_exit_code ? state.failure_exit_code : 4;
+        } else if (!RunOutput(state)) {
+            rc = state.failure_exit_code ? state.failure_exit_code : 5;
+        } else {
+            CollectFinalEvidence(state);
+            if (!AllStepsOk(state)) {
+                rc = state.failure_exit_code ? state.failure_exit_code : 6;
+            }
+        }
     } else {
-        CollectFinalEvidence(state);
-        if (!AllStepsOk(state)) {
-            rc = 6;
+        if (!CreatePipeline(state, first_file)) {
+            rc = state.failure_exit_code ? state.failure_exit_code : 4;
+        } else if (!RunOutput(state)) {
+            rc = state.failure_exit_code ? state.failure_exit_code : 5;
+        } else {
+            CollectFinalEvidence(state);
+            if (!AllStepsOk(state)) {
+                rc = state.failure_exit_code ? state.failure_exit_code : 6;
+            }
         }
     }
 
     WriteReport(state, rc);
     Cleanup(state);
+    UninstallLogCapture();
     std::printf("SELFTEST_EXIT %d\n", rc);
     std::fflush(stdout);
     return rc;

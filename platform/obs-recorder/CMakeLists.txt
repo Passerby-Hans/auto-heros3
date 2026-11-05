@@ -118,6 +118,8 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
   # This is local build output only (git-ignored), never committed.
   set(OBS_MEDIA_RUNTIME_DLLS
     obs.dll
+    libobs-winrt.dll
+    libcurl.dll
     avcodec-61.dll
     avformat-61.dll
     avdevice-61.dll

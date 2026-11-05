@@ -10,11 +10,14 @@ and records a synthetic in-memory H.264+AAC signal to **split Hybrid MP4** files
   `feature/av1b-vdd-wgc`); it never calls `obs_startup`/`obs_shutdown`, never
   creates a video/audio/output subsystem, never captures, never records, never
   plays audio.
-- S1b media self-test: **verified 2026-11-05**, repo HEAD `5e153d6`; it does
-  call `obs_startup` and the real media pipeline (see the dedicated S1b section
-  below). It is a **test host with synthetic media only** — no screen capture
-  of the game, no game PCM, not wired into MCP/Python, and not the product
-  recorder.
+- S1b media self-test (in-memory mode): **verified 2026-11-05**, repo HEAD
+  `5e153d6`; it does call `obs_startup` and the real media pipeline (see the
+  dedicated S1b section below). It is a **test host with synthetic media only**
+  — no screen capture of the game, no game PCM, not wired into MCP/Python, and
+  not the product recorder.
+- S1c WGC window-capture mode: **verified 2026-11-05**, repo HEAD `6510b51`;
+  targets a real window through OBS `window_capture`/WGC (still a synthetic Tk
+  test window, no game, no audio capture; see the S1c section below).
 - The OBS GUI (`obs64.exe`) is never started by any tool in this directory.
 
 ## Verified capability summary (actual observations)
@@ -55,9 +58,11 @@ platform/obs-recorder/
   scripts/
     build.ps1                    # S0/S1a: vcvars64 + CMake/Ninja build, writes build_summary.json
     s0-smoke.ps1                 # reproducible S0 evidence run (build/capabilities/IPC)
-    gen-obs-sdk.ps1              # S1b: generate obs.lib + obsconfig.h from installed obs.dll
-    build-media-selftest.ps1     # S1b: build obs-media-selftest.exe (links libobs)
+    gen-obs-sdk.ps1              # S1b/S1c: generate obs.lib + obsconfig.h from installed obs.dll
+    build-media-selftest.ps1     # S1b/S1c: build obs-media-selftest.exe (links libobs)
     s1b-smoke.ps1                # S1b: build + record + ffprobe/ffmpeg validation, writes summary.json
+    s1c-smoke.ps1                # S1c: WGC window capture + validation + explicit no-window failure run
+    wgc-synthetic-window.py      # S1c: synthetic animated Tk window (no audio/game) for window_capture tests
   src/
     main.cpp                     # CLI modes + capabilities JSON assembly
     json_util.hpp/.cpp           # minimal JSON writer
@@ -203,7 +208,11 @@ libobs** instead of `dlopen()`ing it. Verified 2026-11-05 (repo HEAD `5e153d6`):
 **17/17 independent checks PASS**, evidence in
 `var/runs/obs-media-s1b-20261105-160609/`.
 
-What it does (and only this):
+The same executable has an S1c window mode (`--mode window`) that captures a real
+window through OBS `window_capture` with the **WGC** method — see the dedicated
+S1c section below.
+
+What the default (`--mode in-memory`, S1b) path does (and only this):
 
 1. `obs_startup("en-US", NULL, NULL)` (libobs 32.1.0);
 2. loads only `obs-ffmpeg.dll`, `obs-x264.dll`, `obs-outputs.dll` (explicit
@@ -278,8 +287,9 @@ would need a different duration/keyframe/B-frame configuration.
 ### S1b limitations (still test/stand-in, not the product recorder)
 
 1. **Synthetic media only**: the picture is a generated moving-bar/checker
-   pattern and the audio is a generated 440 Hz sine. No WGC/game capture, no
-   VCMI game PCM (`win-capture`/`win-wasapi` not loaded or tested).
+   pattern and the audio is a generated 440 Hz sine. This in-memory mode does
+   not load `win-capture` (S1c adds WGC window capture — see below) and no game
+   capture / VCMI game PCM is tested here.
 2. **Not wired into the product**: standalone exe; no MCP/Python integration, no
    IPC/manifest hooks, does not replace the existing Python recorder.
 3. **Split semantics/rollover**: 5 s is a keyframe-aligned lower bound (observed
@@ -298,12 +308,107 @@ would need a different duration/keyframe/B-frame configuration.
 See `var/runs/obs-media-s1b-20261105-160609/S1B_REPORT.md` for the full report
 (API/source-line references, per-file probes, crash/fix notes).
 
-## Remaining blockers / next steps after S1b
+## S1c WGC window-capture mode (`--mode window`)
 
-1. **Real capture inputs (S1c)**: feed the same libobs pipeline with WGC desktop
-   capture (`win-capture.dll`) and/or VCMI's real audio/PCM path; this requires
-   loading additional modules (`win-capture`, `win-wasapi`) and testing against
-   the game/VDD without breaking the S0/S1a host.
+Verified 2026-11-05 (repo HEAD `6510b51`): **36/36 independent checks PASS**,
+evidence in `var/runs/obs-wgc-s1c-20261105-163717/`. It captures a **real
+window** through OBS' `window_capture` source using the **WGC** method (not
+BitBlt), while keeping the no-audio/no-playback constraints.
+
+What it does:
+
+1. loads the same base whitelist (`obs-ffmpeg`, `obs-x264`, `obs-outputs`) **and
+   `win-capture.dll`** — the latter is loaded **after `obs_reset_video()`** so the
+   plugin sees the D3D11 graphics context and enables WGC
+   (`plugins/win-capture/plugin-main.c:104 obs_module_load()`,
+   `:102 wgc_supported`). Loading it before graphics init permanently forces the
+   BitBlt fallback;
+2. targets a window by PID/title/class/exe using libobs' helpers:
+   `ms_find_window()` (`libobs/util/windows/window-helpers.h:40`) and
+   `ms_get_window_title/class/exe()`; the OBS escaped `title:class:exe` string is
+   built from the actual HWND attributes (`ms_build_window_strings()` /
+   `encode_dstr()` conventions). **Class is required** for the WGC path because
+   `window-capture.c:630` uses `ms_find_window_top_level()`, which returns NULL
+   when class is NULL;
+3. creates `obs_source_create("window_capture", ...)` with
+   `method=2` (WGC), `client_area=true`, `capture_audio=false`, `force_sdr=true`
+   and puts it in a scene on main-canvas channel 0;
+4. waits for the source `hooked` signal + non-zero captured size (WGC frame
+   init), then records 8 s with the existing x264/AAC/`mp4_output`
+   (split_file=true, `max_time_sec=3`);
+5. verifies the **actual** method from the win-capture plugin log
+   (`method selected: WGC` / `method chosen: WGC`, see
+   `plugins/win-capture/window-capture.c:187 log_settings()`) and records it in
+   `selftest.json`; the smoke script fails if the log shows BitBlt;
+6. runs a negative test with no matching window and requires an explicit
+   failure: exit code **7**, `WINDOW_NOT_FOUND` on stdout,
+   `selftest.json` `status=fail/exit_code=7/window_capture.found=false`, zero
+   MP4 files and a clean `obs_shutdown_done` (no crash).
+
+### S1c run / verification
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File platform\obs-recorder\scripts\s1c-smoke.ps1
+
+# recorder only (target window must already exist)
+platform\obs-recorder\build-media\bin\obs-media-selftest.exe --mode window `
+  --window-pid <pid> --window-title "VCMI WGC Synthetic" --window-class TkTopLevel `
+  --out-dir var\runs\obs-wgc-manual --duration-ms 8000 --max-time-sec 3
+```
+
+The smoke script starts `scripts/wgc-synthetic-window.py` (Tk, animated, no
+audio/game, title `VCMI WGC Synthetic`) and passes its PID/title/class/exe to the
+recorder.
+
+Observed result of the verified run:
+
+| Item | Observed |
+|---|---|
+| Modules | 4/4: obs-ffmpeg, obs-x264, obs-outputs, **win-capture** (init ok) |
+| Window | hwnd `0x9112aa`, pid 61628, `title='VCMI WGC Synthetic'`, `class='TkTopLevel'`, `exe='pythonw.exe'` |
+| source settings (read back) | `method=2, capture_audio=false, client_area=true, force_sdr=true, priority=1, window="VCMI WGC Synthetic:TkTopLevel:pythonw.exe"` |
+| Actual method (plugin log) | **`method selected: WGC` / `method chosen: WGC`**, not BitBlt |
+| Capture size | **960x720** physical client area (Tk logical 640x480, 150% DPI scale 1.5x1.5; client_area crop excludes the title bar) |
+| Files | 3 split MP4s: 3.994 / 2.983 / 1.033 s (239/179/62 frames), total 8.011 s |
+| Streams | H.264 1920x1080@60 + AAC 44.1 kHz 2 ch on every file |
+| Decode | `ffmpeg -v error -i <file> -f null -` → **zero errors** |
+| Frames | YAVG 94.4/66.9/62.5, YMAX ≈ 240 (**non-black**); framemd5 unique ratio 60/60, 57/60, 55/56 (**changing**) |
+| Audio | silent by design (`capture_audio=false`): max_volume = **−91 dB** |
+| No audio device | live process modules contain **no MMDevAPI/audioses/wdmaud/win-wasapi** (98 modules; win-capture/libobs-winrt/libcurl present); `monitoring_type=NONE` |
+| Split behavior | keyframe-aligned: boundaries at 4 s / 7 s (B-frame DTS shift), so 8 s → 4+3+1 s files; `file_changed` events logged |
+| Negative run | no matching window → **exit 7**, explicit `window_not_found` step/log, 0 MP4, clean shutdown |
+
+### S1c limitations (still test/stand-in)
+
+1. **Not game capture**: the target is a synthetic animated Tk window. VCMI/VDD
+   window capture (battle etc.), real window sizes and long runs are not tested.
+2. **No audio**: `capture_audio=false` on purpose; the AAC track is silence.
+   VCMI's real PCM path (SDL disk → pipe) is not wired here.
+3. **HDR**: this host's LG display is HDR; without `force_sdr=true` the WGC
+   RGBA16F/`GS_CS_709_EXTENDED` path produced black frames in this SDR pipeline.
+   `force_sdr=true` is used and recorded; the real HDR→SDR path is not validated.
+4. **DPI**: the host is Per-Monitor-V2 aware (like obs64.exe); the DPI-unaware Tk
+   window is captured at physical 960x720 for a 640x480 logical size. This is
+   reported (`dpi_scale=1.5x1.5`) rather than hidden.
+5. **Plugin source lifetime**: scene/window_capture sources are now destroyed
+   **before** `obs_shutdown()` via `obs_canvas_scene_remove()` + destroy-queue
+   flushing (the main canvas holds a `SCENE_REF` strong reference and
+   `obs_shutdown()` unloads plugin modules before freeing sources). This is
+   required for any plugin-provided source and is covered by the clean-shutdown
+   checks.
+6. **Not wired into the product**: standalone test exe; no MCP/Python/IPC/
+   manifest integration; no rollover/recovery/long soak; GPL compliance for a
+   libobs-linked host is still to be reviewed.
+
+See `var/runs/obs-wgc-s1c-20261105-163717/S1C_REPORT.md` for the full report
+(source-line/API references, per-file probes, DPI/HDR/fix notes).
+
+## Remaining blockers / next steps after S1b/S1c
+
+1. **Real content (S1d)**: point the WGC `window_capture` mode at the actual
+   VCMI window on the VDD (or a WGC monitor capture), including battle content,
+   client-area geometry and real window resizes; optionally load `win-wasapi` for
+   real audio capture. Keep the no-monitoring/no-playback constraints.
 2. **Product integration**: expose start/stop/status through the existing
    `obs-recorder` IPC and the MCP/Python recorder interface; keep the old Python
    recorder as the only usable backend until that is verified end-to-end.
@@ -312,7 +417,8 @@ See `var/runs/obs-media-s1b-20261105-160609/S1B_REPORT.md` for the full report
 4. **A/V acceptance**: real-content listening/visual checks, drift measurement,
    per-frame sync, not just container-level durations.
 5. **Distribution/licensing**: confirm GPL-2.0-or-later obligations for a host
-   that links libobs and ships the generated import library/build scripts.
+   that links libobs (and win-capture) and ships the generated import
+   library/build scripts.
 
 ## Non-goals of the S0/S1a scaffold (unchanged)
 

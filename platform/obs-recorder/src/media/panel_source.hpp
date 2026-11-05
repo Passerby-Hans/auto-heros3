@@ -1,9 +1,11 @@
-// S5b: native libobs status panel (right 480x1080 column).
+// S5b/S6: native libobs status panel (right 480x1080 column).
 //
-// The game capture is scaled uniformly into a 1440x1080 (4:3) region; this
-// source paints the remaining 480x1080 column.  It is a normal async video
-// source: no OBS UI, no text plugin, no audio, no playback.  GDI is used only
-// to rasterise the panel into a BGRA frame handed to libobs.
+// Layout contract: game capture is uniformly scaled into the left 1440x1080
+// (4:3) region; this source paints the right 480x1080 column.  The bottom part
+// of the panel tails the MCP overlay JSONL (thoughts/actions/results) so the
+// recording itself shows the LLM reasoning, not only the game frame.
+//
+// Normal async video source: no OBS UI, no text plugin, no audio, no playback.
 #pragma once
 
 namespace a3 {

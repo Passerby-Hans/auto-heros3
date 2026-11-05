@@ -1,4 +1,5 @@
 #include "panel_source.hpp"
+#include "../json_util.hpp"
 
 #include <obs.h>
 #include <obs-source.h>
@@ -6,9 +7,13 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,10 +25,17 @@ constexpr char kSourceId[] = "a3_status_panel";
 constexpr int kWidth = 480;
 constexpr int kHeight = 1080;
 
+struct OverlayEntry {
+    std::string kind;
+    std::string ts;
+    std::string text;
+};
+
 struct PanelData {
     obs_source_t* source = nullptr;
     std::string title = "AUTO-HEROS3";
     std::string session = "libobs";
+    std::string overlay_path;
     std::vector<uint8_t> bgra;
     HDC dc = nullptr;
     HBITMAP bitmap = nullptr;
@@ -36,6 +48,37 @@ struct PanelData {
 
 std::atomic<PanelData*> g_panel{nullptr};
 
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+std::vector<OverlayEntry> ReadOverlay(const std::string& path, size_t keep = 8) {
+    std::vector<OverlayEntry> entries;
+    if (path.empty()) return entries;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return entries;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        std::string kind, text, ts;
+        bool found = false;
+        json_extract_string(line, "kind", &kind, &found);
+        json_extract_string(line, "text", &text, &found);
+        json_extract_string(line, "ts", &ts, &found);
+        if (text.empty()) continue;
+        entries.push_back({kind, ts, text});
+        if (entries.size() > 64) entries.erase(entries.begin());
+    }
+    if (entries.size() > keep)
+        entries.erase(entries.begin(), entries.end() - static_cast<std::ptrdiff_t>(keep));
+    return entries;
+}
+
 void DrawPanel(PanelData* p) {
     if (!p->dc || !p->bits) return;
     uint8_t* px = static_cast<uint8_t*>(p->bits);
@@ -45,9 +88,9 @@ void DrawPanel(PanelData* p) {
         const int v = 22 + (y * 10) / kHeight;
         for (int x = 0; x < kWidth; ++x) {
             uint8_t* q = px + (static_cast<size_t>(y) * kWidth + x) * 4;
-            q[0] = static_cast<uint8_t>(v);       // B
-            q[1] = static_cast<uint8_t>(v + 2);   // G
-            q[2] = static_cast<uint8_t>(v + 4);   // R
+            q[0] = static_cast<uint8_t>(v);
+            q[1] = static_cast<uint8_t>(v + 2);
+            q[2] = static_cast<uint8_t>(v + 4);
             q[3] = 255;
         }
     }
@@ -57,16 +100,18 @@ void DrawPanel(PanelData* p) {
     DeleteObject(orange);
 
     SetBkMode(p->dc, TRANSPARENT);
-    SetTextColor(p->dc, RGB(235, 235, 235));
     HFONT h1 = CreateFontW(-34, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    HFONT h2 = CreateFontW(-20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT h2 = CreateFontW(-19, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    HFONT h3 = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT h3 = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Consolas");
+    HFONT h4 = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
     auto text = [&](HFONT font, const std::wstring& s, int x, int y, int w, int h,
                     COLORREF color, UINT flags) {
         HGDIOBJ old = SelectObject(p->dc, font);
@@ -76,11 +121,10 @@ void DrawPanel(PanelData* p) {
         SelectObject(p->dc, old);
     };
 
-    text(h1, L"AUTO-HEROS3", 30, 54, 420, 52, RGB(255, 255, 255), DT_LEFT);
-    text(h2, L"LIBOBS RECORDER", 32, 112, 420, 30, RGB(170, 180, 190), DT_LEFT);
-    text(h2, L"SELF-OWNED CAPTURE ENGINE", 32, 146, 420, 30, RGB(120, 132, 144), DT_LEFT);
+    text(h1, L"AUTO-HEROS3", 30, 42, 420, 48, RGB(255, 255, 255), DT_LEFT);
+    text(h2, L"LIBOBS RECORDER  /  SELF-OWNED", 32, 96, 420, 28, RGB(160, 172, 184), DT_LEFT);
 
-    RECT sep{32, 204, 448, 206};
+    RECT sep{32, 140, 448, 142};
     HBRUSH sepbrush = CreateSolidBrush(RGB(64, 70, 78));
     FillRect(p->dc, &sep, sepbrush);
     DeleteObject(sepbrush);
@@ -90,37 +134,69 @@ void DrawPanel(PanelData* p) {
     std::swprintf(rec, 64, L"REC   %02llu:%02llu",
                   static_cast<unsigned long long>(elapsed / 60),
                   static_cast<unsigned long long>(elapsed % 60));
-    text(h1, rec, 30, 238, 420, 52, RGB(232, 96, 72), DT_LEFT);
+    text(h1, rec, 30, 164, 420, 48, RGB(232, 96, 72), DT_LEFT);
 
-    text(h3, L"GAME / 4:3", 32, 352, 420, 26, RGB(140, 150, 160), DT_LEFT);
-    text(h2, L"1440 x 1080", 32, 382, 420, 34, RGB(235, 235, 235), DT_LEFT);
-    text(h3, L"CANVAS", 32, 444, 420, 26, RGB(140, 150, 160), DT_LEFT);
-    text(h2, L"1920 x 1080 @ 60", 32, 474, 420, 34, RGB(235, 235, 235), DT_LEFT);
+    text(h3, L"GAME 4:3  ·  1440x1080", 32, 236, 420, 24, RGB(185, 195, 205), DT_LEFT);
+    text(h3, L"CANVAS 1920x1080 @60", 32, 264, 420, 24, RGB(185, 195, 205), DT_LEFT);
+    text(h3, L"WGC / SDR  ·  game PCM", 32, 292, 420, 24, RGB(185, 195, 205), DT_LEFT);
+    text(h3, L"no audio playback", 32, 320, 420, 24, RGB(120, 132, 144), DT_LEFT);
 
-    text(h3, L"CAPTURE", 32, 550, 420, 26, RGB(140, 150, 160), DT_LEFT);
-    text(h2, L"WGC window / SDR", 32, 580, 420, 34, RGB(235, 235, 235), DT_LEFT);
+    RECT sep2{32, 362, 448, 364};
+    HBRUSH sep2brush = CreateSolidBrush(RGB(60, 66, 74));
+    FillRect(p->dc, &sep2, sep2brush);
+    DeleteObject(sep2brush);
 
-    text(h3, L"AUDIO", 32, 656, 420, 26, RGB(140, 150, 160), DT_LEFT);
-    text(h2, L"game PCM / no playback", 32, 686, 420, 34, RGB(235, 235, 235), DT_LEFT);
+    text(h2, L"LLM  /  ACTIONS", 32, 380, 420, 30, RGB(235, 235, 235), DT_LEFT);
+    text(h3, L"live from MCP overlay.jsonl", 32, 412, 420, 22, RGB(120, 132, 144), DT_LEFT);
 
-    text(h3, L"SESSION", 32, 772, 420, 26, RGB(140, 150, 160), DT_LEFT);
-    std::wstring sess(p->session.begin(), p->session.end());
-    if (sess.size() > 30) sess = sess.substr(0, 30) + L"...";
-    text(h3, sess, 32, 802, 420, 26, RGB(220, 220, 220), DT_LEFT);
+    const std::vector<OverlayEntry> entries = ReadOverlay(p->overlay_path, 7);
+    int y = 448;
+    const int bottom = 1000;
+    if (entries.empty()) {
+        text(h4, L"(waiting for LLM thoughts/actions)", 32, y, 416, 60,
+             RGB(150, 150, 150), DT_LEFT | DT_WORDBREAK);
+    } else {
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            const OverlayEntry& e = *it;
+            COLORREF label_color = RGB(180, 180, 180);
+            std::wstring kind = Utf8ToWide(e.kind);
+            std::transform(kind.begin(), kind.end(), kind.begin(),
+                           [](wchar_t c) { return static_cast<wchar_t>(::towupper(c)); });
+            if (e.kind == "thought") label_color = RGB(238, 170, 90);
+            else if (e.kind == "action") label_color = RGB(120, 220, 150);
+            else if (e.kind == "result") label_color = RGB(140, 180, 230);
+            else if (e.kind == "event") label_color = RGB(180, 150, 210);
+            std::wstring label = kind;
+            if (!e.ts.empty()) label += L"  " + Utf8ToWide(e.ts);
+            text(h3, label, 32, y, 416, 20, label_color, DT_LEFT);
+            y += 20;
+            std::wstring body = Utf8ToWide(e.text);
+            RECT calc{32, y, 448, y + 200};
+            HGDIOBJ old = SelectObject(p->dc, h4);
+            DrawTextW(p->dc, body.c_str(), -1, &calc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+            SelectObject(p->dc, old);
+            const int h = std::min(120, static_cast<int>(calc.bottom - calc.top) + 4);
+            if (y + h > bottom) break;
+            text(h4, body, 32, y, 416, h, RGB(235, 235, 235), DT_LEFT | DT_WORDBREAK);
+            y += h + 10;
+            if (y >= bottom) break;
+        }
+    }
 
-    text(h3, L"STATUS", 32, 890, 420, 26, RGB(140, 150, 160), DT_LEFT);
-    text(h2, L"RECORDING", 32, 920, 420, 34, RGB(120, 220, 150), DT_LEFT);
-
-    text(h3, L"panel is part of the recorded frame", 30, 1018, 420, 24,
-         RGB(105, 115, 125), DT_LEFT);
+    text(h3, L"SESSION", 32, 1008, 420, 20, RGB(120, 132, 144), DT_LEFT);
+    std::wstring sess = Utf8ToWide(p->session);
+    if (sess.size() > 34) sess = sess.substr(0, 34) + L"...";
+    text(h3, sess, 32, 1028, 420, 20, RGB(190, 196, 204), DT_LEFT);
+    text(h3, L"panel is part of the recorded frame", 30, 1052, 420, 20,
+         RGB(100, 108, 118), DT_LEFT);
 
     DeleteObject(h1);
     DeleteObject(h2);
     DeleteObject(h3);
+    DeleteObject(h4);
 
-    // GDI text does not reliably preserve the alpha byte.  The async BGRA frame
-    // is composited over the black scene background; force opaque pixels so the
-    // panel text is not erased as transparent.
+    // GDI text does not reliably preserve the alpha byte.  Force opaque pixels
+    // so the composited panel is not erased as transparent over the black scene.
     for (size_t i = 3; i < static_cast<size_t>(kWidth) * kHeight * 4; i += 4)
         px[i] = 255;
 }
@@ -148,11 +224,13 @@ void* PanelCreate(obs_data_t* settings, obs_source_t* source) {
     auto* p = new PanelData();
     p->source = source;
     p->bgra.assign(static_cast<size_t>(kWidth) * kHeight * 4, 0);
-    if (obs_data_t* s = settings) {
-        const char* t = obs_data_get_string(s, "title");
-        const char* sess = obs_data_get_string(s, "session");
+    if (settings) {
+        const char* t = obs_data_get_string(settings, "title");
+        const char* sess = obs_data_get_string(settings, "session");
+        const char* overlay = obs_data_get_string(settings, "overlay_path");
         if (t && *t) p->title = t;
         if (sess && *sess) p->session = sess;
+        if (overlay) p->overlay_path = overlay;
     }
 
     BITMAPINFO bmi = {};

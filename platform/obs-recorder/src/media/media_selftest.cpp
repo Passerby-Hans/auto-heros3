@@ -243,6 +243,7 @@ struct Options {
     int max_size_mb = 0;   // 0 disables size-triggered splitting
     std::string json_out;
     std::string log_file;             // --log: self-redirect stdout (used by WMI launch)
+    std::string overlay_path;        // MCP overlay.jsonl for the status panel
     RunMode mode = RunMode::InMemory;
     bool duration_explicit = false;
     bool max_time_explicit = false;
@@ -1439,7 +1440,8 @@ bool CreateWindowPipeline(State& s, const std::string& first_file_path)
     obs_data_t* psettings = obs_data_create();
     obs_data_set_string(psettings, "title", "AUTO-HEROS3");
     obs_data_set_string(psettings, "session", s.opt.pipe_name.empty() ? "live" : s.opt.pipe_name.c_str());
-    s.panel_source = obs_source_create("a3_status_panel", "S5b Status Panel", psettings, nullptr);
+    obs_data_set_string(psettings, "overlay_path", s.opt.overlay_path.c_str());
+    s.panel_source = obs_source_create("a3_status_panel", "S6 Status Panel (LLM feed)", psettings, nullptr);
     obs_data_release(psettings);
     AddStep(s, "create_status_panel_source", s.panel_source != nullptr,
             "a3_status_panel 480x1080 BGRA async video (no audio)");
@@ -2708,6 +2710,9 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
         return ReplyError(sess, req, "invalid_args", err);
     if (found && (max_time < 1 || max_time > 3600))
         return ReplyError(sess, req, "invalid_args", "\"max_time_sec\" must be 1..3600");
+    std::string overlay_path;
+    if (!GetStringArg(req, "overlay_path", &overlay_path, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
     long long max_size_mb = 0;
     found = false;
     if (!GetIntArg(req, "max_size_mb", &max_size_mb, &found, err))
@@ -2765,6 +2770,7 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     s.opt.window_pid = static_cast<int>(pid);
     s.opt.max_time_sec = static_cast<int>(max_time);
     s.opt.max_size_mb = static_cast<int>(max_size_mb);
+    s.opt.overlay_path = overlay_path;
     s.opt.duration_ms = static_cast<int>(duration_ms);
     s.opt.json_out.clear();
     s.opt.mode = RunMode::WindowWgc;
@@ -3349,6 +3355,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.json_out = next("--json-out");
         } else if (a == "--log") {
             opt.log_file = next("--log");
+        } else if (a == "--overlay-jsonl") {
+            opt.overlay_path = next("--overlay-jsonl");
         } else if (a == "--serve") {
             opt.serve = true;
         } else if (a == "--pipe") {

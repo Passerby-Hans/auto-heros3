@@ -5968,7 +5968,8 @@ def _size_cap_mb(max_segment_gb: float) -> int:
 
 
 def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
-                         max_time_sec: int, max_size_mb: int = 0) -> tuple[object, dict]:
+                         max_time_sec: int, max_size_mb: int = 0,
+                         overlay_path: Path | None = None) -> tuple[object, dict]:
     """Create/connect/prepare/start one native recorder process for a run."""
     from auto_heros3.recording.obs_backend import ObsRecorder
     client = ObsRecorder(_obs_recorder_exe(), obs_dir=Path(r'C:\Program Files\obs-studio'),
@@ -5977,7 +5978,7 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
         client.connect()
         prep = client.prepare(Path(out), window_pid=int(client_pid), audio_raw=Path(audio_raw),
                               max_time_sec=int(max_time_sec), max_size_mb=int(max_size_mb),
-                              duration_ms=0)
+                              overlay_path=overlay_path, duration_ms=0)
         if not prep.get('ok'):
             raise RuntimeError(f"prepare failed: {prep.get('error')}")
         start = client.start_recording()
@@ -6063,7 +6064,8 @@ def _libobs_restart_after_death(rec: dict, returncode) -> None:
                 metadata={'restart_of': old_run_id, 'restart_count': n})
             client, prep = _libobs_start_client(
                 new_out, client_pid=int(cfg['client_pid']), audio_raw=Path(cfg['audio_raw']),
-                max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0))
+                max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0),
+                overlay_path=Path(cfg['overlay_path']) if cfg.get('overlay_path') else None)
             m.transition_run('recording')
         except Exception as exc:  # noqa: BLE001
             _libobs_mark_run_failed(new_out, f'restart_failed: {type(exc).__name__}: {exc}')
@@ -6137,7 +6139,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         client, prep = _libobs_start_client(
             out, client_pid=int(client_pid), audio_raw=audio_raw,
             max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
-            max_size_mb=_size_cap_mb(max_segment_gb))
+            max_size_mb=_size_cap_mb(max_segment_gb),
+            overlay_path=_dir() / 'overlay.jsonl')
         run_manifest.transition_run('recording')
     except Exception as exc:  # noqa: BLE001
         try:
@@ -6158,7 +6161,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
               'client_pid': int(client_pid), 'audio_raw': str(audio_raw),
               'max_time_sec': int(rollover_seconds) if rollover_seconds else 900,
               'max_size_mb': _size_cap_mb(max_segment_gb),
-              'max_segment_gb': float(max_segment_gb)}
+              'max_segment_gb': float(max_segment_gb),
+              'overlay_path': str(_dir() / 'overlay.jsonl')}
     rec = _RUNTIME.recorder
     rec.clear()
     rec.update({'proc': client.proc, 'dir': out, 'started': time.time(),

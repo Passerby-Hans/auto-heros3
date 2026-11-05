@@ -193,10 +193,13 @@ class ObsRecorder:
                 window_title: str | None = None, window_class: str | None = None,
                 window_exe: str | None = None, audio_raw: Path | None = None,
                 max_time_sec: int = 900, max_size_mb: int = 0,
+                overlay_path: Path | None = None,
                 duration_ms: int = 0) -> dict:
         args: dict[str, Any] = {'out_dir': str(out_dir), 'max_time_sec': int(max_time_sec),
                                 'max_size_mb': int(max_size_mb),
                                 'duration_ms': int(duration_ms)}
+        if overlay_path:
+            args['overlay_path'] = str(overlay_path)
         if window_pid:
             args['window_pid'] = int(window_pid)
         if window_title:

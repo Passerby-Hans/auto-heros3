@@ -1,11 +1,12 @@
-# obs-recorder — S0/S1a scaffold + S1b/S1c/S2a libobs media self-test
+# obs-recorder — S0/S1a scaffold + S1b/S1c/S2a/S3a libobs media self-test
 
 Native Windows host process (`obs-recorder.exe`, **S0/S1a**) that **inspects the
 installed OBS runtime via dynamic loading** and exposes a **local named-pipe
 JSON-lines IPC skeleton**, plus a second, opt-in executable
-(`obs-media-selftest.exe`, **S1b/S1c/S2a**, verified 2026-11-05) that **links
+(`obs-media-selftest.exe`, **S1b/S1c/S2a/S3a**, verified 2026-11-05) that **links
 libobs** and records synthetic media, a real WGC window, and/or a native raw-file
-audio source to **split Hybrid MP4** files.
+audio source to **split Hybrid MP4** files — one-shot CLI or through the S3a
+in-process named-pipe server.
 
 - S0/S1a scaffold: **verified 2026-11-05**, repo HEAD `88cf273` (branch
   `feature/av1b-vdd-wgc`); it never calls `obs_startup`/`obs_shutdown`, never
@@ -25,6 +26,15 @@ audio source to **split Hybrid MP4** files.
   window source in one scene/output. Still a synthetic Tk video + offline/raw
   test audio; **not live VCMI**, not wired into MCP/Python (see the S2a section
   below).
+- S2b live VCMI: **verified 2026-11-05**, repo HEAD `53453af`; the same S2a
+  pipeline was driven against a real VCMI client (`display_index=2`, live
+  `game-audio.raw`, default EOF) through MCP stdio + isolated temp state;
+  43/43 checks (`var/runs/obs-vcmi-live-s2b-20261105-173819/S2B_LIVE_REPORT.md`).
+- S3a IPC server: **verified 2026-11-05**, repo HEAD `53453af`;
+  `obs-media-selftest.exe --serve --pipe NAME` initialises libobs once and
+  exposes `hello/capabilities/prepare/start/status/stop/shutdown` over a named
+  pipe, reusing the S2a WGC + raw-audio + x264/AAC/MP4 pipeline (58/58 checks;
+  see the S3a section below).
 - The OBS GUI (`obs64.exe`) is never started by any tool in this directory.
 
 ## Verified capability summary (actual observations)
@@ -65,23 +75,24 @@ platform/obs-recorder/
   scripts/
     build.ps1                    # S0/S1a: vcvars64 + CMake/Ninja build, writes build_summary.json
     s0-smoke.ps1                 # reproducible S0 evidence run (build/capabilities/IPC)
-    gen-obs-sdk.ps1              # S1b/S1c/S2a: generate obs.lib + obsconfig.h from installed obs.dll
-    build-media-selftest.ps1     # S1b/S1c/S2a: build obs-media-selftest.exe (links libobs)
+    gen-obs-sdk.ps1              # S1b/S1c/S2a/S3a: generate obs.lib + obsconfig.h from installed obs.dll
+    build-media-selftest.ps1     # S1b/S1c/S2a/S3a: build obs-media-selftest.exe (links libobs)
     s1b-smoke.ps1                # S1b: build + record + ffprobe/ffmpeg validation, writes summary.json
     s1c-smoke.ps1                # S1c: WGC window capture + validation + explicit no-window failure run
     s2-smoke.ps1                 # S2a: WGC + raw-file audio, static/EOF/missing/growth runs + validation
+    s3a-ipc-smoke.ps1            # S3a: named-pipe IPC server hello/prepare/start/status/stop/shutdown + validation
     wgc-synthetic-window.py      # S1c/S2a: synthetic animated Tk window (no audio/game)
     gen-test-raw-tone.py         # S2a: offline s16le/44100/2 tone file / real-time appender (no playback)
   src/
     main.cpp                     # CLI modes + capabilities JSON assembly
-    json_util.hpp/.cpp           # minimal JSON writer
+    json_util.hpp/.cpp           # minimal JSON writer + flat JSON request extractors (S3a)
     win_util.hpp/.cpp            # paths, Windows version resources, OS info
     obs_probe.hpp/.cpp           # dynamic obs.dll load, symbol probe, SEH-guarded version calls
     ipc_pipe.hpp/.cpp            # named-pipe server + probe client + in-process self-test
     media/
       gen_av_source.hpp/.cpp     # S1b in-memory async AV source (I420 frames + float PCM)
       raw_audio_source.hpp/.cpp  # S2a async audio-only raw-file source (s16le → FLOAT_PLANAR)
-      media_selftest.cpp         # S1b/S1c/S2a obs-media-selftest.exe host
+      media_selftest.cpp         # S1b/S1c/S2a/S3a obs-media-selftest.exe host
 ```
 
 Build output (git-ignored): `platform/obs-recorder/build/`
@@ -505,17 +516,114 @@ Observed result of the verified run:
 See `var/runs/obs-wgc-audio-s2-20261105-172903/S2A_REPORT.md` for the full
 report (source design, per-file probes, all four run outcomes, limitations).
 
-## Remaining blockers / next steps after S1b/S1c/S2a
+## S3a named-pipe IPC server (`--serve --pipe`)
 
-1. **Live VCMI (S2b)**: run the real game via MCP `session_start(display_index=2)`,
-   point WGC at the actual VCMI window and `--audio-raw` at its live
-   `game-audio.raw`; verify battle content, real audio, window geometry and
-   source restart. Keep the no-monitoring/no-playback constraints.
-2. **Product integration**: expose start/stop/status through the existing
-   `obs-recorder` IPC and the MCP/Python recorder interface; keep the old Python
-   recorder as the only usable backend until that is verified end-to-end.
+Verified 2026-11-05 (repo HEAD `53453af`): **58/58 independent checks PASS**,
+evidence in `var/runs/obs-ipc-s3-20261105-181821/` (and the earlier
+`obs-vcmi-live-s2b-*` run for the live CLI path). It makes the media pipeline
+controllable through a named pipe **inside our own process**, with libobs
+initialised exactly once and torn down only at shutdown.
+
+What it does:
+
+1. `obs-media-selftest.exe --serve --pipe <name>` initialises libobs + base
+   modules + audio/video + `win-capture` once (`--pipe` default
+   `auto-heros3-media-<pid>`), prints `SERVE_READY … protocol=1`, and accepts a
+   byte-mode named-pipe JSON-lines client;
+2. commands `hello`, `capabilities`, `prepare`, `start`, `status`, `stop`,
+   `shutdown`; every response echoes `request_id` and a monotonic `seq`;
+   malformed/unknown/out-of-state requests return explicit
+   `error.code/error.message`;
+3. `prepare {out_dir, window_pid|window_title/class/exe, audio_raw,
+   max_time_sec?, duration_ms?}` validates/creates `out_dir`, validates the
+   window through libobs' helpers and stats the raw file, then moves to
+   `prepared`; missing window/raw are explicit errors;
+4. `start` builds the S2a WGC `window_capture` + `a3_raw_audio` sources in one
+   scene and starts the existing x264/AAC/`mp4_output` (split) pipeline; a
+   second `start` is idempotent (`already_running=true`);
+5. `status` reports `active`, `recording_elapsed_ms`, `auto_stop_in_ms`,
+   segments/files, output counters and raw-audio stats while recording;
+   `duration_ms>0` auto-stops and pushes an `event=auto_stop` line;
+6. `stop` stops/drains the output, writes `selftest.json` **and**
+   `manifest.json` (schema `s3a-ipc-manifest/1`) and returns the result;
+   repeated `stop` is idempotent (`already_stopped=true`);
+7. `shutdown` finalises any active recording, releases libobs objects, unloads
+   modules and exits 0.
+
+### S3a run / verification
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File platform\obs-recorder\scripts\s3a-ipc-smoke.ps1
+
+# server only
+platform\obs-recorder\build-media\bin\obs-media-selftest.exe --serve --pipe auto-heros3-test
+# then connect and send one JSON object per line, e.g.
+#   {"cmd":"hello","request_id":"r1"}
+#   {"cmd":"prepare","request_id":"r2","out_dir":"...","window_pid":1234,"audio_raw":"...","max_time_sec":2,"duration_ms":6000}
+#   {"cmd":"start","request_id":"r3"}
+#   {"cmd":"status","request_id":"r4"}
+#   {"cmd":"stop","request_id":"r5"}
+#   {"cmd":"shutdown","request_id":"r6"}
+```
+
+The smoke script starts a synthetic animated Tk window and a real-time growing
+s16le/44100/2 tone file, then drives two server sessions over a real
+`NamedPipeClientStream` (auto-stop and explicit-stop), validates all protocol
+responses/errors/idempotency, the produced MP4s and selftest/manifest, samples
+the live server process modules, and checks the audio endpoint before/after.
+
+Observed result of the verified run:
+
+| Item | Observed |
+|---|---|
+| Build | exe 303,616 B, SHA-256 `db1ce2e6…f64f4c0`; libobs 32.1.0; 1,782 SDK exports |
+| Protocol | 7 commands, protocol=1, `SERVE_READY`/`SERVE_EXIT` logs; request_id echoed; seq monotonic |
+| Explicit errors | `invalid_json`, `unsupported_command`, `not_prepared`, `window_not_found`, `audio_raw_not_found`, `already_prepared` all returned as `ok=false` + code |
+| Idempotency | second `start` → `already_running=true`; second `stop` → `already_stopped=true`; stop before prepare is ok/idempotent |
+| Scenario A (auto-stop 6 s) | status live: `recording, active=true, elapsed=1223 ms, auto_stop_in_ms=4776`; `auto_stop` event `report_rc=0 checks_ok=true files=3`; 3 MP4s 2.995/1.983/0.983 s |
+| Scenario B (manual stop) | 6.2 s then `stop` → `checks_ok=true`, files=3; 3 MP4s 2.995/1.983/1.200 s |
+| Files | every segment h264 1920×1080@60 + AAC 44100/2; `ffmpeg -v error` 0 errors |
+| Audio | every segment AAC max_volume −12.0…−11.6 dB (tone; >−40); raw source `start_at_zero=false`, `start_offset=529200`, `bytes_read=1,199,520`, `samples=299,880`, `monitoring=NONE` |
+| Video | YAVG 62.5–87.3, YMAX 236–241, framemd5 unique ~58–60/60 (non-black, changing) |
+| No device/playback | live server process: 98 modules, no MMDevAPI/audioses/wdmaud/win-wasapi; win-capture/libobs-winrt present; no obs64/UI/WebSocket/ffplay |
+| Endpoint | before/after identical (`Realtek USB Audio`, mute=false, volume=0.4) |
+| Cleanup | both servers exit 0, `CLEANUP obs_shutdown_done`, no leftover processes |
+| selftest/manifest | selftest status pass, mode `s3a-ipc-wgc-window-plus-raw-file-audio-to-split-mp4`; manifest status pass, report_exit_code 0, 3 files |
+
+### S3a limitations (still test/stand-in)
+
+1. **Single recording per process**: one prepare→start→stop lifecycle; a second
+   prepare returns `already_prepared/session_finished`; a new process is needed
+   for another recording. No reconnect/resume/multi-session.
+2. **One client at a time**; client disconnect while recording finalises the
+   recording (implemented, not separately tested). No authentication.
+3. **Synthetic inputs only in this run**: Tk window + real-time appended tone
+   raw; the real VCMI live path was proven for the CLI (S2b) but **not yet
+   driven over S3a IPC**.
+4. **Auto-stop is serviced at event-loop polling points** (~5–20 ms); a steady
+   request stream can defer it by one loop. Shutdown-while-recording exists but
+   is not separately tested.
+5. **No rollover/1.5 GB/long soak/crash recovery**; selftest/manifest are the
+   simplified S3a versions, not the product state machine.
+6. **Not the final product binary**: still `obs-media-selftest.exe`; the
+   S0/S1a `obs-recorder.exe` remains a separate scaffold. No MCP/Python client
+   library is added (per scope).
+7. The historical S0 smoke's `sdk_headers_absent` check is now false because
+   `vendor/obs-studio` headers are required for S1b+; S0 `build.ps1` still
+   exits 0 and its IPC checks still pass.
+
+## Remaining blockers / next steps after S1b/S1c/S2a/S3a
+
+1. **Product host + S3b**: move the S3a server into the final
+   `auto-heros3-recorder.exe` (single long-lived binary), connect it to the
+   product MCP/Python recorder, and keep the old Python recorder as the only
+   usable backend until end-to-end verification.
+2. **Real VCMI over IPC**: drive the S3a `prepare` with the live VCMI window/raw
+   sink (S2b recipe), add source restart/reconnect, and verify battle content
+   and long runs through the server.
 3. **Rollover/recovery**: size-triggered split (`max_size_mb`), 5–10 min+ soak,
-   crash-safe manifest/state machine, watchdog, clean restart.
+   crash-safe manifest/state machine, watchdog, clean restart; multi-recording
+   lifecycle on one process.
 4. **A/V acceptance**: real-content listening/visual checks, drift measurement,
    per-frame sync, not just container-level durations.
 5. **Distribution/licensing**: confirm GPL-2.0-or-later obligations for a host

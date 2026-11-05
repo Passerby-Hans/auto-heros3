@@ -12,6 +12,17 @@ namespace a3 {
 // Escape a UTF-8 string for inclusion inside JSON double quotes.
 std::string json_escape(const std::string& s);
 
+// Minimal flat-object extraction helpers for JSON-lines requests (S3a media
+// IPC).  They locate "key": ... at any depth of a flat object (the request
+// objects used here have no nested values); `found` reports whether the key was
+// present.  Return false only on malformed/typed-wrong values.
+bool json_extract_string(const std::string& line, const char* key, std::string* out,
+                         bool* found);
+bool json_extract_int(const std::string& line, const char* key, long long* out,
+                      bool* found);
+bool json_extract_bool(const std::string& line, const char* key, bool* out,
+                       bool* found);
+
 class JsonWriter {
 public:
     explicit JsonWriter(bool pretty = true, int indent = 2)

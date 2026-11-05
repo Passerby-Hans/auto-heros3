@@ -57,6 +57,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -252,6 +253,10 @@ struct Options {
     // S2a: raw VCMI game-audio.raw file as a native libobs audio source
     std::string audio_raw;            // empty => no raw audio source
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
+
+    // S3a: persistent named-pipe IPC server (libobs stays initialized)
+    bool serve = false;
+    std::string pipe_name;
 };
 
 struct Step {
@@ -364,6 +369,11 @@ struct State {
 
     // exit code to use when a specific step fails (0 => stage default)
     int failure_exit_code = 0;
+
+    // S3a IPC serve mode evidence
+    bool serve_mode = false;
+    std::string serve_pipe;
+    std::string serve_session_id;
 };
 
 // defined in the evidence/helpers section below
@@ -1409,7 +1419,7 @@ bool CreateWindowPipeline(State& s, const std::string& first_file_path)
     return CreateEncodersAndOutput(s, first_file_path);
 }
 
-bool RunOutput(State& s)
+bool StartOutput(State& s)
 {
     ResetSignalGlobals();
     s.total_frames_drawn_at_start = obs_get_total_frames();
@@ -1438,9 +1448,13 @@ bool RunOutput(State& s)
         s.output_last_error = CurrentOutputLastError(s.output);
         return false;
     }
+    return true;
+}
 
-    // Record for the requested duration.  The source thread keeps pushing
-    // frames/PCM for the whole time, including while the output drains.
+// CLI path: hold the output open for the requested duration.  IPC mode does not
+// use this; it keeps serving requests while the output runs.
+bool RecordForDuration(State& s)
+{
     const uint64_t run_deadline = s.t_output_active_ns + static_cast<uint64_t>(s.opt.duration_ms) * 1000000ULL;
     while (os_gettime_ns() < run_deadline) {
         if (!obs_output_active(s.output)) {
@@ -1454,7 +1468,15 @@ bool RunOutput(State& s)
     AddStep(s, "record_duration", true,
             std::to_string((os_gettime_ns() - s.t_output_active_ns) / 1000000ULL) + " ms requested=" +
                 std::to_string(s.opt.duration_ms) + " ms");
+    return true;
+}
 
+bool StopOutput(State& s)
+{
+    if (!s.output) {
+        AddStep(s, "output_stop_request", false, "no output object");
+        return false;
+    }
     s.total_frames_drawn_at_stop = obs_get_total_frames();
     s.lagged_frames_at_stop = obs_get_lagged_frames();
     s.output_total_bytes = obs_output_get_total_bytes(s.output);
@@ -1545,6 +1567,17 @@ bool RunOutput(State& s)
     AddStep(s, "split_files_ge_3", s.files.size() >= 3,
             std::to_string(s.files.size()) + " mp4 file(s) in " + s.opt.out_dir);
     return true;
+}
+
+bool RunOutput(State& s)
+{
+    if (!StartOutput(s)) {
+        return false;
+    }
+    if (!RecordForDuration(s)) {
+        return false;
+    }
+    return StopOutput(s);
 }
 
 void CollectFinalEvidence(State& s)
@@ -1647,10 +1680,12 @@ void WriteReport(State& s, int exit_code)
     w.key("tool");
     w.value_string("obs-media-selftest");
     w.key("mode");
-    w.value_string(s.opt.mode == RunMode::WindowWgc
-                       ? (s.audio_enabled ? "s2a-wgc-window-plus-raw-file-audio-to-split-mp4"
-                                          : "s1c-wgc-window-capture-to-split-mp4")
-                       : "s1b-in-memory-av-to-split-mp4");
+    w.value_string(s.serve_mode
+                       ? "s3a-ipc-wgc-window-plus-raw-file-audio-to-split-mp4"
+                       : (s.opt.mode == RunMode::WindowWgc
+                              ? (s.audio_enabled ? "s2a-wgc-window-plus-raw-file-audio-to-split-mp4"
+                                                 : "s1c-wgc-window-capture-to-split-mp4")
+                              : "s1b-in-memory-av-to-split-mp4"));
     w.key("status");
     w.value_string(exit_code == 0 ? "pass" : "fail");
     w.key("exit_code");
@@ -1677,11 +1712,15 @@ void WriteReport(State& s, int exit_code)
         w.key("graphics_module");
         w.value_string(s.graphics_module);
         w.key("run_mode");
-        w.value_string(s.opt.mode == RunMode::WindowWgc ? "window" : "in-memory");
+        w.value_string(s.serve_mode ? "serve" : (s.opt.mode == RunMode::WindowWgc ? "window" : "in-memory"));
         w.key("win_capture_module_loaded");
         w.value_bool(s.win_capture_module_loaded);
         w.key("raw_audio_enabled");
         w.value_bool(s.audio_enabled);
+        w.key("serve_mode");
+        w.value_bool(s.serve_mode);
+        w.key("serve_pipe");
+        w.value_string(s.serve_pipe);
     }
     w.end_object();
 
@@ -1741,6 +1780,22 @@ void WriteReport(State& s, int exit_code)
         w.value_int(2);
         w.key("chunk_frames");
         w.value_int(4410);
+        w.end_object();
+    }
+    if (s.serve_mode) {
+        w.key("ipc");
+        w.begin_object();
+        w.key("protocol");
+        w.value_int(1);
+        w.key("pipe");
+        w.value_string(s.serve_pipe);
+        w.key("session_id");
+        w.value_string(s.serve_session_id);
+        w.key("commands");
+        w.begin_array();
+        for (const char* c : {"hello", "capabilities", "prepare", "start", "status", "stop", "shutdown"})
+            w.value_string(c);
+        w.end_array();
         w.end_object();
     }
     w.end_object();
@@ -2033,6 +2088,1084 @@ void WriteReport(State& s, int exit_code)
 }
 
 // ---------------------------------------------------------------------------
+// S3a: named-pipe IPC server (libobs initialised once; one recording per process)
+// ---------------------------------------------------------------------------
+
+using a3::JsonWriter;
+using a3::json_extract_bool;
+using a3::json_extract_int;
+using a3::json_extract_string;
+
+enum class ServePhase { Idle, Prepared, Recording, Stopped, Failed };
+
+const char* ServePhaseName(ServePhase phase)
+{
+    switch (phase) {
+    case ServePhase::Idle:
+        return "idle";
+    case ServePhase::Prepared:
+        return "prepared";
+    case ServePhase::Recording:
+        return "recording";
+    case ServePhase::Stopped:
+        return "stopped";
+    case ServePhase::Failed:
+        return "failed";
+    }
+    return "unknown";
+}
+
+struct IpcRequest {
+    std::string raw;
+    std::string cmd;
+    bool has_request_id = false;
+    bool request_id_is_int = false;
+    std::string request_id;
+    long long request_id_int = 0;
+};
+
+struct ServeSession {
+    ServePhase phase = ServePhase::Idle;
+    bool shutdown = false;
+    bool ever_prepared = false;
+    bool ever_started = false;
+    bool checks_ok = false;
+    bool auto_stopped = false;
+    int report_rc = -1;
+    std::string last_error_code;
+    std::string last_error_message;
+    std::string session_id;
+    std::string pipe;
+    std::string selftest_path;
+    std::string manifest_path;
+    std::string started_utc;
+    std::string stopped_utc;
+    uint64_t started_ns = 0;
+    uint64_t auto_stop_deadline_ns = 0;
+    uint64_t serve_started_ns = 0;
+    int requests = 0;
+    int seq = 0;
+};
+
+struct IpcReply {
+    std::string line;
+    bool shutdown = false;
+};
+
+void WriteRequestId(JsonWriter& w, const IpcRequest& req)
+{
+    if (!req.has_request_id) {
+        w.value_null();
+    } else if (req.request_id_is_int) {
+        w.value_int(req.request_id_int);
+    } else {
+        w.value_string(req.request_id);
+    }
+}
+
+bool ParseIpcRequest(const std::string& raw, IpcRequest& req, std::string& err)
+{
+    req = IpcRequest{};
+    req.raw = raw;
+    std::size_t first = raw.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos || raw[first] != '{') {
+        err = "request is not a JSON object";
+        return false;
+    }
+    bool found = false;
+    if (!json_extract_string(raw, "cmd", &req.cmd, &found) || !found || req.cmd.empty()) {
+        err = "missing/invalid \"cmd\" (string required)";
+        return false;
+    }
+    std::string id;
+    if (!json_extract_string(raw, "request_id", &id, &found)) {
+        err = "invalid \"request_id\" (string)";
+        return false;
+    }
+    if (found) {
+        req.has_request_id = true;
+        req.request_id = id;
+    } else {
+        long long id_int = 0;
+        if (!json_extract_int(raw, "request_id", &id_int, &found)) {
+            err = "invalid \"request_id\"";
+            return false;
+        }
+        if (found) {
+            req.has_request_id = true;
+            req.request_id_is_int = true;
+            req.request_id_int = id_int;
+        }
+    }
+    return true;
+}
+
+std::string ReplyOk(ServeSession& sess, const IpcRequest& req, const char* state,
+                    const std::function<void(JsonWriter&)>& fill)
+{
+    JsonWriter w(false);
+    w.begin_object();
+    w.key("ok");
+    w.value_bool(true);
+    w.key("request_id");
+    WriteRequestId(w, req);
+    w.key("cmd");
+    w.value_string(req.cmd);
+    w.key("state");
+    w.value_string(state);
+    w.key("server");
+    w.value_string("obs-media-selftest");
+    w.key("protocol");
+    w.value_int(1);
+    w.key("seq");
+    w.value_int(++sess.seq);
+    if (fill)
+        fill(w);
+    w.end_object();
+    return w.str();
+}
+
+std::string ReplyError(ServeSession& sess, const IpcRequest& req, const std::string& code,
+                       const std::string& message)
+{
+    sess.last_error_code = code;
+    sess.last_error_message = message;
+    JsonWriter w(false);
+    w.begin_object();
+    w.key("ok");
+    w.value_bool(false);
+    w.key("request_id");
+    WriteRequestId(w, req);
+    w.key("cmd");
+    w.value_string(req.cmd);
+    w.key("state");
+    w.value_string(ServePhaseName(sess.phase));
+    w.key("server");
+    w.value_string("obs-media-selftest");
+    w.key("protocol");
+    w.value_int(1);
+    w.key("seq");
+    w.value_int(++sess.seq);
+    w.key("error");
+    w.begin_object();
+    w.key("code");
+    w.value_string(code);
+    w.key("message");
+    w.value_string(message);
+    w.end_object();
+    w.end_object();
+    return w.str();
+}
+
+bool GetStringArg(const IpcRequest& req, const char* key, std::string* out, bool* found,
+                  std::string& err)
+{
+    bool f = false;
+    if (!json_extract_string(req.raw, key, out, &f)) {
+        err = std::string("invalid \"") + key + "\" (string required)";
+        return false;
+    }
+    if (found)
+        *found = f;
+    return true;
+}
+
+bool GetIntArg(const IpcRequest& req, const char* key, long long* out, bool* found,
+               std::string& err)
+{
+    bool f = false;
+    if (!json_extract_int(req.raw, key, out, &f)) {
+        err = std::string("invalid \"") + key + "\" (integer required)";
+        return false;
+    }
+    if (found)
+        *found = f;
+    return true;
+}
+
+void WriteWindowJson(JsonWriter& w, const State& s)
+{
+    w.begin_object();
+    w.key("found");
+    w.value_bool(s.window_found);
+    w.key("hwnd");
+    w.value_uintptr(s.window_hwnd);
+    w.key("pid");
+    w.value_int(s.window_pid_found);
+    w.key("title");
+    w.value_string(s.window_title_found);
+    w.key("class");
+    w.value_string(s.window_class_found);
+    w.key("exe");
+    w.value_string(s.window_exe_found);
+    w.key("capture_width");
+    w.value_uint(s.capture_width);
+    w.key("capture_height");
+    w.value_uint(s.capture_height);
+    w.end_object();
+}
+
+void WriteRawAudioStatsJson(JsonWriter& w, const a3::RawAudioStats& st, bool enabled)
+{
+    w.begin_object();
+    w.key("enabled");
+    w.value_bool(enabled);
+    w.key("path");
+    w.value_string(st.path);
+    w.key("opened");
+    w.value_bool(st.opened);
+    w.key("open_error");
+    w.value_string(st.open_error);
+    w.key("open_attempts");
+    w.value_uint(st.open_attempts);
+    w.key("start_offset");
+    w.value_uint(st.start_offset);
+    w.key("file_size_at_open");
+    w.value_uint(st.file_size_at_open);
+    w.key("bytes_read");
+    w.value_uint(st.bytes_read);
+    w.key("frames_read");
+    w.value_uint(st.frames_read);
+    w.key("chunks_pushed");
+    w.value_uint(st.chunks_pushed);
+    w.key("silence_chunks");
+    w.value_uint(st.silence_chunks);
+    w.key("eof_waits");
+    w.value_uint(st.eof_waits);
+    w.key("samples_pushed");
+    w.value_uint(st.samples_pushed);
+    w.end_object();
+}
+
+void WriteSegmentsJson(JsonWriter& w, const std::vector<FileResult>& files)
+{
+    w.begin_array();
+    for (const auto& f : files) {
+        w.begin_object();
+        w.key("name");
+        w.value_string(f.name);
+        w.key("size_bytes");
+        w.value_uint(f.size);
+        w.key("mtime_unix");
+        w.value_uint(f.mtime_unix);
+        w.end_object();
+    }
+    w.end_array();
+}
+
+void WriteManifest(State& s, ServeSession& sess)
+{
+    JsonWriter w(true, 1);
+    w.begin_object();
+    w.key("tool");
+    w.value_string("obs-media-selftest");
+    w.key("schema");
+    w.value_string("s3a-ipc-manifest/1");
+    w.key("mode");
+    w.value_string("s3a-ipc-wgc-window-plus-raw-file-audio-to-split-mp4");
+    w.key("protocol");
+    w.value_int(1);
+    w.key("session_id");
+    w.value_string(sess.session_id);
+    w.key("pipe");
+    w.value_string(sess.pipe);
+    w.key("out_dir");
+    w.value_string(s.opt.out_dir);
+    w.key("status");
+    w.value_string(sess.checks_ok ? "pass" : "fail");
+    w.key("report_exit_code");
+    w.value_int(sess.report_rc);
+    w.key("started_utc");
+    w.value_string(sess.started_utc);
+    w.key("stopped_utc");
+    w.value_string(sess.stopped_utc);
+    w.key("auto_stopped");
+    w.value_bool(sess.auto_stopped);
+    w.key("requested");
+    w.begin_object();
+    w.key("duration_ms");
+    w.value_int(s.opt.duration_ms);
+    w.key("max_time_sec");
+    w.value_int(s.opt.max_time_sec);
+    w.key("window_pid");
+    w.value_int(s.opt.window_pid);
+    w.key("window_title");
+    w.value_string(s.opt.window_title);
+    w.key("window_class");
+    w.value_string(s.opt.window_class);
+    w.key("window_exe");
+    w.value_string(s.opt.window_exe);
+    w.key("audio_raw");
+    w.value_string(s.opt.audio_raw);
+    w.key("audio_start_zero");
+    w.value_bool(s.opt.audio_start_zero);
+    w.end_object();
+    w.key("window_capture");
+    WriteWindowJson(w, s);
+    w.key("raw_audio");
+    WriteRawAudioStatsJson(w, s.audio_stats, s.audio_enabled);
+    w.key("output");
+    w.begin_object();
+    w.key("total_bytes");
+    w.value_uint(s.output_total_bytes);
+    w.key("total_frames");
+    w.value_int(s.output_total_frames);
+    w.key("frames_dropped");
+    w.value_int(s.output_frames_dropped);
+    w.key("stop_code");
+    w.value_int(s.output_stop_code);
+    w.key("last_error");
+    w.value_string(s.output_last_error);
+    w.end_object();
+    w.key("files");
+    WriteSegmentsJson(w, s.files);
+    w.key("checks");
+    w.begin_array();
+    for (const auto& st : s.steps) {
+        w.begin_object();
+        w.key("name");
+        w.value_string(st.name);
+        w.key("ok");
+        w.value_bool(st.ok);
+        w.key("detail");
+        w.value_string(st.detail);
+        w.end_object();
+    }
+    w.end_array();
+    w.key("selftest");
+    w.value_string("selftest.json");
+    w.end_object();
+    sess.manifest_path = JoinPath(s.opt.out_dir, "manifest.json");
+    FILE* f = nullptr;
+    if (fopen_s(&f, sess.manifest_path.c_str(), "wb") == 0 && f) {
+        std::string text = w.str() + "\n";
+        std::fwrite(text.data(), 1, text.size(), f);
+        std::fclose(f);
+    }
+    std::printf("IPC_MANIFEST path=%s files=%zu status=%s\n", sess.manifest_path.c_str(),
+                s.files.size(), sess.checks_ok ? "pass" : "fail");
+    std::fflush(stdout);
+}
+
+bool ServeFinishRecording(ServeSession& sess, State& s, bool auto_stop, std::string& error)
+{
+    if (sess.phase != ServePhase::Recording) {
+        return true;
+    }
+    sess.stopped_utc = UtcNowIso();
+    sess.auto_stopped = auto_stop;
+    const bool stop_ok = StopOutput(s);
+    s.files = ListMp4Files(s.opt.out_dir);
+    CollectFinalEvidence(s);
+    sess.checks_ok = AllStepsOk(s);
+    sess.report_rc = stop_ok ? (sess.checks_ok ? 0 : 6) : 5;
+    WriteReport(s, sess.report_rc);
+    sess.selftest_path = JoinPath(s.opt.out_dir, "selftest.json");
+    WriteManifest(s, sess);
+    sess.phase = ServePhase::Stopped;
+    if (!stop_ok) {
+        error = "output stop/drain failed; see selftest.json";
+        sess.last_error_code = "output_stop_failed";
+        sess.last_error_message = error;
+    }
+    return stop_ok;
+}
+
+std::string ServeHello(ServeSession& sess, State& s, const IpcRequest& req)
+{
+    return ReplyOk(sess, req, ServePhaseName(sess.phase), [&](JsonWriter& w) {
+        w.key("version");
+        w.value_string("0.4.0-s3a");
+        w.key("obs_version");
+        w.value_string(s.obs_version);
+        w.key("obs_api_version");
+        w.value_int(s.obs_api_version);
+        w.key("pid");
+        w.value_uint(GetCurrentProcessId());
+        w.key("pipe");
+        w.value_string(sess.pipe);
+        w.key("commands");
+        w.begin_array();
+        for (const char* c : {"hello", "capabilities", "prepare", "start", "status", "stop", "shutdown"})
+            w.value_string(c);
+        w.end_array();
+        w.key("capabilities");
+        w.begin_object();
+        w.key("wgc_window_capture");
+        w.value_bool(true);
+        w.key("raw_file_audio");
+        w.value_bool(true);
+        w.key("x264");
+        w.value_bool(true);
+        w.key("aac");
+        w.value_bool(true);
+        w.key("hybrid_mp4");
+        w.value_bool(true);
+        w.key("split_file");
+        w.value_bool(true);
+        w.key("auto_stop_duration_ms");
+        w.value_bool(true);
+        w.end_object();
+        w.key("constraints");
+        w.begin_object();
+        w.key("no_obs_ui");
+        w.value_bool(true);
+        w.key("no_websocket");
+        w.value_bool(true);
+        w.key("no_audio_device");
+        w.value_bool(true);
+        w.key("no_playback");
+        w.value_bool(true);
+        w.key("single_recording_per_process");
+        w.value_bool(true);
+        w.end_object();
+        w.key("win_capture_module_loaded");
+        w.value_bool(s.win_capture_module_loaded);
+    });
+}
+
+std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
+{
+    // If the output died without an explicit stop, finalise now (explicit error).
+    if (sess.phase == ServePhase::Recording && s.output && !obs_output_active(s.output)) {
+        std::string err = "output became inactive without a stop request";
+        sess.last_error_code = "output_stopped_unexpectedly";
+        sess.last_error_message = err;
+        ServeFinishRecording(sess, s, false, err);
+    }
+    if (!s.opt.out_dir.empty() && fs::is_directory(Utf8ToWide(s.opt.out_dir))) {
+        s.files = ListMp4Files(s.opt.out_dir);
+    }
+    const bool active =
+        sess.phase == ServePhase::Recording && s.output && obs_output_active(s.output);
+    return ReplyOk(sess, req, ServePhaseName(sess.phase), [&](JsonWriter& w) {
+        w.key("active");
+        w.value_bool(active);
+        w.key("uptime_ms");
+        w.value_uint((os_gettime_ns() - sess.serve_started_ns) / 1000000ULL);
+        w.key("requests");
+        w.value_int(sess.requests);
+        w.key("session_id");
+        w.value_string(sess.session_id);
+        w.key("out_dir");
+        w.value_string(s.opt.out_dir);
+        w.key("window");
+        WriteWindowJson(w, s);
+        w.key("audio_raw");
+        w.begin_object();
+        w.key("path");
+        w.value_string(s.opt.audio_raw);
+        w.key("start_at_zero");
+        w.value_bool(s.opt.audio_start_zero);
+        w.key("max_time_sec");
+        w.value_int(s.opt.max_time_sec);
+        w.key("duration_ms");
+        w.value_int(s.opt.duration_ms);
+        w.end_object();
+        w.key("recording_elapsed_ms");
+        w.value_uint(sess.started_ns ? (os_gettime_ns() - sess.started_ns) / 1000000ULL : 0);
+        w.key("auto_stop_in_ms");
+        if (sess.auto_stop_deadline_ns && sess.phase == ServePhase::Recording) {
+            const uint64_t now = os_gettime_ns();
+            const uint64_t remaining =
+                sess.auto_stop_deadline_ns > now ? sess.auto_stop_deadline_ns - now : 0;
+            w.value_int(static_cast<long long>(remaining / 1000000ULL));
+        } else {
+            w.value_null();
+        }
+        w.key("segments");
+        WriteSegmentsJson(w, s.files);
+        w.key("segment_count");
+        w.value_uint(s.files.size());
+        w.key("output");
+        w.begin_object();
+        w.key("total_bytes");
+        w.value_uint(s.output ? obs_output_get_total_bytes(s.output) : 0);
+        w.key("total_frames");
+        w.value_int(s.output ? obs_output_get_total_frames(s.output) : 0);
+        w.key("frames_dropped");
+        w.value_int(s.output ? obs_output_get_frames_dropped(s.output) : 0);
+        w.key("last_error");
+        w.value_string(s.output_last_error);
+        w.end_object();
+        w.key("raw_audio");
+        const a3::RawAudioStats stats = a3::GetRawAudioStats();
+        WriteRawAudioStatsJson(w, stats, s.audio_enabled);
+        w.key("result");
+        w.begin_object();
+        w.key("available");
+        w.value_bool(sess.report_rc >= 0);
+        w.key("report_exit_code");
+        w.value_int(sess.report_rc);
+        w.key("checks_ok");
+        w.value_bool(sess.checks_ok);
+        w.key("auto_stopped");
+        w.value_bool(sess.auto_stopped);
+        w.key("selftest");
+        w.value_string(sess.selftest_path);
+        w.key("manifest");
+        w.value_string(sess.manifest_path);
+        w.end_object();
+        w.key("last_error");
+        w.begin_object();
+        w.key("code");
+        w.value_string(sess.last_error_code);
+        w.key("message");
+        w.value_string(sess.last_error_message);
+        w.end_object();
+    });
+}
+
+std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
+{
+    if (sess.phase != ServePhase::Idle) {
+        return ReplyError(sess, req, sess.phase == ServePhase::Prepared ? "already_prepared"
+                                                                       : "session_finished",
+                          std::string("prepare is only allowed once per process; current state=") +
+                              ServePhaseName(sess.phase));
+    }
+    std::string err;
+    std::string out_dir;
+    bool found = false;
+    if (!GetStringArg(req, "out_dir", &out_dir, &found, err) || !found || out_dir.empty()) {
+        return ReplyError(sess, req, "invalid_args",
+                          found ? "\"out_dir\" is required" : (err.empty() ? "\"out_dir\" is required" : err));
+    }
+    std::string audio_raw;
+    found = false;
+    if (!GetStringArg(req, "audio_raw", &audio_raw, &found, err) || !found || audio_raw.empty()) {
+        return ReplyError(sess, req, "invalid_args",
+                          found ? "\"audio_raw\" is required" : (err.empty() ? "\"audio_raw\" is required" : err));
+    }
+    std::string title, cls, exe;
+    bool f = false;
+    if (!GetStringArg(req, "window_title", &title, &f, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (!GetStringArg(req, "window_class", &cls, &f, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (!GetStringArg(req, "window_exe", &exe, &f, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    long long pid = 0;
+    found = false;
+    if (!GetIntArg(req, "window_pid", &pid, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (pid < 0)
+        return ReplyError(sess, req, "invalid_args", "\"window_pid\" must be >= 0");
+    long long max_time = 3;
+    found = false;
+    if (!GetIntArg(req, "max_time_sec", &max_time, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (found && (max_time < 1 || max_time > 3600))
+        return ReplyError(sess, req, "invalid_args", "\"max_time_sec\" must be 1..3600");
+    long long duration_ms = 0;
+    found = false;
+    if (!GetIntArg(req, "duration_ms", &duration_ms, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (found && (duration_ms < 0 || duration_ms > 86400000LL))
+        return ReplyError(sess, req, "invalid_args", "\"duration_ms\" must be 0..86400000 (0=manual stop)");
+    if (pid <= 0 && title.empty() && cls.empty() && exe.empty())
+        return ReplyError(sess, req, "invalid_args",
+                          "a window target is required (window_pid or window_title/class/exe)");
+    if (!EnsureDir(out_dir))
+        return ReplyError(sess, req, "invalid_out_dir", "cannot create out_dir: " + out_dir);
+    if (!FileExists(audio_raw))
+        return ReplyError(sess, req, "audio_raw_not_found",
+                          "audio_raw file does not exist: " + audio_raw);
+    std::error_code ec;
+    const uintmax_t audio_size = fs::file_size(Utf8ToWide(audio_raw), ec);
+    if (ec)
+        return ReplyError(sess, req, "audio_raw_unreadable",
+                          "cannot stat audio_raw: " + audio_raw + " (" + ec.message() + ")");
+
+    // Fresh per-recording evidence.
+    s.steps.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_events_mutex);
+        g_events.clear();
+    }
+    s.files.clear();
+    s.failure_exit_code = 0;
+    s.window_found = false;
+    s.window_hwnd = 0;
+    s.window_pid_found = 0;
+    s.window_title_found.clear();
+    s.window_class_found.clear();
+    s.window_exe_found.clear();
+    s.window_lookup.clear();
+    s.capture_width = 0;
+    s.capture_height = 0;
+    s.capture_proc_hooked = false;
+    s.capture_signal_hooked = false;
+    s.audio_enabled = false;
+    s.audio_stats = a3::RawAudioStats{};
+
+    s.opt.out_dir = out_dir;
+    s.opt.audio_raw = audio_raw;
+    s.opt.audio_start_zero = false; // live semantics: default EOF
+    s.opt.window_title = title;
+    s.opt.window_class = cls;
+    s.opt.window_exe = exe;
+    s.opt.window_pid = static_cast<int>(pid);
+    s.opt.max_time_sec = static_cast<int>(max_time);
+    s.opt.duration_ms = static_cast<int>(duration_ms);
+    s.opt.json_out.clear();
+    s.opt.mode = RunMode::WindowWgc;
+
+    if (!FindTargetWindow(s)) {
+        return ReplyError(sess, req, "window_not_found", s.window_lookup);
+    }
+
+    char stamp[64];
+    std::time_t now = std::time(nullptr);
+    std::tm tm_now = {};
+    localtime_s(&tm_now, &now);
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_now);
+    sess.session_id = std::string("s3a-") + stamp + "-" + std::to_string(GetCurrentProcessId());
+    s.serve_session_id = sess.session_id;
+    sess.ever_prepared = true;
+    sess.phase = ServePhase::Prepared;
+    sess.last_error_code.clear();
+    sess.last_error_message.clear();
+
+    return ReplyOk(sess, req, "prepared", [&](JsonWriter& w) {
+        w.key("prepared");
+        w.value_bool(true);
+        w.key("session_id");
+        w.value_string(sess.session_id);
+        w.key("out_dir");
+        w.value_string(s.opt.out_dir);
+        w.key("window");
+        WriteWindowJson(w, s);
+        w.key("audio_raw");
+        w.begin_object();
+        w.key("path");
+        w.value_string(audio_raw);
+        w.key("size_bytes");
+        w.value_uint(audio_size);
+        w.key("start_at_zero");
+        w.value_bool(false);
+        w.end_object();
+        w.key("max_time_sec");
+        w.value_int(s.opt.max_time_sec);
+        w.key("duration_ms");
+        w.value_int(s.opt.duration_ms);
+        w.key("auto_stop");
+        w.value_bool(s.opt.duration_ms > 0);
+        w.key("note");
+        w.value_string("start not called yet; window/raw were validated now and will be re-checked at start");
+    });
+}
+
+std::string ServeStart(ServeSession& sess, State& s, const IpcRequest& req)
+{
+    if (sess.phase == ServePhase::Recording) {
+        return ReplyOk(sess, req, "recording", [&](JsonWriter& w) {
+            w.key("already_running");
+            w.value_bool(true);
+            w.key("active");
+            w.value_bool(true);
+            w.key("session_id");
+            w.value_string(sess.session_id);
+            w.key("out_dir");
+            w.value_string(s.opt.out_dir);
+            w.key("recording_elapsed_ms");
+            w.value_uint((os_gettime_ns() - sess.started_ns) / 1000000ULL);
+        });
+    }
+    if (sess.phase != ServePhase::Prepared) {
+        return ReplyError(sess, req, sess.phase == ServePhase::Idle ? "not_prepared" : "session_finished",
+                          std::string("start needs a prepared session; current state=") +
+                              ServePhaseName(sess.phase));
+    }
+    const std::string first_file = JoinPath(s.opt.out_dir, "clip-000.mp4");
+    if (!CreateWindowPipeline(s, first_file)) {
+        sess.phase = ServePhase::Failed;
+        const int rc = s.failure_exit_code;
+        std::string code = "pipeline_failed";
+        if (rc == 7)
+            code = "window_not_found";
+        else if (rc == 8)
+            code = "capture_failed";
+        else if (rc == 9)
+            code = "audio_source_failed";
+        std::string msg = "failed to create the WGC+raw-audio pipeline (see server stdout)";
+        for (const auto& st : s.steps) {
+            if (!st.ok) {
+                msg = st.name + ": " + st.detail;
+                break;
+            }
+        }
+        return ReplyError(sess, req, code, msg);
+    }
+    if (!StartOutput(s)) {
+        sess.phase = ServePhase::Failed;
+        return ReplyError(sess, req, "output_start_failed", s.output_last_error.empty()
+                                                                  ? "obs_output_start/active failed"
+                                                                  : s.output_last_error);
+    }
+    sess.ever_started = true;
+    sess.phase = ServePhase::Recording;
+    sess.last_error_code.clear();
+    sess.last_error_message.clear();
+    sess.started_ns = os_gettime_ns();
+    sess.started_utc = UtcNowIso();
+    sess.auto_stop_deadline_ns =
+        s.opt.duration_ms > 0 ? sess.started_ns + static_cast<uint64_t>(s.opt.duration_ms) * 1000000ULL : 0;
+    AddStep(s, "ipc_start", true,
+            "started via named-pipe IPC session=" + sess.session_id + " auto_stop=" +
+                (s.opt.duration_ms > 0 ? std::to_string(s.opt.duration_ms) + " ms" : "manual"));
+    return ReplyOk(sess, req, "recording", [&](JsonWriter& w) {
+        w.key("already_running");
+        w.value_bool(false);
+        w.key("active");
+        w.value_bool(true);
+        w.key("session_id");
+        w.value_string(sess.session_id);
+        w.key("out_dir");
+        w.value_string(s.opt.out_dir);
+        w.key("window");
+        WriteWindowJson(w, s);
+        w.key("audio_raw");
+        w.begin_object();
+        w.key("path");
+        w.value_string(s.opt.audio_raw);
+        w.key("start_at_zero");
+        w.value_bool(false);
+        w.end_object();
+        w.key("max_time_sec");
+        w.value_int(s.opt.max_time_sec);
+        w.key("duration_ms");
+        w.value_int(s.opt.duration_ms);
+        w.key("auto_stop");
+        w.value_bool(s.opt.duration_ms > 0);
+        w.key("recording_started_utc");
+        w.value_string(sess.started_utc);
+    });
+}
+
+std::string ServeStop(ServeSession& sess, State& s, const IpcRequest& req)
+{
+    if (sess.phase == ServePhase::Recording) {
+        std::string error;
+        const bool stop_ok = ServeFinishRecording(sess, s, false, error);
+        if (!stop_ok) {
+            return ReplyError(sess, req, "output_stop_failed", error);
+        }
+        sess.last_error_code.clear();
+        sess.last_error_message.clear();
+        return ReplyOk(sess, req, "stopped", [&](JsonWriter& w) {
+            w.key("already_stopped");
+            w.value_bool(false);
+            w.key("active");
+            w.value_bool(false);
+            w.key("session_id");
+            w.value_string(sess.session_id);
+            w.key("out_dir");
+            w.value_string(s.opt.out_dir);
+            w.key("report_exit_code");
+            w.value_int(sess.report_rc);
+            w.key("checks_ok");
+            w.value_bool(sess.checks_ok);
+            w.key("auto_stopped");
+            w.value_bool(sess.auto_stopped);
+            w.key("selftest");
+            w.value_string(sess.selftest_path);
+            w.key("manifest");
+            w.value_string(sess.manifest_path);
+            w.key("files");
+            WriteSegmentsJson(w, s.files);
+            if (!stop_ok) {
+                w.key("stop_error");
+                w.value_string(error);
+            }
+        });
+    }
+    if (sess.phase == ServePhase::Prepared) {
+        sess.phase = ServePhase::Stopped;
+        sess.checks_ok = false;
+        sess.report_rc = -1;
+        sess.stopped_utc = UtcNowIso();
+        WriteManifest(s, sess);
+        sess.selftest_path.clear();
+    }
+    sess.last_error_code.clear();
+    sess.last_error_message.clear();
+    return ReplyOk(sess, req, ServePhaseName(sess.phase), [&](JsonWriter& w) {
+        w.key("already_stopped");
+        w.value_bool(true);
+        w.key("active");
+        w.value_bool(false);
+        w.key("session_id");
+        w.value_string(sess.session_id);
+        w.key("out_dir");
+        w.value_string(s.opt.out_dir);
+        w.key("report_exit_code");
+        w.value_int(sess.report_rc);
+        w.key("checks_ok");
+        w.value_bool(sess.checks_ok);
+        w.key("selftest");
+        w.value_string(sess.selftest_path);
+        w.key("manifest");
+        w.value_string(sess.manifest_path);
+        w.key("files");
+        WriteSegmentsJson(w, s.files);
+    });
+}
+
+std::string ServeShutdown(ServeSession& sess, State& s, const IpcRequest& req)
+{
+    if (sess.phase == ServePhase::Recording) {
+        std::string error;
+        ServeFinishRecording(sess, s, false, error);
+    } else if (sess.phase == ServePhase::Prepared) {
+        sess.phase = ServePhase::Stopped;
+        sess.stopped_utc = UtcNowIso();
+        WriteManifest(s, sess);
+    }
+    sess.last_error_code.clear();
+    sess.last_error_message.clear();
+    std::string line = ReplyOk(sess, req, "shutdown", [&](JsonWriter& w) {
+        w.key("shutting_down");
+        w.value_bool(true);
+        w.key("session_id");
+        w.value_string(sess.session_id);
+        w.key("report_exit_code");
+        w.value_int(sess.report_rc);
+        w.key("checks_ok");
+        w.value_bool(sess.checks_ok);
+        w.key("selftest");
+        w.value_string(sess.selftest_path);
+        w.key("manifest");
+        w.value_string(sess.manifest_path);
+        w.key("files");
+        WriteSegmentsJson(w, s.files);
+    });
+    sess.shutdown = true;
+    return line;
+}
+
+IpcReply HandleIpcLine(ServeSession& sess, State& s, const std::string& line)
+{
+    IpcReply reply;
+    IpcRequest req;
+    std::string err;
+    if (!ParseIpcRequest(line, req, err)) {
+        req.raw = line;
+        req.cmd = "";
+        reply.line = ReplyError(sess, req, "invalid_json", err);
+        return reply;
+    }
+    ++sess.requests;
+    std::string id_text = "<none>";
+    if (req.has_request_id) {
+        id_text = req.request_id_is_int ? std::to_string(req.request_id_int) : req.request_id;
+    }
+    std::printf("IPC_REQ seq=%d cmd=%s request_id=%s\n", sess.requests, req.cmd.c_str(),
+                id_text.c_str());
+    std::fflush(stdout);
+    if (req.cmd == "hello" || req.cmd == "capabilities") {
+        reply.line = ServeHello(sess, s, req);
+    } else if (req.cmd == "prepare") {
+        reply.line = ServePrepare(sess, s, req);
+    } else if (req.cmd == "start") {
+        reply.line = ServeStart(sess, s, req);
+    } else if (req.cmd == "status") {
+        reply.line = ServeStatus(sess, s, req);
+    } else if (req.cmd == "stop") {
+        reply.line = ServeStop(sess, s, req);
+    } else if (req.cmd == "shutdown") {
+        reply.line = ServeShutdown(sess, s, req);
+        reply.shutdown = true;
+    } else {
+        reply.line = ReplyError(sess, req, "unsupported_command",
+                                "unknown command '" + req.cmd +
+                                    "'; supported: hello, capabilities, prepare, start, status, stop, shutdown");
+    }
+    std::printf("IPC_RESP seq=%d cmd=%s state=%s shutdown=%d\n", sess.seq, req.cmd.c_str(),
+                ServePhaseName(sess.phase), reply.shutdown ? 1 : 0);
+    std::fflush(stdout);
+    return reply;
+}
+
+bool PipeWrite(HANDLE pipe, const std::string& text)
+{
+    std::string payload = text + "\n";
+    DWORD written = 0;
+    return WriteFile(pipe, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) &&
+           written == payload.size();
+}
+
+std::string NormalizePipeName(const std::string& requested)
+{
+    std::string name = requested;
+    if (name.empty()) {
+        name = "auto-heros3-media-" + std::to_string(GetCurrentProcessId());
+    }
+    const std::string prefix = "\\\\.\\pipe\\";
+    std::string leaf = name;
+    if (leaf.rfind(prefix, 0) == 0) {
+        leaf = leaf.substr(prefix.size());
+    }
+    for (char c : leaf) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!(std::isalnum(uc) || c == '-' || c == '_' || c == '.')) {
+            return "";
+        }
+    }
+    return leaf.empty() ? "" : prefix + leaf;
+}
+
+int RunServeMode(State& s, const std::string& requested_pipe)
+{
+    const std::string pipe_path = NormalizePipeName(requested_pipe);
+    if (pipe_path.empty()) {
+        std::fprintf(stderr, "invalid pipe name: %s\n", requested_pipe.c_str());
+        return 2;
+    }
+    ServeSession sess;
+    sess.pipe = pipe_path;
+    sess.serve_started_ns = os_gettime_ns();
+    s.serve_mode = true;
+    s.serve_pipe = pipe_path;
+    s.opt.serve = true;
+    a3::RegisterRawAudioSource();
+
+    const std::wstring wpipe = Utf8ToWide(pipe_path);
+    HANDLE pipe = CreateNamedPipeW(wpipe.c_str(), PIPE_ACCESS_DUPLEX,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 65536,
+                                   65536, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        std::fprintf(stderr, "CreateNamedPipeW failed: %s (win32 %lu)\n", pipe_path.c_str(),
+                     GetLastError());
+        return 3;
+    }
+    std::printf("SERVE_READY pipe=%s pid=%lu protocol=1 obs=%s session_scope=single-recording\n",
+                pipe_path.c_str(), GetCurrentProcessId(), s.obs_version.c_str());
+    std::printf("SERVE_COMMANDS hello capabilities prepare start status stop shutdown\n");
+    std::fflush(stdout);
+
+    int exit_rc = 0;
+    bool stop_serving = false;
+    while (!stop_serving) {
+        const BOOL connected = ConnectNamedPipe(pipe, nullptr);
+        if (!connected) {
+            const DWORD err = GetLastError();
+            if (err != ERROR_PIPE_CONNECTED) {
+                std::printf("SERVE_CLIENT connect_error win32=%lu\n", err);
+                std::fflush(stdout);
+                continue;
+            }
+        }
+        std::printf("SERVE_CLIENT connected requests_so_far=%d\n", sess.requests);
+        std::fflush(stdout);
+
+        std::string rx;
+        bool client_gone = false;
+        while (!stop_serving && !client_gone) {
+            // Auto-stop timer is serviced even while no request is in flight.
+            if (sess.phase == ServePhase::Recording && sess.auto_stop_deadline_ns &&
+                os_gettime_ns() >= sess.auto_stop_deadline_ns) {
+                std::string error;
+                ServeFinishRecording(sess, s, true, error);
+                std::printf("IPC_EVENT auto_stop state=%s report_rc=%d checks_ok=%d files=%zu\n",
+                            ServePhaseName(sess.phase), sess.report_rc, sess.checks_ok ? 1 : 0,
+                            s.files.size());
+                std::fflush(stdout);
+                JsonWriter ev(false);
+                ev.begin_object();
+                ev.key("event");
+                ev.value_string("auto_stop");
+                ev.key("ok");
+                ev.value_bool(sess.report_rc == 0);
+                ev.key("state");
+                ev.value_string(ServePhaseName(sess.phase));
+                ev.key("session_id");
+                ev.value_string(sess.session_id);
+                ev.key("report_exit_code");
+                ev.value_int(sess.report_rc);
+                ev.key("checks_ok");
+                ev.value_bool(sess.checks_ok);
+                ev.key("selftest");
+                ev.value_string(sess.selftest_path);
+                ev.key("manifest");
+                ev.value_string(sess.manifest_path);
+                ev.key("files");
+                WriteSegmentsJson(ev, s.files);
+                ev.end_object();
+                PipeWrite(pipe, ev.str());
+            }
+
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {
+                const DWORD err = GetLastError();
+                if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED ||
+                    err == ERROR_NO_DATA) {
+                    std::printf("SERVE_CLIENT disconnected win32=%lu\n", err);
+                    std::fflush(stdout);
+                    client_gone = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            if (avail == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            char buf[4096];
+            DWORD got = 0;
+            if (!ReadFile(pipe, buf, sizeof(buf), &got, nullptr)) {
+                std::printf("SERVE_CLIENT read_error win32=%lu\n", GetLastError());
+                std::fflush(stdout);
+                client_gone = true;
+                break;
+            }
+            rx.append(buf, got);
+            if (rx.size() > 1000000) {
+                PipeWrite(pipe, R"({"ok":false,"request_id":null,"cmd":"","error":{"code":"line_too_long","message":"request line exceeds 1 MB"}})");
+                rx.clear();
+                continue;
+            }
+            std::size_t pos = 0;
+            while ((pos = rx.find('\n')) != std::string::npos) {
+                std::string line = rx.substr(0, pos);
+                rx.erase(0, pos + 1);
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                    line.pop_back();
+                if (line.empty())
+                    continue;
+                IpcReply reply = HandleIpcLine(sess, s, line);
+                if (!reply.line.empty()) {
+                    if (!PipeWrite(pipe, reply.line)) {
+                        client_gone = true;
+                        break;
+                    }
+                }
+                if (reply.shutdown) {
+                    stop_serving = true;
+                    exit_rc = 0;
+                    break;
+                }
+            }
+        }
+        if (client_gone && !stop_serving && sess.phase == ServePhase::Recording) {
+            std::string error;
+            sess.last_error_code = "client_disconnected";
+            sess.last_error_message = "IPC client disconnected while recording; recording was stopped";
+            ServeFinishRecording(sess, s, false, error);
+            std::printf("IPC_EVENT client_disconnected_finalized report_rc=%d\n", sess.report_rc);
+            std::fflush(stdout);
+        }
+        DisconnectNamedPipe(pipe);
+    }
+    CloseHandle(pipe);
+    std::printf("SERVE_EXIT rc=%d requests=%d state=%s\n", exit_rc, sess.requests,
+                ServePhaseName(sess.phase));
+    std::fflush(stdout);
+    return exit_rc;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -2052,6 +3185,8 @@ void PrintUsage()
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
+                "  --serve              S3a: run the named-pipe IPC server (libobs stays initialized)\n"
+                "  --pipe NAME          S3a: pipe name (default auto-heros3-media-<pid>)\n"
                 "exit codes: 0 ok, 2 usage, 3 obs/module init, 4 pipeline, 5 output run,\n"
                 "            6 checks, 7 window_not_found, 8 capture/not-WGC failure,\n"
                 "            9 raw audio source failure\n");
@@ -2106,6 +3241,10 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.max_time_explicit = true;
         } else if (a == "--json-out") {
             opt.json_out = next("--json-out");
+        } else if (a == "--serve") {
+            opt.serve = true;
+        } else if (a == "--pipe") {
+            opt.pipe_name = next("--pipe");
         } else if (a == "--help" || a == "-h") {
             PrintUsage();
             exit_code = 0;
@@ -2119,6 +3258,23 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
         if (exit_code != 0) {
             return false;
         }
+    }
+    if (opt.serve) {
+        // S3a: one process initialises libobs once and serves the single-recording
+        // lifecycle over a named pipe.  out_dir/window/audio come from `prepare`.
+        opt.mode = RunMode::WindowWgc;
+        if (!opt.duration_explicit) {
+            opt.duration_ms = 8000;
+        }
+        if (!opt.max_time_explicit) {
+            opt.max_time_sec = 3;
+        }
+        if (!opt.audio_raw.empty()) {
+            std::fprintf(stderr, "--audio-raw is supplied by the IPC prepare command, not on the CLI in --serve mode\n");
+            exit_code = 2;
+            return false;
+        }
+        return true;
     }
     if (opt.mode == RunMode::WindowWgc) {
         if (!opt.duration_explicit) {
@@ -2186,10 +3342,28 @@ int main(int argc, char** argv)
     InstallLogCapture();
 
     std::printf("obs-media-selftest: libobs=linked mode=%s obs_dir=%s out_dir=%s duration_ms=%d max_time_sec=%d\n",
-                state.opt.mode == RunMode::WindowWgc ? "window" : "in-memory",
+                state.opt.serve ? "serve" : (state.opt.mode == RunMode::WindowWgc ? "window" : "in-memory"),
                 state.opt.obs_dir.c_str(), state.opt.out_dir.c_str(), state.opt.duration_ms,
                 state.opt.max_time_sec);
     std::fflush(stdout);
+
+    // S3a: persistent IPC server.  libobs is initialised exactly once here and
+    // torn down only by Cleanup() after the shutdown command / server exit.
+    if (state.opt.serve) {
+        state.serve_mode = true;
+        state.opt.mode = RunMode::WindowWgc;
+        int rc = 0;
+        if (!InitObs(state)) {
+            rc = state.failure_exit_code ? state.failure_exit_code : 3;
+        } else {
+            rc = RunServeMode(state, state.opt.pipe_name);
+        }
+        Cleanup(state);
+        UninstallLogCapture();
+        std::printf("SERVE_EXIT_CODE %d\n", rc);
+        std::fflush(stdout);
+        return rc;
+    }
 
     if (!EnsureDir(state.opt.out_dir)) {
         std::fprintf(stderr, "cannot create out dir: %s\n", state.opt.out_dir.c_str());

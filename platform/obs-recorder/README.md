@@ -1,14 +1,21 @@
-# obs-recorder — S0/S1a native host scaffold
+# obs-recorder — S0/S1a native host scaffold + S1b libobs media self-test
 
-Native Windows host process (`obs-recorder.exe`) that **inspects the installed OBS
-runtime via dynamic loading** and exposes a **local named-pipe JSON-lines IPC
-skeleton**. This is deliberately *not* a recorder yet.
+Native Windows host process (`obs-recorder.exe`, **S0/S1a**) that **inspects the
+installed OBS runtime via dynamic loading** and exposes a **local named-pipe
+JSON-lines IPC skeleton**, plus a second, opt-in executable
+(`obs-media-selftest.exe`, **S1b**, verified 2026-11-05) that **links libobs**
+and records a synthetic in-memory H.264+AAC signal to **split Hybrid MP4** files.
 
-- Status: **S0/S1a scaffold only** (verified 2026-11-05, repo HEAD `88cf273`,
-  branch `feature/av1b-vdd-wgc`).
-- It never calls `obs_startup`/`obs_shutdown`, never creates a video/audio/output
-  subsystem, never captures the screen, never records, never plays audio.
-- The OBS GUI is never started by any tool in this directory.
+- S0/S1a scaffold: **verified 2026-11-05**, repo HEAD `88cf273` (branch
+  `feature/av1b-vdd-wgc`); it never calls `obs_startup`/`obs_shutdown`, never
+  creates a video/audio/output subsystem, never captures, never records, never
+  plays audio.
+- S1b media self-test: **verified 2026-11-05**, repo HEAD `5e153d6`; it does
+  call `obs_startup` and the real media pipeline (see the dedicated S1b section
+  below). It is a **test host with synthetic media only** — no screen capture
+  of the game, no game PCM, not wired into MCP/Python, and not the product
+  recorder.
+- The OBS GUI (`obs64.exe`) is never started by any tool in this directory.
 
 ## Verified capability summary (actual observations)
 
@@ -33,28 +40,44 @@ skeleton**. This is deliberately *not* a recorder yet.
 capability probe: no plugin was loaded and no encoder/capture/mux capability was
 tested.
 
+> Note: the table above describes **S0/S1a `obs-recorder.exe` only**. S1b below
+> adds a separate executable that does generate an SDK import library from the
+> installed runtime, calls `obs_startup`, loads a selective plugin whitelist and
+> exercises the real x264/AAC/MP4 pipeline.
+
 ## Layout
 
 ```
 platform/obs-recorder/
   CMakeLists.txt
-  .gitignore                     # ignores /build/
+  .gitignore                     # ignores /build/ and /build-media/
   README.md
   scripts/
-    build.ps1                    # vcvars64 + CMake/Ninja build, writes build_summary.json
+    build.ps1                    # S0/S1a: vcvars64 + CMake/Ninja build, writes build_summary.json
     s0-smoke.ps1                 # reproducible S0 evidence run (build/capabilities/IPC)
+    gen-obs-sdk.ps1              # S1b: generate obs.lib + obsconfig.h from installed obs.dll
+    build-media-selftest.ps1     # S1b: build obs-media-selftest.exe (links libobs)
+    s1b-smoke.ps1                # S1b: build + record + ffprobe/ffmpeg validation, writes summary.json
   src/
     main.cpp                     # CLI modes + capabilities JSON assembly
     json_util.hpp/.cpp           # minimal JSON writer
     win_util.hpp/.cpp            # paths, Windows version resources, OS info
     obs_probe.hpp/.cpp           # dynamic obs.dll load, symbol probe, SEH-guarded version calls
     ipc_pipe.hpp/.cpp            # named-pipe server + probe client + in-process self-test
+    media/
+      gen_av_source.hpp/.cpp     # S1b in-memory async AV source (I420 frames + float PCM)
+      media_selftest.cpp         # S1b obs-media-selftest.exe host
 ```
 
 Build output (git-ignored): `platform/obs-recorder/build/`
 – `bin/obs-recorder.exe`
 – `build_summary.json`
 – `logs/{toolchain,configure,build}.log`
+
+S1b build output (git-ignored): `platform/obs-recorder/build-media/`
+– `bin/obs-media-selftest.exe` (+ staged OBS runtime DLLs)
+– `sdk/{obs.def,obs.lib,obsconfig.h,sdk_summary.json}`
+– `build_media_summary.json`, `logs/`
 
 ## Build
 
@@ -173,28 +196,128 @@ PASS. It contains `capabilities.json`, `ipc_selftest.jsonl`,
 `OBS_NATIVE_S0_REPORT.md`. Auxiliary `dumpbin /exports` / `/dependents` captures
 for `obs.dll`/`obs64.exe` are under `logs/`.
 
-## Blockers and next prerequisite (S1b)
+## S1b media self-test (`obs-media-selftest.exe`)
 
-1. **No OBS SDK headers / import library.** `sdk_headers=false`,
-   `sdk_import_lib=false`; this is why the S0/S1a binary is pure
-   `LoadLibrary`/`GetProcAddress`. To use the real libobs lifecycle, add OBS
-   Studio **32.1.0** source headers (`libobs/obs.h`, `obsconfig.h`, related) and
-   a matching `obs.lib` import library (or the official obs-deps package), or
-   keep the dynamic-loading route with hand-declared ABI for the needed subset.
-2. **`obs_startup` lifecycle out of scope.** It needs locale/module/data path
-   wiring (`obs_add_data_path`, `obs_add_module_path`), then
-   `obs_load_all_modules`/`obs_post_load_modules`, plus video/audio/output
-   subsystems for real media — none of this is safe or meaningful in a
-   capabilities probe, so it is deliberately not called.
-3. **Media capability probes are not implemented.** WGC capture, x264 encoding,
-   AAC encoding and MP4 muxing must be probed after startup and plugin load
-   before any WGC/x264/AAC/MP4 claim is made. File presence alone is not evidence.
-4. **Long-lived host concerns** (crash-safe shutdown, leak checks, watchdog,
-   reconnection) are not designed yet.
+Opt-in second executable that is the first binary in this directory to **link
+libobs** instead of `dlopen()`ing it. Verified 2026-11-05 (repo HEAD `5e153d6`):
+**17/17 independent checks PASS**, evidence in
+`var/runs/obs-media-s1b-20261105-160609/`.
 
-## Non-goals of this scaffold
+What it does (and only this):
+
+1. `obs_startup("en-US", NULL, NULL)` (libobs 32.1.0);
+2. loads only `obs-ffmpeg.dll`, `obs-x264.dll`, `obs-outputs.dll` (explicit
+   whitelist; **never** `obs_load_all_modules`, so no Qt/UI/frontend plugin);
+3. `obs_reset_audio(44100 Hz stereo)` and
+   `obs_reset_video(1920x1080@60, I420, Rec.709/Partial, D3D11)`;
+4. registers/creates one in-memory async AV source
+   (`a3_test_av_source`: 1920x1080 I420 frames with a moving-bar pattern via
+   `obs_source_output_video()` + 440 Hz float PCM via
+   `obs_source_output_audio()`), puts it in an `obs_scene`, assigns the scene to
+   main-canvas channel 0;
+5. creates `obs_x264` (H.264) + `ffmpeg_aac` encoders and an `mp4_output`
+   (Hybrid MP4) with `split_file=true`, `max_time_sec=5`;
+6. records for the requested duration (default 17 s), stops cleanly, and writes
+   `selftest.json` (modules, applied settings, output signals/events,
+   frame/byte counters, produced files, process module list).
+
+No screen capture, no audio capture, no audio monitoring/playback, no physical
+audio output, no OBS UI/WebSocket, no game. The media is **synthetic**.
+
+### S1b build
+
+Prerequisites: installed OBS **32.1.0**, `vendor/obs-studio` OBS 32.1.0 source
+clone (git-ignored), VS C++ toolset, CMake/Ninja.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File platform\obs-recorder\scripts\build-media-selftest.ps1
+```
+
+`scripts/gen-obs-sdk.ps1` first generates `obs.lib` (from `dumpbin /exports` of
+the installed `obs.dll` → `lib /def:`, 1,782 exports) and a minimal
+`obsconfig.h` under `build-media/sdk/`, then CMake builds the target with the
+OBS 32.1.0 source headers and stages the required OBS runtime DLLs next to the
+exe (all inside the git-ignored `build-media/`; no generated binary is
+committed). The S0/S1a `obs-recorder` target is unaffected and still builds with
+`scripts/build.ps1`.
+
+### S1b run / verification
+
+```powershell
+# full evidence run: build + record + independent ffprobe/ffmpeg validation
+pwsh -NoProfile -ExecutionPolicy Bypass -File platform\obs-recorder\scripts\s1b-smoke.ps1
+
+# recorder only
+platform\obs-recorder\build-media\bin\obs-media-selftest.exe `
+  --out-dir var\runs\obs-media-s1b-manual --duration-ms 17000 --max-time-sec 5
+```
+
+Observed result of the verified run:
+
+| Item | Observed |
+|---|---|
+| Recorder exit | **0**; wall 18.4 s for a 17.0 s recording (drain 0.9 s) |
+| Files | **4** split Hybrid MP4s: 5.990 / 4.983 / 4.992 / 1.000 s |
+| Streams (every file) | H.264 1920x1080, `avg_frame_rate=60/1` + AAC 44.1 kHz 2 ch |
+| Decode | `ffmpeg -v error -i <file> -f null -` → **zero errors** on all files |
+| Audio | 440 Hz tone present on every file (`max_volume` ≈ −13…−14 dB) |
+| Video content | sampled frames differ; 119/120 unique decoded frame hashes in 2 s |
+| A/V (container) | max |video−audio| duration delta **48 ms**; total 16.965 s vs 17.0 s requested |
+| Split behavior | boundaries at 6.0 / 11.0 / 16.0 s (see below) |
+| No audio device | live process modules contain **no MMDevAPI/audioses/wdmaud**; source `monitoring_type=NONE`; no monitoring APIs called; `win-wasapi` not loaded |
+
+**Actual split behavior (honest, not "exactly 3x5 s"):** `mp4_output` splits only
+at a primary-track keyframe whose `dts_usec - start_time >= max_time_sec`
+(`plugins/obs-outputs/mp4-output.c:333 should_split()`, `:414 change_file()`).
+With `keyint_sec=1` and x264 B-frames, the PTS=5 s keyframe has DTS≈4.95 s, so
+the first eligible keyframe is PTS=6.0 s → first segment 6.0 s; then +5.0 s
+boundaries. A 17 s recording therefore yields 4 files (6+5+5+1 s). The task
+target "16–18 s → at least 3 valid split files" is met; an exact 3×5 s result
+would need a different duration/keyframe/B-frame configuration.
+
+### S1b limitations (still test/stand-in, not the product recorder)
+
+1. **Synthetic media only**: the picture is a generated moving-bar/checker
+   pattern and the audio is a generated 440 Hz sine. No WGC/game capture, no
+   VCMI game PCM (`win-capture`/`win-wasapi` not loaded or tested).
+2. **Not wired into the product**: standalone exe; no MCP/Python integration, no
+   IPC/manifest hooks, does not replace the existing Python recorder.
+3. **Split semantics/rollover**: 5 s is a keyframe-aligned lower bound (observed
+   6/11/16 s); no 1.5 GB size-triggered rollover (`max_size_mb=0`), no
+   crash-safe recovery/segment resume/atomic manifest.
+4. **Durability**: single 17 s run; no multi-minute/1.5 GB soak, no watchdog, no
+   leak checks.
+5. **A/V quality scope**: container-level durations + full decode + tone/frame
+   checks only; no human listening/visual or per-frame sync validation.
+6. **Licensing**: OBS/libobs is GPL-2.0-or-later; distributing a libobs-linked
+   host needs GPL compliance review (not done here).
+7. **Host-specific**: OBS 32.1.0 install layout and DLL names are hard-coded in
+   the scripts/staging list; changing OBS versions requires regenerating
+   `obs.lib` and updating the staged DLL list.
+
+See `var/runs/obs-media-s1b-20261105-160609/S1B_REPORT.md` for the full report
+(API/source-line references, per-file probes, crash/fix notes).
+
+## Remaining blockers / next steps after S1b
+
+1. **Real capture inputs (S1c)**: feed the same libobs pipeline with WGC desktop
+   capture (`win-capture.dll`) and/or VCMI's real audio/PCM path; this requires
+   loading additional modules (`win-capture`, `win-wasapi`) and testing against
+   the game/VDD without breaking the S0/S1a host.
+2. **Product integration**: expose start/stop/status through the existing
+   `obs-recorder` IPC and the MCP/Python recorder interface; keep the old Python
+   recorder as the only usable backend until that is verified end-to-end.
+3. **Rollover/recovery**: size-triggered split (`max_size_mb`), 5–10 min+ soak,
+   crash-safe manifest/state machine, watchdog, clean restart.
+4. **A/V acceptance**: real-content listening/visual checks, drift measurement,
+   per-frame sync, not just container-level durations.
+5. **Distribution/licensing**: confirm GPL-2.0-or-later obligations for a host
+   that links libobs and ships the generated import library/build scripts.
+
+## Non-goals of the S0/S1a scaffold (unchanged)
 
 - Starting the OBS GUI (`obs64.exe`) — never done.
-- Recording, screen capture, audio capture/playback — no code path exists.
+- Recording, screen capture, audio capture/playback — no code path exists in
+  `obs-recorder.exe` (the separate S1b self-test uses synthetic media only).
 - Claiming codec/container/capture capability without a real probe.
 - Touching Python product code or tracked docs.

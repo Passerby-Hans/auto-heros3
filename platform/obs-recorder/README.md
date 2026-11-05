@@ -1,10 +1,11 @@
-# obs-recorder — S0/S1a native host scaffold + S1b libobs media self-test
+# obs-recorder — S0/S1a scaffold + S1b/S1c/S2a libobs media self-test
 
 Native Windows host process (`obs-recorder.exe`, **S0/S1a**) that **inspects the
 installed OBS runtime via dynamic loading** and exposes a **local named-pipe
 JSON-lines IPC skeleton**, plus a second, opt-in executable
-(`obs-media-selftest.exe`, **S1b**, verified 2026-11-05) that **links libobs**
-and records a synthetic in-memory H.264+AAC signal to **split Hybrid MP4** files.
+(`obs-media-selftest.exe`, **S1b/S1c/S2a**, verified 2026-11-05) that **links
+libobs** and records synthetic media, a real WGC window, and/or a native raw-file
+audio source to **split Hybrid MP4** files.
 
 - S0/S1a scaffold: **verified 2026-11-05**, repo HEAD `88cf273` (branch
   `feature/av1b-vdd-wgc`); it never calls `obs_startup`/`obs_shutdown`, never
@@ -18,6 +19,12 @@ and records a synthetic in-memory H.264+AAC signal to **split Hybrid MP4** files
 - S1c WGC window-capture mode: **verified 2026-11-05**, repo HEAD `6510b51`;
   targets a real window through OBS `window_capture`/WGC (still a synthetic Tk
   test window, no game, no audio capture; see the S1c section below).
+- S2a WGC + raw-file audio mode: **verified 2026-11-05**, repo HEAD `e510405`;
+  adds a native audio-only source that reads VCMI `game-audio.raw`
+  (s16le/44100/2 → FLOAT_PLANAR) and records it together with the S1c WGC
+  window source in one scene/output. Still a synthetic Tk video + offline/raw
+  test audio; **not live VCMI**, not wired into MCP/Python (see the S2a section
+  below).
 - The OBS GUI (`obs64.exe`) is never started by any tool in this directory.
 
 ## Verified capability summary (actual observations)
@@ -58,11 +65,13 @@ platform/obs-recorder/
   scripts/
     build.ps1                    # S0/S1a: vcvars64 + CMake/Ninja build, writes build_summary.json
     s0-smoke.ps1                 # reproducible S0 evidence run (build/capabilities/IPC)
-    gen-obs-sdk.ps1              # S1b/S1c: generate obs.lib + obsconfig.h from installed obs.dll
-    build-media-selftest.ps1     # S1b/S1c: build obs-media-selftest.exe (links libobs)
+    gen-obs-sdk.ps1              # S1b/S1c/S2a: generate obs.lib + obsconfig.h from installed obs.dll
+    build-media-selftest.ps1     # S1b/S1c/S2a: build obs-media-selftest.exe (links libobs)
     s1b-smoke.ps1                # S1b: build + record + ffprobe/ffmpeg validation, writes summary.json
     s1c-smoke.ps1                # S1c: WGC window capture + validation + explicit no-window failure run
-    wgc-synthetic-window.py      # S1c: synthetic animated Tk window (no audio/game) for window_capture tests
+    s2-smoke.ps1                 # S2a: WGC + raw-file audio, static/EOF/missing/growth runs + validation
+    wgc-synthetic-window.py      # S1c/S2a: synthetic animated Tk window (no audio/game)
+    gen-test-raw-tone.py         # S2a: offline s16le/44100/2 tone file / real-time appender (no playback)
   src/
     main.cpp                     # CLI modes + capabilities JSON assembly
     json_util.hpp/.cpp           # minimal JSON writer
@@ -71,7 +80,8 @@ platform/obs-recorder/
     ipc_pipe.hpp/.cpp            # named-pipe server + probe client + in-process self-test
     media/
       gen_av_source.hpp/.cpp     # S1b in-memory async AV source (I420 frames + float PCM)
-      media_selftest.cpp         # S1b obs-media-selftest.exe host
+      raw_audio_source.hpp/.cpp  # S2a async audio-only raw-file source (s16le → FLOAT_PLANAR)
+      media_selftest.cpp         # S1b/S1c/S2a obs-media-selftest.exe host
 ```
 
 Build output (git-ignored): `platform/obs-recorder/build/`
@@ -79,8 +89,8 @@ Build output (git-ignored): `platform/obs-recorder/build/`
 – `build_summary.json`
 – `logs/{toolchain,configure,build}.log`
 
-S1b build output (git-ignored): `platform/obs-recorder/build-media/`
-– `bin/obs-media-selftest.exe` (+ staged OBS runtime DLLs)
+Media self-test build output (git-ignored): `platform/obs-recorder/build-media/`
+– `bin/obs-media-selftest.exe` (+ staged OBS runtime DLLs incl. `libobs-winrt.dll`, `libcurl.dll`)
 – `sdk/{obs.def,obs.lib,obsconfig.h,sdk_summary.json}`
 – `build_media_summary.json`, `logs/`
 
@@ -382,8 +392,9 @@ Observed result of the verified run:
 
 1. **Not game capture**: the target is a synthetic animated Tk window. VCMI/VDD
    window capture (battle etc.), real window sizes and long runs are not tested.
-2. **No audio**: `capture_audio=false` on purpose; the AAC track is silence.
-   VCMI's real PCM path (SDL disk → pipe) is not wired here.
+2. **No audio in S1c mode**: `capture_audio=false` on purpose; the AAC track is
+   silence. S2a (below) adds a separate raw-file audio source; VCMI's real PCM
+   path is only wired through that file source, not through win-wasapi.
 3. **HDR**: this host's LG display is HDR; without `force_sdr=true` the WGC
    RGBA16F/`GS_CS_709_EXTENDED` path produced black frames in this SDR pipeline.
    `force_sdr=true` is used and recorded; the real HDR→SDR path is not validated.
@@ -403,12 +414,103 @@ Observed result of the verified run:
 See `var/runs/obs-wgc-s1c-20261105-163717/S1C_REPORT.md` for the full report
 (source-line/API references, per-file probes, DPI/HDR/fix notes).
 
-## Remaining blockers / next steps after S1b/S1c
+## S2a WGC window + raw-file audio mode (`--audio-raw`)
 
-1. **Real content (S1d)**: point the WGC `window_capture` mode at the actual
-   VCMI window on the VDD (or a WGC monitor capture), including battle content,
-   client-area geometry and real window resizes; optionally load `win-wasapi` for
-   real audio capture. Keep the no-monitoring/no-playback constraints.
+Verified 2026-11-05 (repo HEAD `e510405`): **47/47 independent checks PASS**,
+evidence in `var/runs/obs-wgc-audio-s2-20261105-172903/`. It adds a **native
+audio-only libobs source** that reads VCMI's existing
+`game-audio.raw` (s16le interleaved, 44100 Hz, stereo) and records it **together
+with the S1c WGC window source in one scene and one output** — no WASAPI,
+no audio device, no playback, no monitoring.
+
+What it does:
+
+1. registers a custom source id `a3_raw_audio` with
+   `OBS_SOURCE_AUDIO|OBS_SOURCE_ASYNC`; settings `path` + `start_at_zero`
+   (default **false** = start at the current **EOF**, so only data appended by
+   the running game is consumed; `--audio-start-zero` is the test mode that reads
+   a static file from byte 0);
+2. one reader thread per source opens the file with
+   `CreateFileW(... FILE_SHARE_READ|WRITE|DELETE)`, seeks to 0/EOF, then every
+   100 ms (4410 frames) converts interleaved s16le → `FLOAT_PLANAR` (+-1.0,
+   /32768) and calls `obs_source_output_audio()` with an absolute
+   `os_gettime_ns()` timestamp grid;
+3. handles no-data explicitly: missing file is retried (host fails with **exit
+   9** after a 3 s timeout if it never opens); an open file with fewer than 4410
+   new frames pushes a **silent** chunk on the same grid and counts
+   `silence_chunks/eof_waits` in `selftest.json` (no silent stall);
+4. creates the audio source **in the same `obs_scene`** as `window_capture`, so
+   the scene's audio mix feeds the same `ffmpeg_aac` encoder → same
+   `mp4_output` (`split_file=true`, `max_time_sec=3`), with `capture_audio=false`
+   on the window source and `monitoring_type=NONE`/volume 1.0 on the audio
+   source;
+5. records 8 s and writes a `raw_audio` evidence block: settings JSON,
+   `output_flags`, opened/open_error/open_attempts, start_offset,
+   file_size_at_open, bytes_read, frames_read, chunks_pushed, silence_chunks,
+   eof_waits, samples_pushed, monitoring/volume/mixers;
+6. stops the reader after the output drained (idempotent) and only then tears
+   down libobs.
+
+### S2a run / verification
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File platform\obs-recorder\scripts\s2-smoke.ps1
+
+# recorder only (Tk target window must already exist)
+platform\obs-recorder\build-media\bin\obs-media-selftest.exe --mode window `
+  --window-pid <pid> --window-title "VCMI WGC Synthetic" `
+  --audio-raw E:\path\to\game-audio.raw --audio-start-zero `
+  --out-dir var\runs\obs-wgc-audio-manual --duration-ms 8000 --max-time-sec 3
+```
+
+`s2-smoke.ps1` generates a 17 s s16le/44100/2 tone file offline
+(`gen-test-raw-tone.py`, no ffplay/playback), starts the same synthetic Tk
+window, and runs four recorder paths (static tone + start-zero, static file + EOF
+default, missing file, real-time growing file).
+
+Observed result of the verified run:
+
+| Item | Observed |
+|---|---|
+| Audio source | `a3_raw_audio`, output_flags `0x6` (AUDIO\|ASYNC), s16le→FLOAT_PLANAR, 4410-frame chunks, volume 1.0, mixers 255, `monitoring_type=NONE` |
+| Static tone + start-zero | exit 0; 3 MP4s 3.994/2.983/1.017 s; `samples_pushed=396900`, `bytes_read=1587600` (=176400 B/s×9 s), `silence_chunks=0` |
+| Audio in MP4 | **AAC max_volume −11.8/−11.9/−12.0 dB** on every file (tone present); video 1920×1080@60 H.264, YAVG 98.8/62.5/61.6, YMAX≈240, unique frames 59/60+ |
+| Full decode | `ffmpeg -v error -i <file> -f null -` → **zero errors** on all files; A/V container delta **41.7 ms** |
+| EOF default + static file | exit 0; `start_offset=2998800` (EOF), `bytes_read=0`, `samples_pushed=0`, **`silence_chunks=90/eof_waits=90`**, AAC −91 dB per file (explicit no-data) |
+| Missing file | **exit 9**; `raw_audio_opened FAIL` with `win32 error 2` after 61 open attempts; `status=fail/exit_code=9`; 0 MP4; clean `obs_shutdown_done` |
+| Live growth | real-time appended file, default EOF: `start_offset=264600`, `bytes_read=1569960`, `chunks=89`, `silence_chunks=1`; **AAC −11.8/−12.0/−12.0 dB** |
+| Real VCMI raw (offline) | 15-min real `game-audio.raw` (176,898,048 B) replayed from byte 0 → AAC max/mean −11.5/−24.2, −11.8/−29.6, −30.0/−43.4 dB; full decode 0 errors (not live VCMI) |
+| No audio device | 98 live modules: **no MMDevAPI/audioses/wdmaud/win-wasapi**; only 4 whitelist modules (incl. win-capture); no obs64/UI/WebSocket/game/ffplay |
+
+### S2a limitations (still test/stand-in)
+
+1. **Not live VCMI**: the video is the synthetic Tk window; live VCMI via MCP
+   `session_start(display_index=2)` was not run. Real-VCMI PCM is only replayed
+   offline from an existing 15-min session file.
+2. **No audio device path** by design (no WASAPI/MMDevice/playback/monitoring);
+   that also means device capture was not exercised (not needed).
+3. **Silence filling**: if the file grows slower than real time, the source
+   pushes up to one 100 ms silent chunk per starvation and counts it; there is no
+   PLC/sample-accurate resync. A static file with the default EOF start therefore
+   records a silent AAC track (intended and visible in stats).
+4. **100 ms chunk latency**; A/V acceptance is container-level (41.7 ms max
+   delta), no per-frame sync/drift measurement.
+5. **Short single runs** (4 paths × 8 s + 8 s offline real raw); no long soak,
+   1.5 GB rollover, source-restart/crash recovery.
+6. **Not wired into the product**: standalone test source/exe, no MCP/Python/IPC/
+   manifest integration; old Python recorder remains the only product backend.
+7. GPL-2.0-or-later compliance and OBS-version pinning are the same open items
+   as S1b/S1c.
+
+See `var/runs/obs-wgc-audio-s2-20261105-172903/S2A_REPORT.md` for the full
+report (source design, per-file probes, all four run outcomes, limitations).
+
+## Remaining blockers / next steps after S1b/S1c/S2a
+
+1. **Live VCMI (S2b)**: run the real game via MCP `session_start(display_index=2)`,
+   point WGC at the actual VCMI window and `--audio-raw` at its live
+   `game-audio.raw`; verify battle content, real audio, window geometry and
+   source restart. Keep the no-monitoring/no-playback constraints.
 2. **Product integration**: expose start/stop/status through the existing
    `obs-recorder` IPC and the MCP/Python recorder interface; keep the old Python
    recorder as the only usable backend until that is verified end-to-end.

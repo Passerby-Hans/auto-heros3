@@ -64,6 +64,7 @@
 
 #include "../json_util.hpp"
 #include "gen_av_source.hpp"
+#include "raw_audio_source.hpp"
 
 namespace fs = std::filesystem;
 
@@ -247,6 +248,10 @@ struct Options {
     std::string window_class;
     std::string window_exe;
     int window_pid = 0;
+
+    // S2a: raw VCMI game-audio.raw file as a native libobs audio source
+    std::string audio_raw;            // empty => no raw audio source
+    bool audio_start_zero = false;    // default: start at EOF (live semantics)
 };
 
 struct Step {
@@ -348,6 +353,14 @@ struct State {
     uint32_t capture_width = 0;
     uint32_t capture_height = 0;
     std::vector<std::string> capture_log_lines;
+
+    // S2a raw-file audio source evidence
+    bool audio_enabled = false;
+    obs_source_t* audio_source = nullptr;
+    std::string audio_applied_settings_json;
+    int audio_source_monitoring_type = -1;
+    float audio_source_volume = 0.0f;
+    a3::RawAudioStats audio_stats;
 
     // exit code to use when a specific step fails (0 => stage default)
     int failure_exit_code = 0;
@@ -726,10 +739,12 @@ void Cleanup(State& s)
     };
     trace("begin");
 
-    // Safety net for error paths: make sure the synthetic media producer is
-    // stopped before any libobs object is released.  On the normal path this
-    // was already done right after the output drained (idempotent).
+    // Safety net for error paths: make sure the synthetic media producer and
+    // the raw-audio reader are stopped before any libobs object is released.
+    // On the normal path this was already done right after the output drained
+    // (idempotent).
     a3::StopAvTestSourceThread();
+    a3::StopRawAudioSourceThread();
 
     // Detach the scene from the main canvas channel first (the channel holds a
     // strong reference to the scene source, libobs/obs-canvas.c
@@ -793,6 +808,11 @@ void Cleanup(State& s)
         obs_source_release(s.source);
         s.source = nullptr;
         trace("source_released");
+    }
+    if (s.audio_source) {
+        obs_source_release(s.audio_source);
+        s.audio_source = nullptr;
+        trace("audio_source_released");
     }
     if (s.scene) {
         obs_scene_release(s.scene);
@@ -1226,6 +1246,89 @@ bool WaitForWindowCapture(State& s)
     return hooked && wgc && dimensions_ok;
 }
 
+// S2a: create the native raw-file audio source (VCMI game-audio.raw) and add it
+// to the same scene as the WGC window source.  Audio-only: no monitoring, no
+// audio device, no playback.  The source retries the open itself; the host waits
+// here and turns "file never opened" into an explicit failure (exit 9).
+bool CreateRawAudioSource(State& s)
+{
+    if (s.opt.audio_raw.empty()) {
+        return true;
+    }
+    s.audio_enabled = true;
+    AddStep(s, "audio_raw_mode", true,
+            std::string("raw s16le/44100/2 file -> FLOAT_PLANAR async audio source; start_at=") +
+                (s.opt.audio_start_zero ? "0 (test)" : "EOF (live)") + " path='" + s.opt.audio_raw + "'");
+
+    a3::RegisterRawAudioSource();
+    AddStep(s, "register_raw_audio_source", true, "obs_register_source_s(a3_raw_audio)");
+
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "path", s.opt.audio_raw.c_str());
+    obs_data_set_bool(settings, "start_at_zero", s.opt.audio_start_zero);
+    s.audio_source = obs_source_create("a3_raw_audio", "S2a Raw VCMI Game Audio", settings, nullptr);
+    obs_data_release(settings);
+    AddStep(s, "create_raw_audio_source", s.audio_source != nullptr,
+            "a3_raw_audio (OBS_SOURCE_AUDIO|OBS_SOURCE_ASYNC)");
+    if (!s.audio_source) {
+        s.failure_exit_code = 9;
+        return false;
+    }
+    const uint32_t audio_flags = s.audio_source ? obs_source_get_output_flags(s.audio_source) : 0;
+    AddStep(s, "raw_audio_flags",
+            (audio_flags & OBS_SOURCE_AUDIO) != 0 && (audio_flags & OBS_SOURCE_ASYNC) != 0,
+            "output_flags=0x" + [](uint32_t v) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "%x", v);
+                return std::string(buf);
+            }(audio_flags) + " (AUDIO=0x2, ASYNC=0x4)");
+
+    obs_data_t* applied = obs_source_get_settings(s.audio_source);
+    const char* applied_json = obs_data_get_json(applied);
+    s.audio_applied_settings_json = applied_json ? applied_json : "";
+    obs_data_release(applied);
+    s.audio_source_monitoring_type = static_cast<int>(obs_source_get_monitoring_type(s.audio_source));
+    s.audio_source_volume = obs_source_get_volume(s.audio_source);
+    AddStep(s, "raw_audio_settings", true, s.audio_applied_settings_json);
+    AddStep(s, "raw_audio_monitoring_none",
+            s.audio_source_monitoring_type == OBS_MONITORING_TYPE_NONE,
+            "monitoring_type=" + std::to_string(s.audio_source_monitoring_type) + " (NONE=" +
+                std::to_string(OBS_MONITORING_TYPE_NONE) + ") volume=" +
+                std::to_string(s.audio_source_volume) + " mixers=" +
+                std::to_string(obs_source_get_audio_mixers(s.audio_source)));
+
+    obs_sceneitem_t* item = obs_scene_add(s.scene, s.audio_source);
+    AddStep(s, "scene_add_audio_source", item != nullptr, "audio source added to the same S1c scene");
+    if (!item) {
+        s.failure_exit_code = 9;
+        return false;
+    }
+
+    // Wait for the reader thread to open the file.  Missing files are retried by
+    // the source; the host fails explicitly instead of recording silent audio
+    // for a wrong path.
+    const uint64_t deadline = os_gettime_ns() + 3000000000ULL;
+    a3::RawAudioStats stats;
+    while (os_gettime_ns() < deadline) {
+        stats = a3::GetRawAudioStats();
+        if (stats.opened) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    s.audio_stats = stats;
+    AddStep(s, "raw_audio_opened", stats.opened,
+            "path='" + s.opt.audio_raw + "' opened=" + std::to_string(stats.opened ? 1 : 0) +
+                " attempts=" + std::to_string(stats.open_attempts) +
+                " start_offset=" + std::to_string(stats.start_offset) +
+                " error='" + stats.open_error + "'");
+    if (!stats.opened) {
+        s.failure_exit_code = 9;
+        return false;
+    }
+    return true;
+}
+
 bool CreateWindowPipeline(State& s, const std::string& first_file_path)
 {
     AddStep(s, "mode", true, "mode=window (win-capture window_capture forced method=WGC)");
@@ -1299,6 +1402,9 @@ bool CreateWindowPipeline(State& s, const std::string& first_file_path)
                 "scale=" + std::to_string(scale.x) + "x" + std::to_string(scale.y) +
                     " (window " + std::to_string(s.capture_width) + "x" +
                     std::to_string(s.capture_height) + " -> canvas 1920x1080)");
+    }
+    if (!CreateRawAudioSource(s)) {
+        return false;
     }
     return CreateEncodersAndOutput(s, first_file_path);
 }
@@ -1387,6 +1493,18 @@ bool RunOutput(State& s)
     } else {
         AddStep(s, "window_capture_after_stop", true,
                 "window_capture source is a synchronous render source (no worker thread of ours)");
+    }
+    if (s.audio_enabled) {
+        // Stop the raw-audio reader after the output drained (idempotent), then
+        // snapshot its counters for the report.
+        a3::StopRawAudioSourceThread();
+        s.audio_stats = a3::GetRawAudioStats();
+        AddStep(s, "raw_audio_after_stop", true,
+                "opened=" + std::to_string(s.audio_stats.opened ? 1 : 0) +
+                    " bytes_read=" + std::to_string(s.audio_stats.bytes_read) +
+                    " chunks=" + std::to_string(s.audio_stats.chunks_pushed) +
+                    " silence_chunks=" + std::to_string(s.audio_stats.silence_chunks) +
+                    " samples=" + std::to_string(s.audio_stats.samples_pushed));
     }
 
     // stop event details (code is set from mp4_output's end_data_capture path)
@@ -1486,6 +1604,35 @@ void CollectFinalEvidence(State& s)
                     !HasModule(s.process_modules, "audioses.dll") &&
                     !HasModule(s.process_modules, "win-wasapi.dll"),
                 "no MMDevAPI/audioses/win-wasapi module loaded (capture_audio=false)");
+
+        if (s.audio_enabled) {
+            s.audio_stats = a3::GetRawAudioStats();
+            AddStep(s, "raw_audio_reader_stats",
+                    s.audio_stats.opened &&
+                        (s.audio_stats.samples_pushed > 0 || s.audio_stats.silence_chunks > 0),
+                    "opened=" + std::to_string(s.audio_stats.opened ? 1 : 0) +
+                        " start_offset=" + std::to_string(s.audio_stats.start_offset) +
+                        " bytes_read=" + std::to_string(s.audio_stats.bytes_read) +
+                        " frames_read=" + std::to_string(s.audio_stats.frames_read) +
+                        " chunks=" + std::to_string(s.audio_stats.chunks_pushed) +
+                        " silence_chunks=" + std::to_string(s.audio_stats.silence_chunks) +
+                        " eof_waits=" + std::to_string(s.audio_stats.eof_waits));
+            AddStep(s, "raw_audio_data_pushed_when_start_zero",
+                    !s.opt.audio_start_zero || s.audio_stats.samples_pushed > 0,
+                    std::string("start_at_zero=") + (s.opt.audio_start_zero ? "true" : "false") +
+                        " samples_pushed=" + std::to_string(s.audio_stats.samples_pushed) +
+                        " (EOF mode may legitimately be silent if the file did not grow)");
+            AddStep(s, "raw_audio_monitoring_none_final",
+                    s.audio_source_monitoring_type == OBS_MONITORING_TYPE_NONE,
+                    "volume=" + std::to_string(s.audio_source_volume) + " mixers=" +
+                        std::to_string(s.audio_source ? obs_source_get_audio_mixers(s.audio_source) : 0) +
+                        " monitoring_type=" + std::to_string(s.audio_source_monitoring_type));
+            AddStep(s, "raw_audio_no_playback_device",
+                    !HasModule(s.process_modules, "MMDevAPI.dll") &&
+                        !HasModule(s.process_modules, "audioses.dll") &&
+                        !HasModule(s.process_modules, "win-wasapi.dll"),
+                    "raw file audio source loaded without WASAPI/MMDevice endpoint (no playback/monitoring)");
+        }
     }
 }
 
@@ -1500,8 +1647,10 @@ void WriteReport(State& s, int exit_code)
     w.key("tool");
     w.value_string("obs-media-selftest");
     w.key("mode");
-    w.value_string(s.opt.mode == RunMode::WindowWgc ? "s1c-wgc-window-capture-to-split-mp4"
-                                                   : "s1b-in-memory-av-to-split-mp4");
+    w.value_string(s.opt.mode == RunMode::WindowWgc
+                       ? (s.audio_enabled ? "s2a-wgc-window-plus-raw-file-audio-to-split-mp4"
+                                          : "s1c-wgc-window-capture-to-split-mp4")
+                       : "s1b-in-memory-av-to-split-mp4");
     w.key("status");
     w.value_string(exit_code == 0 ? "pass" : "fail");
     w.key("exit_code");
@@ -1531,6 +1680,8 @@ void WriteReport(State& s, int exit_code)
         w.value_string(s.opt.mode == RunMode::WindowWgc ? "window" : "in-memory");
         w.key("win_capture_module_loaded");
         w.value_bool(s.win_capture_module_loaded);
+        w.key("raw_audio_enabled");
+        w.value_bool(s.audio_enabled);
     }
     w.end_object();
 
@@ -1573,6 +1724,23 @@ void WriteReport(State& s, int exit_code)
         w.value_string(s.opt.window_exe);
         w.key("window_pid");
         w.value_int(s.opt.window_pid);
+        w.end_object();
+    }
+    if (s.audio_enabled) {
+        w.key("audio_source");
+        w.begin_object();
+        w.key("type");
+        w.value_string("a3_raw_audio (s16le interleaved -> FLOAT_PLANAR, async audio-only)");
+        w.key("path");
+        w.value_string(s.opt.audio_raw);
+        w.key("start_at_zero");
+        w.value_bool(s.opt.audio_start_zero);
+        w.key("sample_rate");
+        w.value_int(44100);
+        w.key("channels");
+        w.value_int(2);
+        w.key("chunk_frames");
+        w.value_int(4410);
         w.end_object();
     }
     w.end_object();
@@ -1696,6 +1864,53 @@ void WriteReport(State& s, int exit_code)
     w.end_array();
     w.end_object();
 
+    // S2a raw-file audio source evidence (window+audio mode only).
+    w.key("raw_audio");
+    w.begin_object();
+    w.key("enabled");
+    w.value_bool(s.audio_enabled);
+    w.key("path");
+    w.value_string(s.opt.audio_raw);
+    w.key("start_at_zero");
+    w.value_bool(s.opt.audio_start_zero);
+    w.key("source_settings_json");
+    w.value_string(s.audio_applied_settings_json);
+    w.key("output_flags");
+    w.value_int(s.audio_source ? static_cast<long long>(obs_source_get_output_flags(s.audio_source)) : 0);
+    w.key("source_monitoring_type");
+    w.value_int(s.audio_source_monitoring_type);
+    w.key("monitoring_type_none_value");
+    w.value_int(OBS_MONITORING_TYPE_NONE);
+    w.key("source_volume");
+    w.value_double(s.audio_source_volume, 3);
+    w.key("audio_mixers");
+    w.value_int(s.audio_source ? static_cast<long long>(obs_source_get_audio_mixers(s.audio_source)) : 0);
+    w.key("opened");
+    w.value_bool(s.audio_stats.opened);
+    w.key("open_error");
+    w.value_string(s.audio_stats.open_error);
+    w.key("open_attempts");
+    w.value_uint(s.audio_stats.open_attempts);
+    w.key("start_offset");
+    w.value_uint(s.audio_stats.start_offset);
+    w.key("file_size_at_open");
+    w.value_uint(s.audio_stats.file_size_at_open);
+    w.key("bytes_read");
+    w.value_uint(s.audio_stats.bytes_read);
+    w.key("frames_read");
+    w.value_uint(s.audio_stats.frames_read);
+    w.key("chunks_pushed");
+    w.value_uint(s.audio_stats.chunks_pushed);
+    w.key("silence_chunks");
+    w.value_uint(s.audio_stats.silence_chunks);
+    w.key("eof_waits");
+    w.value_uint(s.audio_stats.eof_waits);
+    w.key("samples_pushed");
+    w.value_uint(s.audio_stats.samples_pushed);
+    w.key("bytes_per_second_expected");
+    w.value_int(176400); // 44100 frames/s * 2ch * 2 bytes
+    w.end_object();
+
     w.key("media");
     w.begin_object();
     w.key("output_settings_json");
@@ -1745,6 +1960,10 @@ void WriteReport(State& s, int exit_code)
     w.value_string(s.monitoring_device_name);
     w.key("default_monitoring_device_id");
     w.value_string(s.monitoring_device_id);
+    w.key("raw_audio_source_monitoring_type");
+    w.value_int(s.audio_source_monitoring_type);
+    w.key("raw_audio_source_volume");
+    w.value_double(s.audio_source_volume, 3);
     w.end_object();
     w.key("source_pushed");
     w.begin_object();
@@ -1828,11 +2047,14 @@ void PrintUsage()
                 "  --window-class STR   window mode: target window class (optional)\n"
                 "  --window-exe STR     window mode: target executable name (optional)\n"
                 "  --window-pid N       window mode: restrict to a process id (optional)\n"
+                "  --audio-raw PATH      also add native raw-file audio source (s16le/44100/2)\n"
+                "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
                 "exit codes: 0 ok, 2 usage, 3 obs/module init, 4 pipeline, 5 output run,\n"
-                "            6 checks, 7 window_not_found, 8 capture/not-WGC failure\n");
+                "            6 checks, 7 window_not_found, 8 capture/not-WGC failure,\n"
+                "            9 raw audio source failure\n");
 }
 
 bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
@@ -1872,6 +2094,10 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.window_exe = next("--window-exe");
         } else if (a == "--window-pid") {
             opt.window_pid = std::atoi(next("--window-pid").c_str());
+        } else if (a == "--audio-raw") {
+            opt.audio_raw = next("--audio-raw");
+        } else if (a == "--audio-start-zero") {
+            opt.audio_start_zero = true;
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
             opt.duration_explicit = true;
@@ -1910,6 +2136,11 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
     }
     if (opt.window_pid < 0) {
         std::fprintf(stderr, "--window-pid out of range\n");
+        exit_code = 2;
+        return false;
+    }
+    if (!opt.audio_raw.empty() && opt.mode != RunMode::WindowWgc) {
+        std::fprintf(stderr, "--audio-raw is only supported together with --mode window\n");
         exit_code = 2;
         return false;
     }

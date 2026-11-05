@@ -85,6 +85,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
   add_executable(obs-media-selftest
     src/media/media_selftest.cpp
     src/media/gen_av_source.cpp
+    src/media/raw_audio_source.cpp
     src/json_util.cpp
   )
   target_compile_features(obs-media-selftest PRIVATE cxx_std_17)

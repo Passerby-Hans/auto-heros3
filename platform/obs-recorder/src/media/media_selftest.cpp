@@ -66,6 +66,7 @@
 #include "../json_util.hpp"
 #include "gen_av_source.hpp"
 #include "raw_audio_source.hpp"
+#include "panel_source.hpp"
 
 namespace fs = std::filesystem;
 
@@ -364,6 +365,7 @@ struct State {
     // S2a raw-file audio source evidence
     bool audio_enabled = false;
     obs_source_t* audio_source = nullptr;
+    obs_source_t* panel_source = nullptr;
     std::string audio_applied_settings_json;
     int audio_source_monitoring_type = -1;
     float audio_source_volume = 0.0f;
@@ -757,6 +759,7 @@ void Cleanup(State& s)
     // (idempotent).
     a3::StopAvTestSourceThread();
     a3::StopRawAudioSourceThread();
+    a3::StopStatusPanelSourceThread();
 
     // Detach the scene from the main canvas channel first (the channel holds a
     // strong reference to the scene source, libobs/obs-canvas.c
@@ -820,6 +823,11 @@ void Cleanup(State& s)
         obs_source_release(s.source);
         s.source = nullptr;
         trace("source_released");
+    }
+    if (s.panel_source) {
+        obs_source_release(s.panel_source);
+        s.panel_source = nullptr;
+        trace("panel_source_released");
     }
     if (s.audio_source) {
         obs_source_release(s.audio_source);
@@ -1402,20 +1410,54 @@ bool CreateWindowPipeline(State& s, const std::string& first_file_path)
         return false;
     }
 
-    // Scale the captured window to fill the 1920x1080 canvas so nonblack /
-    // frame-change validation covers the whole output frame instead of only the
-    // top-left window-sized region.  This is a test-host presentation choice
-    // (non-uniform stretch) and is recorded in selftest.json.
+    // Layout: 4:3 game on the left (1440x1080), status panel on the right
+    // (480x1080).  The game must be scaled uniformly; stretching it to the full
+    // 1920x1080 canvas is what produced the earlier horizontally-squashed video.
     if (s.scene_item && s.capture_width > 0 && s.capture_height > 0) {
-        struct vec2 scale = {};
-        scale.x = 1920.0f / static_cast<float>(s.capture_width);
-        scale.y = 1080.0f / static_cast<float>(s.capture_height);
-        obs_sceneitem_set_scale(s.scene_item, &scale);
-        AddStep(s, "scene_item_scale_fill_canvas", true,
-                "scale=" + std::to_string(scale.x) + "x" + std::to_string(scale.y) +
+        const float target_w = 1440.0f;
+        const float target_h = 1080.0f;
+        const float sx = target_w / static_cast<float>(s.capture_width);
+        const float sy = target_h / static_cast<float>(s.capture_height);
+        const float scale = sx < sy ? sx : sy;
+        struct vec2 sc = {};
+        sc.x = scale;
+        sc.y = scale;
+        obs_sceneitem_set_scale(s.scene_item, &sc);
+        struct vec2 pos = {};
+        pos.x = (target_w - static_cast<float>(s.capture_width) * scale) * 0.5f;
+        pos.y = (target_h - static_cast<float>(s.capture_height) * scale) * 0.5f;
+        obs_sceneitem_set_pos(s.scene_item, &pos);
+        AddStep(s, "scene_item_uniform_scale_4x3", true,
+                "scale=" + std::to_string(scale) + "x" + std::to_string(scale) +
+                    " pos=" + std::to_string(pos.x) + "," + std::to_string(pos.y) +
                     " (window " + std::to_string(s.capture_width) + "x" +
-                    std::to_string(s.capture_height) + " -> canvas 1920x1080)");
+                    std::to_string(s.capture_height) + " -> game area 1440x1080)");
     }
+
+    a3::RegisterStatusPanelSource();
+    AddStep(s, "register_status_panel_source", true, "obs_register_source_s(a3_status_panel)");
+    obs_data_t* psettings = obs_data_create();
+    obs_data_set_string(psettings, "title", "AUTO-HEROS3");
+    obs_data_set_string(psettings, "session", s.opt.pipe_name.empty() ? "live" : s.opt.pipe_name.c_str());
+    s.panel_source = obs_source_create("a3_status_panel", "S5b Status Panel", psettings, nullptr);
+    obs_data_release(psettings);
+    AddStep(s, "create_status_panel_source", s.panel_source != nullptr,
+            "a3_status_panel 480x1080 BGRA async video (no audio)");
+    if (!s.panel_source) {
+        s.failure_exit_code = 8;
+        return false;
+    }
+    obs_sceneitem_t* panel_item = obs_scene_add(s.scene, s.panel_source);
+    AddStep(s, "scene_add_status_panel", panel_item != nullptr, "panel added at x=1440");
+    if (!panel_item) {
+        s.failure_exit_code = 8;
+        return false;
+    }
+    struct vec2 panel_pos = {};
+    panel_pos.x = 1440.0f;
+    panel_pos.y = 0.0f;
+    obs_sceneitem_set_pos(panel_item, &panel_pos);
+    AddStep(s, "status_panel_layout", true, "panel 480x1080 at (1440,0); game 1440x1080 on the left");
     if (!CreateRawAudioSource(s)) {
         return false;
     }

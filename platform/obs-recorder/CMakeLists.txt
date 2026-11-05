@@ -86,6 +86,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
     src/media/media_selftest.cpp
     src/media/gen_av_source.cpp
     src/media/raw_audio_source.cpp
+    src/media/panel_source.cpp
     src/json_util.cpp
   )
   target_compile_features(obs-media-selftest PRIVATE cxx_std_17)
@@ -104,6 +105,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
   target_link_libraries(obs-media-selftest PRIVATE
     "${OBS_SDK_LIB}"
     advapi32
+    gdi32
     version
   )
   set_target_properties(obs-media-selftest PROPERTIES

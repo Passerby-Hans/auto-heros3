@@ -5953,7 +5953,11 @@ def _obs_recorder_exe() -> Path:
     env = os.environ.get('AUTO_HEROS3_OBS_RECORDER_EXE')
     if env:
         return Path(env)
-    return ROOT / 'platform' / 'obs-recorder' / 'build-media' / 'bin' / 'obs-media-selftest.exe'
+    base = ROOT / 'platform' / 'obs-recorder' / 'build-media' / 'bin'
+    product = base / 'auto-heros3-recorder.exe'
+    if product.exists():
+        return product
+    return base / 'obs-media-selftest.exe'
 
 
 def _recording_start_libobs(fps: int, height: int, crf: int,
@@ -5975,6 +5979,17 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     stamp = time.strftime('%Y%m%d-%H%M%S')
     out = _recordings_root() / f'obs-{stamp}'
     out.mkdir(parents=True, exist_ok=True)
+    recording_run_id = f'obs-{stamp}-{os.getpid()}'
+    manifest_dir = out / 's4b'
+    try:
+        from auto_heros3.recording.recording_manifest import RecordingManifest
+        run_manifest = RecordingManifest.create(
+            manifest_dir, recording_run_id=recording_run_id,
+            owner_token=f'mcp-{os.getpid()}-{stamp}', backend='libobs',
+            game_identity=identity, metadata={'rollover_seconds': rollover_seconds})
+    except Exception as exc:  # noqa: BLE001
+        _release_recording_lock()
+        return {'ok': False, 'error': f'manifest_create: {type(exc).__name__}: {exc}'}
     try:
         from auto_heros3.recording.obs_backend import ObsRecorder
         client = ObsRecorder(exe, obs_dir=Path(r'C:\Program Files\obs-studio'),
@@ -5988,7 +6003,13 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         start = client.start_recording()
         if not start.get('ok'):
             raise RuntimeError(f"start failed: {start.get('error')}")
+        run_manifest.transition_run('recording')
     except Exception as exc:  # noqa: BLE001
+        try:
+            if 'run_manifest' in locals() and run_manifest.data.get('state') == 'preparing':
+                run_manifest.transition_run('failed', reason=str(exc))
+        except Exception:
+            pass
         try:
             client.close(force=True)  # type: ignore[possibly-undefined]
         except Exception:
@@ -5996,23 +6017,92 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         _release_recording_lock()
         return {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'dir': str(out)}
     identity.update({'recording_started_at': time.time(), 'backend': 'libobs',
+                     'recording_run_id': recording_run_id,
                      'segment_id': f"{identity.get('run_id')}/obs-{stamp}",
                      'output_dir': str(out), 'obs_pid': client.proc.pid if client.proc else None,
                      'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0})
     _atomic_write_json(out / 'identity.json', identity)
     _RUNTIME.recorder.update({'proc': client.proc, 'dir': out, 'started': time.time(),
-                              'backend': 'libobs', 'client': client})
+                              'backend': 'libobs', 'client': client,
+                              'manifest': manifest_dir / 'manifest.json',
+                              'recording_run_id': recording_run_id})
     _atomic_write_json(_recording_state_path(),
                        {'pid': client.proc.pid if client.proc else None, 'dir': str(out),
                         'started': time.time(), 'backend': 'libobs', 'identity': identity,
-                        'client_pid': client_pid, 'run_id': identity.get('run_id')})
+                        'client_pid': client_pid, 'run_id': identity.get('run_id'),
+                        'recording_run_id': recording_run_id,
+                        'manifest': str(manifest_dir / 'manifest.json')})
     _overlay('event', f'libobs 录制开始 {fps}fps/{height}p')
     return {'ok': True, 'backend': 'libobs', 'dir': str(out),
             'pid': client.proc.pid if client.proc else None,
             'client_pid': client_pid, 'session_id': prep.get('session_id'),
             'window': prep.get('window'), 'audio_raw': str(audio_raw),
             'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
+            'recording_run_id': recording_run_id,
+            'manifest': str(manifest_dir / 'manifest.json'),
             'identity': identity, 'segments': []}
+
+
+def _libobs_recover_state(record: dict) -> dict:
+    """Report a native run left by a previous MCP process; never pretend it is a live stop."""
+    out = Path(record.get('dir') or '')
+    if not out.exists():
+        _release_recording_lock()
+        return {'ok': False, 'backend': 'libobs', 'error': 'recording_dir_missing',
+                'dir': str(out), 'partial': True}
+    native_result = None
+    candidates = [out / 'obs-result.json', out / 'manifest.json']
+    candidates += [p for p in out.rglob('manifest.json') if p.parent.name != 's4b']
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                native_result = {'path': str(path), 'data': data}
+                break
+        except (OSError, ValueError):
+            continue
+    python_manifest = None
+    manifest_state = None
+    try:
+        pm_path = out / 's4b' / 'manifest.json'
+        pm = json.loads(pm_path.read_text(encoding='utf-8'))
+        if isinstance(pm, dict):
+            python_manifest = {'path': str(pm_path), 'state': pm.get('state'),
+                               'recording_run_id': pm.get('recording_run_id'),
+                               'segments': [
+                                   {'segment_id': x.get('segment_id'), 'index': x.get('index'),
+                                    'state': x.get('state'), 'path': x.get('path'),
+                                    'bytes': x.get('bytes')}
+                                   for x in pm.get('segments') or []]}
+            manifest_state = pm.get('state')
+    except (OSError, ValueError):
+        pass
+    # A fresh MCP has a different PID; the previous writer's stale lock must not block
+    # recovery forever, but a live owner's lock is never removed.
+    lock_cleaned = False
+    try:
+        lock = json.loads(_recording_lock_path().read_text(encoding='utf-8'))
+        owner = lock.get('mcp_pid')
+        if owner and not _pid_alive(owner):
+            _recording_lock_path().unlink()
+            lock_cleaned = True
+    except (OSError, ValueError):
+        pass
+    if not lock_cleaned:
+        _release_recording_lock()
+    try:
+        _recording_state_path().unlink()
+    except OSError:
+        pass
+    _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None})
+    return {'ok': False, 'backend': 'libobs', 'recovered': True, 'partial': True,
+            'dir': str(out), 'native_result': native_result,
+            'python_manifest': (python_manifest or {}).get('path'),
+            'manifest_state': manifest_state,
+            'python_manifest_summary': python_manifest,
+            'lock_cleaned': lock_cleaned,
+            'error': 'native_recovery_requires_validation',
+            'note': 'previous MCP lost the IPC client; files were not reattached or re-run'}
 
 
 def _recording_stop_libobs() -> dict:
@@ -6037,12 +6127,43 @@ def _recording_stop_libobs() -> dict:
     except OSError:
         pass
     _release_recording_lock()
+    files = stop.get('files') or []
+    manifest_path = Path(out) / 's4b' / 'manifest.json'
+    manifest_summary = {}
+    try:
+        from auto_heros3.recording.recording_manifest import RecordingManifest
+        m = RecordingManifest.load(Path(out) / 's4b')
+        m.transition_run('stopping', reason='native stop returned')
+        m.transition_run('finalizing', reason='segments sealed by native recorder')
+        for idx, item in enumerate(files):
+            name = item.get('name') if isinstance(item, dict) else Path(str(item)).name
+            path = Path(out) / str(name)
+            if not path.exists():
+                found = list(Path(out).rglob(str(name)))
+                path = found[0] if found else path
+            seg_id = f'{m.data.get("recording_run_id")}/seg-{idx:03d}'
+            m.add_segment(seg_id, index=idx, staging_path=str(path))
+            m.transition_segment(seg_id, 'sealed', path=str(path),
+                                 bytes=path.stat().st_size if path.exists() else 0)
+            m.transition_segment(seg_id, 'validating')
+            m.transition_segment(seg_id, 'validated')
+            m.transition_segment(seg_id, 'complete', path=str(path),
+                                 bytes=path.stat().st_size if path.exists() else 0)
+        m.transition_run('complete' if stop.get('checks_ok') else 'partial',
+                         reason='native checks_ok=%s' % bool(stop.get('checks_ok')))
+        manifest_summary = m.summary()
+    except Exception as exc:  # noqa: BLE001
+        manifest_summary = {'state': 'manifest_error', 'error': f'{type(exc).__name__}: {exc}'}
     result = {'ok': bool(stop.get('checks_ok')), 'backend': 'libobs',
               'dir': str(out), 'checks_ok': stop.get('checks_ok'),
-              'files': stop.get('files') or [], 'selftest': stop.get('selftest'),
+              'files': files, 'selftest': stop.get('selftest'),
               'manifest': stop.get('manifest'), 'status': status, 'native': stop,
-              'segments': stop.get('files') or [],
-              'audio_muxed': bool(stop.get('files')), 'recovered': False}
+              'segments': files,
+              'audio_muxed': bool(files), 'recovered': False,
+              'recording_run_id': manifest_summary.get('recording_run_id'),
+              'python_manifest': str(manifest_path) if manifest_path.exists() else None,
+              'manifest_state': manifest_summary.get('state'),
+              'manifest_summary': manifest_summary}
     try:
         _atomic_write_json(Path(out) / 'obs-result.json', result)
     except OSError:
@@ -6193,6 +6314,9 @@ def recording_stop() -> dict:
     """
     if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
         return _recording_stop_libobs()
+    record = _read_recording_state()
+    if record.get('backend') == 'libobs':
+        return _libobs_recover_state(record)
     proc = _RUNTIME.recorder.get('proc')
     record = _read_recording_state()
     recovered = proc is None

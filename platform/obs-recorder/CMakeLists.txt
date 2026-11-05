@@ -144,4 +144,14 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
       COMMENT "Staging OBS runtime ${dll}"
     )
   endforeach()
+
+  # Product-facing executable name.  Keep obs-media-selftest.exe as the
+  # compatibility/test name (existing smoke scripts and historical evidence use
+  # it); the final recorder CLI is the same binary under the product name.
+  add_custom_command(TARGET obs-media-selftest POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "$<TARGET_FILE:obs-media-selftest>"
+      "$<TARGET_FILE_DIR:obs-media-selftest>/auto-heros3-recorder.exe"
+    COMMENT "Publishing auto-heros3-recorder.exe"
+  )
 endif()

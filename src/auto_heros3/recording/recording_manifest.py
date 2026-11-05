@@ -54,7 +54,21 @@ def _atomic_json(path: Path, data: dict) -> None:
             os.fsync(f.fileno())
         except OSError:
             pass
-    os.replace(tmp, path)
+    # Windows indexers/AV can briefly hold the destination open.  Retry the
+    # atomic replace instead of leaving the manifest stuck in finalizing.
+    last_exc = None
+    for attempt in range(8):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    raise ManifestError(f'cannot replace manifest {path}: {last_exc}') from last_exc
 
 
 def _append_journal(path: Path, event: dict) -> None:

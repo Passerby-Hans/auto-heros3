@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 
 from auto_heros3.recording.recording_manifest import (  # noqa: E402
     ManifestError, RecordingManifest, read_journal)
+import auto_heros3.recording.recording_manifest as rm  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -88,6 +89,23 @@ def main() -> int:
         reloaded = RecordingManifest.load(run_dir)
         check('final_reload', reloaded.data['state'] == 'complete'
               and reloaded.data['segments'][0]['bytes'] == 1234)
+
+        # Windows transient PermissionError on os.replace must be retried.
+        atomic = run_dir / 'atomic.json'
+        original_replace = rm.os.replace
+        attempts = {'n': 0}
+        def flaky_replace(src, dst):
+            attempts['n'] += 1
+            if attempts['n'] < 3:
+                raise PermissionError('simulated transient lock')
+            return original_replace(src, dst)
+        rm.os.replace = flaky_replace
+        try:
+            rm._atomic_json(atomic, {'ok': True})
+            check('atomic_replace_retry', attempts['n'] == 3 and atomic.exists(),
+                  f'attempts={attempts["n"]}')
+        finally:
+            rm.os.replace = original_replace
 
     for name, ok, detail in RESULTS:
         print(('PASS ' if ok else 'FAIL ') + name + (f'  ({detail})' if detail else ''))

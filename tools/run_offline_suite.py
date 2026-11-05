@@ -50,6 +50,7 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_p5_fixes.py",
     "test_protocol_mock.py",
     "test_recording_health.py",
+    "test_recording_manifest.py",
     "test_recording_segment.py",
     "test_short_game_tools.py",
     "test_t35_spellcasting.py",

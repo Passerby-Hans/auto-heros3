@@ -154,8 +154,16 @@ Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $stage 'SDL2.dll') 
 $hash = (Get-FileHash -LiteralPath (Join-Path $stage 'SDL2.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $cl) { throw 'cl.exe not available for a3capture smoke' }
+$sourceCommit = ''
+$sourceDirty = $null
+try {
+    $sourceCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null | Out-String).Trim()
+    $sourceDirty = [bool]((& git -C $RepoRoot status --porcelain 2>$null | Out-String).Trim())
+} catch { }
 $info = [ordered]@{
     built_at_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    source_commit = $sourceCommit
+    source_dirty = $sourceDirty
     source_dir = $SdlDir
     source_tag = 'release-2.32.10'
     source_sha256 = $archiveHash

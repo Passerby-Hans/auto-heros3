@@ -492,6 +492,13 @@ class VcmiAgent:
         if self.audio_driver not in ('disk', 'a3capture'):
             self._restore_video_settings()
             raise BridgeError(f'unsupported audio driver {self.audio_driver!r}')
+        if self.audio_driver == 'a3capture':
+            # A killed previous client may leave a stale ready marker; readiness
+            # must be produced by this launch, not inherited from the last one.
+            try:
+                self.a3capture_ready_path.unlink()
+            except OSError:
+                pass
         self._restore_video_settings()
         self._patch_video_settings()
         try:

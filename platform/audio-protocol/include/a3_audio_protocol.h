@@ -10,6 +10,8 @@
 // boundaries using header_bytes/payload_bytes and the two CRC32 values.
 #pragma once
 
+#include "a3_audio_wire.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -61,6 +63,19 @@ struct PacketHeader {
 #pragma pack(pop)
 
 static_assert(sizeof(PacketHeader) == kHeaderBytes, "wire header size changed");
+static_assert(sizeof(PacketHeader) == sizeof(A3AudioPacketHeader),
+              "C and C++ wire header sizes diverged");
+static_assert(offsetof(PacketHeader, sequence) == offsetof(A3AudioPacketHeader, sequence),
+              "C and C++ sequence offset diverged");
+static_assert(offsetof(PacketHeader, sample_start) ==
+                  offsetof(A3AudioPacketHeader, sample_start),
+              "C and C++ sample_start offset diverged");
+static_assert(offsetof(PacketHeader, planned_qpc) ==
+                  offsetof(A3AudioPacketHeader, planned_qpc),
+              "C and C++ planned_qpc offset diverged");
+static_assert(offsetof(PacketHeader, header_crc32) ==
+                  offsetof(A3AudioPacketHeader, header_crc32),
+              "C and C++ header_crc32 offset diverged");
 
 uint32_t Crc32(const void* data, size_t bytes);
 

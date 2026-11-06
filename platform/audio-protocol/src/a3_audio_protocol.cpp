@@ -92,6 +92,9 @@ bool ValidatePacket(const PacketHeader& header, const void* payload,
     if (header.sample_count == 0 && !(header.flags & kFlagLast)) {
         return Fail(error, "empty_packet_without_last");
     }
+    if (header.reserved0 != 0 || header.reserved1 != 0) {
+        return Fail(error, "nonzero_reserved");
+    }
     if ((header.flags & kFlagDiscontinuity) != 0) {
         if (header.discontinuity_count == 0 ||
             header.discontinuity_start >
@@ -101,12 +104,8 @@ bool ValidatePacket(const PacketHeader& header, const void* payload,
     } else if (header.discontinuity_count != 0) {
         return Fail(error, "discontinuity_without_flag");
     }
-    if (header.header_crc32 == 0) {
-        return Fail(error, "missing_header_crc");
-    }
-    if (header.payload_bytes > 0 && header.payload_crc32 == 0) {
-        return Fail(error, "missing_payload_crc");
-    }
+    // CRC32 value 0 is a legal result; presence is proven by comparing the
+    // computed value with the field, not by a non-zero sentinel.
 
     PacketHeader copy = header;
     copy.header_crc32 = 0;

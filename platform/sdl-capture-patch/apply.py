@@ -37,7 +37,11 @@ def main() -> int:
     target.mkdir(parents=True, exist_ok=True)
     for src in (patch / "src" / "a3capture").glob("*"):
         shutil.copy2(src, target / src.name)
-    print(f"copied backend sources -> {target}")
+    # Share the A1 QPC deadline implementation with the C backend.
+    clock_dir = root / "platform" / "obs-recorder" / "src" / "audio"
+    for name in ("audio_clock_c.c", "audio_clock_c.h"):
+        shutil.copy2(clock_dir / name, target / name)
+    print(f"copied backend + shared C clock -> {target}")
 
     patch_text(
         sdl / "include" / "SDL_config.h.cmake",

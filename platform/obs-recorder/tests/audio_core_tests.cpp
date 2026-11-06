@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+extern "C" int a3_wire_c_layout_ok(void);
+
 namespace {
 
 int g_failures = 0;
@@ -64,6 +66,7 @@ int main()
     using namespace a3::audio;
 
     Check("protocol_header_is_128_bytes", sizeof(PacketHeader) == kHeaderBytes);
+    Check("c_wire_layout", a3_wire_c_layout_ok() == 1);
     Check("protocol_descriptor", ProtocolDescriptor().find("a3-audio/1") != std::string::npos,
           ProtocolDescriptor());
 
@@ -71,7 +74,15 @@ int main()
     auto good = MakeHeader(0, 1024);
     std::string err;
     Check("valid_packet_roundtrip", Valid(good, payload, &err), err);
-    Check("valid_packet_crc_nonzero", good.header_crc32 != 0 && good.payload_crc32 != 0);
+
+    // CRC32 value zero is a legal result.  9d 0a d9 6d is one stereo s16le
+    // frame whose payload CRC32 is exactly zero; validation must accept it.
+    std::vector<uint8_t> zero_crc_payload = {0x9d, 0x0a, 0xd9, 0x6d};
+    auto zero_crc_header = MakeHeader(0, 1);
+    Check("zero_payload_crc_vector",
+          Valid(zero_crc_header, zero_crc_payload, &err) &&
+              zero_crc_header.payload_crc32 == 0,
+          "crc=" + std::to_string(zero_crc_header.payload_crc32) + " " + err);
 
     auto bad = good;
     bad.magic[0] = 'X';
@@ -84,6 +95,11 @@ int main()
     bad = good;
     bad.sample_format = 99;
     Check("reject_format", !ValidatePacket(bad, payload.data(), payload.size(), &err), err);
+
+    bad = good;
+    bad.reserved0 = 1;
+    Check("reject_nonzero_reserved",
+          !ValidatePacket(bad, payload.data(), payload.size(), &err), err);
 
     bad = good;
     bad.payload_bytes -= 4;
@@ -139,7 +155,7 @@ int main()
 
     FrameScheduler scheduler(clock, 0);
     const auto d0 = scheduler.next_deadline_qpc();
-    scheduler.advance(1024);
+    Check("scheduler_advance_ok", scheduler.advance(1024));
     const auto d1 = scheduler.next_deadline_qpc();
     Check("scheduler_absolute_deadline", d0.has_value() && d1.has_value() && *d1 > *d0);
     Check("scheduler_frame_cursor", scheduler.next_frame() == 1024);
@@ -154,6 +170,9 @@ int main()
     const auto before = scheduler.next_deadline_qpc();
     Check("processing_time_does_not_move_deadline",
           before == scheduler.next_deadline_qpc());
+
+    FrameScheduler overflow_scheduler(clock, UINT64_MAX - 1);
+    Check("scheduler_advance_overflow_rejected", !overflow_scheduler.advance(2));
 
     std::cout << (g_failures == 0 ? "ALL_PASS" : "FAILURES") << " checks=" << g_checks
               << " failures=" << g_failures << '\n';

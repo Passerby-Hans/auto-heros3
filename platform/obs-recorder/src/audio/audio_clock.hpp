@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -72,7 +73,16 @@ public:
     int64_t remaining_qpc(uint64_t now_qpc) const;
 
     // Advances by exactly the frames actually accepted from the callback.
-    void advance(uint32_t frames) { next_frame_ += frames; }
+    // Returns false on uint64_t cursor overflow; callers must fail the capture
+    // rather than wrap the sample timeline.
+    bool advance(uint32_t frames)
+    {
+        if (frames > std::numeric_limits<uint64_t>::max() - next_frame_) {
+            return false;
+        }
+        next_frame_ += frames;
+        return true;
+    }
 
     // A small bounded catch-up policy for the producer, not a hidden rate
     // correction.  Returns false when the late interval exceeds

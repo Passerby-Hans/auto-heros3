@@ -144,9 +144,12 @@ int main(int argc, char **argv)
     FILE *f = fopen(argv[2], "rb");
     long bytes = 0;
     if (f) { fseek(f, 0, SEEK_END); bytes = ftell(f); fclose(f); }
-    char detail[128];
-    snprintf(detail, sizeof(detail), "bytes=%ld", bytes);
-    check("pcm_written", bytes > 100000, detail);
+    char detail[160];
+    const long expected = 1200L * 44100L * 2L * 2L / 1000L; /* 1.2 s */
+    snprintf(detail, sizeof(detail), "bytes=%ld expected~%ld", bytes, expected);
+    check("pcm_written", bytes > 0, detail);
+    check("pcm_rate_bounds",
+          bytes >= expected * 95L / 100L && bytes <= expected * 105L / 100L, detail);
     printf("DLL_VERSION %u.%u.%u\n", ver.major, ver.minor, ver.patch);
     printf("DRIVER %s\n", driver ? driver : "");
     printf("AUDIO %s\n", spec);

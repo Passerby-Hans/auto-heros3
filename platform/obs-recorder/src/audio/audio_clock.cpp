@@ -1,4 +1,5 @@
 #include "audio_clock.hpp"
+#include "audio_clock_c.h"
 
 #include <limits>
 #include <sstream>
@@ -6,8 +7,10 @@
 namespace a3::audio {
 namespace {
 
-constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
-constexpr uint64_t kMaxI64 = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+a3_qpc_clock ToC(const SampleClock& clock)
+{
+    return a3_qpc_clock{clock.epoch_qpc(), clock.qpc_frequency(), clock.sample_rate()};
+}
 
 }  // namespace
 
@@ -16,42 +19,21 @@ std::optional<uint64_t> SampleClock::deadline_qpc(uint64_t frame) const
     if (!valid()) {
         return std::nullopt;
     }
-    const uint64_t q = frame / sample_rate_;
-    const uint64_t r = frame % sample_rate_;
-    if (q != 0 && qpc_frequency_ > (kMaxU64 - epoch_qpc_) / q) {
+    const a3_qpc_clock c = ToC(*this);
+    uint64_t deadline = 0;
+    if (!a3_qpc_deadline(&c, frame, &deadline)) {
         return std::nullopt;
     }
-    const uint64_t base = q * qpc_frequency_;
-    uint64_t remainder = 0;
-    if (r != 0) {
-        if (qpc_frequency_ > kMaxU64 / r) {
-            return std::nullopt;
-        }
-        remainder = (r * qpc_frequency_) / sample_rate_;
-    }
-    if (base > kMaxU64 - epoch_qpc_ ||
-        remainder > kMaxU64 - epoch_qpc_ - base) {
-        return std::nullopt;
-    }
-    return epoch_qpc_ + base + remainder;
+    return deadline;
 }
 
 int64_t SampleClock::remaining_qpc(uint64_t now_qpc, uint64_t frame) const
 {
-    const auto deadline = deadline_qpc(frame);
-    if (!deadline.has_value()) {
+    if (!valid()) {
         return std::numeric_limits<int64_t>::min();
     }
-    if (*deadline >= now_qpc) {
-        const uint64_t delta = *deadline - now_qpc;
-        return delta > kMaxI64 ? std::numeric_limits<int64_t>::max()
-                               : static_cast<int64_t>(delta);
-    }
-    const uint64_t delta = now_qpc - *deadline;
-    if (delta > kMaxI64) {
-        return std::numeric_limits<int64_t>::min();
-    }
-    return -static_cast<int64_t>(delta);
+    const a3_qpc_clock c = ToC(*this);
+    return a3_qpc_remaining(&c, now_qpc, frame);
 }
 
 int64_t FrameScheduler::remaining_qpc(uint64_t now_qpc) const

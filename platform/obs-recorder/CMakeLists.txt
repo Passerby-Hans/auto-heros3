@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(obs-recorder LANGUAGES CXX)
+project(obs-recorder LANGUAGES C CXX)
 
 # S0/S1a host scaffold: MSVC + Windows only.  obs.dll is loaded dynamically at
 # runtime, so no OBS SDK headers/import library are required to build this.
@@ -52,7 +52,9 @@ set_target_properties(obs-recorder PROPERTIES
 # ---------------------------------------------------------------------------
 add_executable(audio-core-tests
   tests/audio_core_tests.cpp
+  tests/audio_wire_c_test.c
   src/audio/audio_clock.cpp
+  src/audio/audio_clock_c.c
   ../audio-protocol/src/a3_audio_protocol.cpp
 )
 target_compile_features(audio-core-tests PRIVATE cxx_std_17)

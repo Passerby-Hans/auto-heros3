@@ -13,6 +13,32 @@ if (-not $BuildDir) { $BuildDir = Join-Path $scriptDir 'build' }
 $SdlDir = (Resolve-Path $SdlDir).Path
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
+function Get-Sha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$lockPath = Join-Path $scriptDir 'source-lock.json'
+$lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$archive = Join-Path $RepoRoot 'vendor\downloads\SDL-release-2.32.10.tar.gz'
+if (-not (Test-Path -LiteralPath $archive)) {
+    throw "source-lock archive missing: $archive"
+}
+$archiveHash = Get-Sha256 $archive
+if ($archiveHash -ne $lock.source_sha256) {
+    throw "source lock mismatch: archive=$archiveHash expected=$($lock.source_sha256)"
+}
+$patchFiles = @(
+    (Join-Path $scriptDir 'apply.py'),
+    (Join-Path $scriptDir 'src\a3capture\SDL_a3capture.c'),
+    (Join-Path $scriptDir 'tests\a3capture_smoke.c'),
+    (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.c'),
+    (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.h')
+)
+$patchConcat = ($patchFiles | ForEach-Object { (Get-Content -LiteralPath $_ -Raw) }) -join "`n---A3PATCH---`n"
+$patchHash = [System.BitConverter]::ToString(
+    [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($patchConcat))
+).Replace('-', '').ToLowerInvariant()
+Write-Host ("source lock verified: archive={0} patch={1}" -f $archiveHash, $patchHash)
+
 function Find-Tool([string[]]$Candidates) {
     foreach ($candidate in $Candidates) {
         if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
@@ -45,7 +71,8 @@ if (-not $ninja) { throw 'ninja.exe not found' }
 # Apply the tracked backend patch to the ignored SDL source tree.
 $python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { $python = 'python.exe' }
-& $python (Join-Path $scriptDir 'apply.py')
+$applyPy = Join-Path $scriptDir 'apply.py'
+& $python $applyPy --sdl-dir $SdlDir --patch-dir $scriptDir
 if ($LASTEXITCODE -ne 0) { throw 'SDL backend patch failed' }
 
 $envBat = Join-Path $BuildDir 'vcvars_env.bat'
@@ -109,15 +136,24 @@ $stage = Join-Path $scriptDir 'stage'
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $stage 'SDL2.dll') -Force
 $hash = (Get-FileHash -LiteralPath (Join-Path $stage 'SDL2.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+$cl = (Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $cl) { throw 'cl.exe not available for a3capture smoke' }
 $info = [ordered]@{
     built_at_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     source_dir = $SdlDir
     source_tag = 'release-2.32.10'
+    source_sha256 = $archiveHash
+    source_lock_verified = $true
+    patch_sha256 = $patchHash
     output = (Join-Path $stage 'SDL2.dll')
     sha256 = $hash
     bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
     build_dir = $BuildDir
     backend = 'a3capture'
+    cmake = $cmake
+    ninja = $ninja
+    cl = $cl
+    generator = 'Ninja'
 }
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
 Write-Host ('SDL2.dll -> {0} sha256={1}' -f (Join-Path $stage 'SDL2.dll'), $hash)

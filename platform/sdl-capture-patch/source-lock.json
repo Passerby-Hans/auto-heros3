@@ -3,11 +3,15 @@
   "runtime_sha256": "76ec39741feed5bb949a8126735ec3aec7737b8de6dfc4f6333b9f0eba3dc10c",
   "runtime_version": "2.32.10.0",
   "schema_version": 1,
-  "backend_status": "planned",
+  "backend_status": "validated_spike",
   "note": "Private SDL2.dll must be built from pinned source and staged locally; do not replace Conan/system DLL.",
   "source_url": "https://github.com/libsdl-org/SDL/releases/tag/release-2.32.10",
   "backend_name": "a3capture",
   "source_tag": "release-2.32.10",
   "protocol": "a3-audio/1",
-  "runtime_dll": "vendor/vcmi-1.7.5/SDL2.dll"
+  "runtime_dll": "vendor/vcmi-1.7.5/SDL2.dll",
+  "private_dll_sha256": "2c7f92401f63dd3afc52469f32b6e7bab27bffabdadcf83bc578735a4c66f8e0",
+  "private_dll_bytes": 1801216,
+  "smoke": "PASS: explicit private DLL load; driver=a3capture; 44.1k/s16/2ch/1024; 212992 raw bytes; dependencies exclude MMDevAPI/audioses",
+  "a2_vcmi": "PASS: VCMI_client loaded a3capture from vendor/vcmi-src/build/bin/SDL2.dll; wrote 2478080 raw bytes in 5s; Mix_OpenAudio=OK"
 }

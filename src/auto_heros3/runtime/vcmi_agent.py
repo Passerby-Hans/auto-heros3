@@ -205,6 +205,11 @@ class VcmiAgent:
         self.audio_ready_path = self.dir / 'audio-relay.ready'
         self.audio_relay_proc: subprocess.Popen | None = None
         self.audio_pipe_name: str | None = None
+        # A2 spike hook.  Default remains the existing SDL disk sink.  The
+        # private backend is selected explicitly for staged-DLL experiments.
+        self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'disk').strip()
+        self.a3capture_file = Path(os.environ.get(
+            'AUTO_HEROS3_A3CAPTURE_FILE', str(self.dir / 'a3capture.raw'))).resolve()
         self.session: Session | None = None
         self._pending_seq = 0
         self._seq_offset: dict[int, int] = {}
@@ -365,6 +370,11 @@ class VcmiAgent:
         while the game is running.  No physical audio endpoint is touched.
         """
         self.dir.mkdir(parents=True, exist_ok=True)
+        if self.audio_driver != 'disk':
+            # The private a3capture backend writes its own stream; no disk pipe
+            # or relay exists in this experimental path.
+            self.audio_pipe_name = None
+            return
         try:
             self.audio_sink_path.unlink()
         except FileNotFoundError:
@@ -478,6 +488,9 @@ class VcmiAgent:
         if self.map_name:
             args += ['--agent-start', q(self.map_name)]
         # Recover a backup left by a crashed/previous MCP process before taking a new snapshot.
+        if self.audio_driver not in ('disk', 'a3capture'):
+            self._restore_video_settings()
+            raise BridgeError(f'unsupported audio driver {self.audio_driver!r}')
         self._restore_video_settings()
         self._patch_video_settings()
         try:
@@ -485,10 +498,16 @@ class VcmiAgent:
         except Exception:
             self._restore_video_settings()
             raise
-        audio_pipe_path = '\\\\.\\pipe\\' + str(self.audio_pipe_name)
+        if self.audio_driver == 'disk':
+            audio_pipe_path = '\\\\.\\pipe\\' + str(self.audio_pipe_name)
+            audio_env = (f"$env:SDL_AUDIODRIVER='disk'; "
+                         f"$env:SDL_DISKAUDIOFILE={q(audio_pipe_path)}; ")
+        else:
+            self.a3capture_file.parent.mkdir(parents=True, exist_ok=True)
+            audio_env = (f"$env:SDL_AUDIODRIVER='{self.audio_driver}'; "
+                         f"$env:A3CAPTURE_FILE={q(str(self.a3capture_file))}; ")
         cmdline = (f"& {q(CONANRUN)}; "
-                   f"$env:SDL_AUDIODRIVER='disk'; "
-                   f"$env:SDL_DISKAUDIOFILE={q(audio_pipe_path)}; "
+                   + audio_env +
                    f"$env:AUTO_HEROS3_CHEAT_FILE={q(cheat_path)}; "
                    f"& {args[0]} " + ' '.join(args[1:]))
         self.proc = None

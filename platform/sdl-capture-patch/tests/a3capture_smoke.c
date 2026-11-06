@@ -148,7 +148,8 @@ int main(int argc, char **argv)
     FreeLibrary(h);
     printf("STEP DLL freed\n");
 
-    FILE *f = fopen(argv[2], "rb");
+    const int pipe_mode = getenv("A3CAPTURE_TEST_PIPE") != NULL;
+    FILE *f = pipe_mode ? NULL : fopen(argv[2], "rb");
     long bytes = 0;
     unsigned char header[128] = {0};
     size_t header_read = 0;
@@ -170,7 +171,9 @@ int main(int argc, char **argv)
               b[4] == 1 && b[5] == 0 && b[6] == 0x80 && b[7] == 0,
               "unexpected version/header size");
     }
-    if (getenv("A3CAPTURE_TEST_NO_PCM")) {
+    if (getenv("A3CAPTURE_TEST_PIPE")) {
+        check("pipe_mode_skip_file_check", 1, "named-pipe relay owns the framed stream");
+    } else if (getenv("A3CAPTURE_TEST_NO_PCM")) {
         check("no_pcm_expected", 1, "fault mode intentionally leaves no complete file");
     } else if (!getenv("A3CAPTURE_TEST_NO_THREAD")) {
         check("pcm_written", bytes > 0, detail);

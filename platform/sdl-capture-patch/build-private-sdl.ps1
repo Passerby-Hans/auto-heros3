@@ -31,6 +31,8 @@ $patchFiles = @(
     (Join-Path $scriptDir 'src\a3capture\SDL_a3capture.c'),
     (Join-Path $scriptDir 'tests\a3capture_smoke.c'),
     (Join-Path $scriptDir 'tests\validate_framed.py'),
+    (Join-Path $scriptDir 'tests\test_pipe.py'),
+    (Join-Path $RepoRoot 'platform\audio-protocol\python\a3_framed.py'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.c'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.h')
 )
@@ -211,6 +213,18 @@ if ($smokeExit -ne 0 -or $framedExit -ne 0) {
     $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
     throw "a3capture smoke failed (exit $smokeExit)"
 }
+
+# A3 named-pipe relay: same backend, but the framed stream goes through a pipe
+# server that validates/splits packets and writes raw + JSONL index + manifest.
+$pipeOut = Join-Path $stage 'a3pipe-relay'
+$pipeTest = Join-Path $scriptDir 'tests\test_pipe.py'
+$relayPy = Join-Path $RepoRoot 'platform\audio-protocol\python\a3_framed.py'
+& $python $pipeTest --smoke $smoke --dll (Join-Path $stage 'SDL2.dll') --relay $relayPy --out $pipeOut --duration-ms 1200
+$pipeExit = $LASTEXITCODE
+$info['pipe_relay_exit'] = $pipeExit
+$info['pipe_relay_manifest'] = if (Test-Path (Join-Path $pipeOut 'manifest.json')) { Get-Content (Join-Path $pipeOut 'manifest.json') -Raw } else { '' }
+$info | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+if ($pipeExit -ne 0) { throw 'framed named-pipe relay test failed' }
 
 # A2.1 fault injection: queue overflow and short write must set failed and
 # expose dropped/committed counters, not freeze the sample cursor.

@@ -14,7 +14,7 @@
   "private_dll_bytes": 1802752,
   "smoke": "PASS R2: explicit private DLL; driver=a3capture; 44.1k/s16/2ch/1024; 212992B in 1.2s; generated=queued=written=committed; rate bounds PASS; dependencies exclude MMDevAPI/audioses",
   "a2_vcmi": "PASS R3: VCMI loaded a3capture, audio_ready=true, non-zero raw PCM; no accurate timing window, not a rate claim",
-  "patch_sha256": "a344557ba8e86ef6e9806ac0c5ea6b13e20ac58ecd06812426500252b1cae9f8",
+  "patch_sha256": "166e233c623d9c060b55c097754142523e381078ff46d697e96892b399daf96d",
   "source_lock_verified": true,
   "fault_injection": "PASS: queue overflow, short write, no-thread cleanup, close timeout (bounded 5s/detached)",
   "a3_framed": "PASS: 53 packets, 53248 frames, first=1,last=2, header/payload CRC and sample continuity validated"

@@ -1795,7 +1795,7 @@ void CollectFinalEvidence(State& s)
                     !HasModule(s.process_modules, "win-wasapi.dll"),
                 "no MMDevAPI/audioses/win-wasapi module loaded (capture_audio=false)");
 
-        if (s.audio_enabled) {
+        if (s.audio_enabled && !s.framed_audio_enabled) {
             s.audio_stats = a3::GetRawAudioStats();
             AddStep(s, "raw_audio_reader_stats",
                     s.audio_stats.opened &&

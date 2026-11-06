@@ -1,6 +1,7 @@
 // Offline A0/A1 tests: wire protocol + absolute QPC scheduling.
 // Build target: audio-core-tests (see platform/obs-recorder/CMakeLists.txt).
 #include "a3_audio_protocol.h"
+#include "a3_audio_protocol_c.h"
 #include "audio_clock.hpp"
 
 #include <cstdint>
@@ -74,6 +75,9 @@ int main()
     auto good = MakeHeader(0, 1024);
     std::string err;
     Check("valid_packet_roundtrip", Valid(good, payload, &err), err);
+    Check("c_crc_matches_cpp",
+          a3_audio_crc32(payload.data(), payload.size()) ==
+              Crc32(payload.data(), payload.size()));
 
     // CRC32 value zero is a legal result.  9d 0a d9 6d is one stereo s16le
     // frame whose payload CRC32 is exactly zero; validation must accept it.

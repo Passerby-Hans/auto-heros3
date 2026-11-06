@@ -41,7 +41,11 @@ def main() -> int:
     clock_dir = root / "platform" / "obs-recorder" / "src" / "audio"
     for name in ("audio_clock_c.c", "audio_clock_c.h"):
         shutil.copy2(clock_dir / name, target / name)
-    print(f"copied backend + shared C clock -> {target}")
+    protocol_dir = root / "platform" / "audio-protocol"
+    for name in ("include/a3_audio_wire.h", "include/a3_audio_protocol_c.h",
+                 "src/a3_audio_protocol_c.c"):
+        shutil.copy2(protocol_dir / name, target / Path(name).name)
+    print(f"copied backend + shared C clock/wire -> {target}")
 
     patch_text(
         sdl / "include" / "SDL_config.h.cmake",

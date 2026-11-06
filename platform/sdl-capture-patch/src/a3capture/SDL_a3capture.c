@@ -21,6 +21,7 @@
 #include "../SDL_audio_c.h"
 #include "../SDL_sysaudio.h"
 #include "audio_clock_c.h"
+#include "a3_audio_protocol_c.h"
 
 /* Use Windows kernel threads and SDL_RWops.  The private SDL2 DLL is linked
  * with /NODEFAULTLIB; pulling stdio/_beginthreadex into the backend would
@@ -35,12 +36,7 @@
 
 typedef struct A3Packet
 {
-    Uint64 sequence;
-    Uint64 frame_start;
-    Uint32 frames;
-    Uint64 planned_qpc;
-    Uint64 actual_start_qpc;
-    Uint64 actual_end_qpc;
+    A3AudioPacketHeader header;
     Uint8 *data;
 } A3Packet;
 
@@ -61,6 +57,15 @@ struct SDL_PrivateAudioData
     int queue_head;
     int queue_count;
     Uint32 payload_bytes;
+    Uint64 capture_id;
+    Uint32 generation;
+    Uint64 capture_epoch_qpc;
+    SDL_bool sent_any;
+    Uint64 pending_discontinuity_start;
+    Uint64 pending_discontinuity_count;
+    A3AudioPacketHeader final_header;
+    SDL_bool final_requested;
+    SDL_bool final_written;
     Uint64 next_sequence;
     Uint64 generated_frames;
     Uint64 queued_frames;
@@ -109,9 +114,27 @@ static DWORD WINAPI A3Worker(LPVOID arg)
         }
         if (h->queue_count == 0 && h->stopping) {
             const Uint32 close_delay = h->test_close_delay_ms;
+            A3AudioPacketHeader final_header = h->final_header;
+            const SDL_bool final_requested = h->final_requested;
             SDL_UnlockMutex(h->lock);
             if (close_delay) {
                 SDL_Delay(close_delay);
+            }
+            if (final_requested && !h->final_written) {
+                const size_t wrote = SDL_RWwrite(h->out, &final_header, 1, sizeof(final_header));
+                SDL_LockMutex(h->lock);
+                if (wrote == sizeof(final_header)) {
+                    h->final_written = SDL_TRUE;
+                    ++h->written_packets;
+                    h->written_bytes += sizeof(final_header);
+                } else {
+                    h->failed = SDL_TRUE;
+                    SDL_snprintf(h->write_error, sizeof(h->write_error),
+                                 "short final header %llu/%llu",
+                                 (unsigned long long)wrote,
+                                 (unsigned long long)sizeof(final_header));
+                }
+                SDL_UnlockMutex(h->lock);
             }
             break;
         }
@@ -124,35 +147,36 @@ static DWORD WINAPI A3Worker(LPVOID arg)
             if (h->test_worker_delay_ms) {
                 SDL_Delay(h->test_worker_delay_ms);
             }
-            const size_t expected = (size_t)packet->frames * 2u * 2u;
-            if (!h->out || expected == 0) {
-                SDL_LockMutex(h->lock);
+            const size_t payload = (size_t)packet->header.sample_count * 2u * 2u;
+            const size_t header_len = sizeof(packet->header);
+            const size_t payload_write =
+                (h->test_short_write && payload > 1) ? payload - 1 : payload;
+            size_t header_wrote = 0;
+            size_t payload_wrote = 0;
+            if (h->out) {
+                header_wrote = SDL_RWwrite(h->out, &packet->header, 1, header_len);
+                if (header_wrote == header_len && payload_write > 0) {
+                    payload_wrote = SDL_RWwrite(h->out, packet->data, 1, payload_write);
+                }
+            }
+            SDL_LockMutex(h->lock);
+            if (header_wrote == header_len && payload_wrote == payload) {
+                ++h->written_packets;
+                h->written_bytes += header_len + payload;
+                h->written_frames += packet->header.sample_count;
+                h->committed_frames = h->written_frames;
+            } else {
                 h->failed = SDL_TRUE;
                 SDL_snprintf(h->write_error, sizeof(h->write_error),
-                             "missing output or empty packet");
-                h->free_slots[h->free_count++] = packet;
-                SDL_UnlockMutex(h->lock);
-            } else {
-                const size_t write_len =
-                    (h->test_short_write && expected > 1) ? expected - 1 : expected;
-                const size_t wrote = SDL_RWwrite(h->out, packet->data, 1, write_len);
-                SDL_LockMutex(h->lock);
-                if (wrote == expected) {
-                    ++h->written_packets;
-                    h->written_bytes += expected;
-                    h->written_frames += packet->frames;
-                    h->committed_frames = h->written_frames;
-                } else {
-                    h->failed = SDL_TRUE;
-                    SDL_snprintf(h->write_error, sizeof(h->write_error),
-                                 "short write %llu/%llu at frame %llu",
-                                 (unsigned long long)wrote,
-                                 (unsigned long long)expected,
-                                 (unsigned long long)packet->frame_start);
-                }
-                h->free_slots[h->free_count++] = packet;
-                SDL_UnlockMutex(h->lock);
+                             "short packet header=%llu/%llu payload=%llu/%llu frame=%llu",
+                             (unsigned long long)header_wrote,
+                             (unsigned long long)header_len,
+                             (unsigned long long)payload_wrote,
+                             (unsigned long long)payload,
+                             (unsigned long long)packet->header.sample_start);
             }
+            h->free_slots[h->free_count++] = packet;
+            SDL_UnlockMutex(h->lock);
         }
     }
 
@@ -207,23 +231,55 @@ static void A3CAPTURE_PlayDevice(_THIS)
         packet = h->free_slots[--h->free_count];
     } else {
         ++h->overflow_events;
-        if (h->dropped_frames == 0) {
-            h->first_dropped_frame = frame_start;
+        if (h->pending_discontinuity_count == 0) {
+            h->pending_discontinuity_start = frame_start;
+            if (h->dropped_frames == 0) {
+                h->first_dropped_frame = frame_start;
+            }
         }
+        h->pending_discontinuity_count += h->samples_per_callback;
         h->dropped_frames += h->samples_per_callback;
         h->failed = SDL_TRUE;
     }
     if (packet) {
-        packet->sequence = sequence;
-        packet->frame_start = frame_start;
-        packet->frames = h->samples_per_callback;
-        packet->planned_qpc = planned;
-        packet->actual_start_qpc = h->callback_start_qpc ? h->callback_start_qpc : now;
-        packet->actual_end_qpc = now;
+        A3AudioPacketHeader hh = {0};
+        memcpy(hh.magic, "A3AP", 4);
+        hh.version = A3_AUDIO_WIRE_VERSION;
+        hh.header_bytes = A3_AUDIO_HEADER_BYTES;
+        hh.capture_id = h->capture_id;
+        hh.generation = h->generation;
+        hh.sequence = (Uint32)sequence;
+        hh.sample_rate = h->sample_rate;
+        hh.channels = A3_AUDIO_CHANNELS_STEREO;
+        hh.sample_format = A3_AUDIO_FORMAT_S16LE;
+        hh.payload_bytes = h->payload_bytes;
+        hh.sample_start = frame_start;
+        hh.sample_count = h->samples_per_callback;
+        hh.planned_qpc = planned;
+        hh.actual_start_qpc = h->callback_start_qpc ? h->callback_start_qpc : now;
+        hh.actual_end_qpc = now;
+        hh.qpc_frequency = h->qpc_frequency;
+        hh.capture_epoch_qpc = h->capture_epoch_qpc;
+        if (!h->sent_any) {
+            hh.flags |= A3_AUDIO_FLAG_FIRST;
+        }
+        if (h->pending_discontinuity_count > 0) {
+            hh.flags |= A3_AUDIO_FLAG_DISCONTINUITY;
+            hh.discontinuity_start = h->pending_discontinuity_start;
+            hh.discontinuity_count = h->pending_discontinuity_count;
+        }
+        if (h->overflow_events > 0) {
+            hh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
+        }
         memcpy(packet->data, h->mixbuf, h->payload_bytes);
+        a3_audio_finalize_packet(&hh, packet->data, h->payload_bytes);
+        packet->header = hh;
         h->queue[(h->queue_head + h->queue_count) % A3CAPTURE_QUEUE_SLOTS] = packet;
         ++h->queue_count;
         h->queued_frames += h->samples_per_callback;
+        h->sent_any = SDL_TRUE;
+        h->pending_discontinuity_start = 0;
+        h->pending_discontinuity_count = 0;
         SDL_CondSignal(h->cond);
     }
     // The generated cursor advances even when the queue rejects a block; the
@@ -254,6 +310,44 @@ static void A3CAPTURE_CloseDevice(_THIS)
     // then a harmless no-op, and an OpenDevice failure cannot free twice.
     _this->hidden = NULL;
     SDL_LockMutex(h->lock);
+    if (!h->final_requested && !h->final_written) {
+        A3AudioPacketHeader fh = {0};
+        const Uint64 now = SDL_GetPerformanceCounter();
+        Uint64 planned = now;
+        A3Deadline(h, h->generated_frames, &planned);
+        memcpy(fh.magic, "A3AP", 4);
+        fh.version = A3_AUDIO_WIRE_VERSION;
+        fh.header_bytes = A3_AUDIO_HEADER_BYTES;
+        fh.capture_id = h->capture_id;
+        fh.generation = h->generation;
+        fh.sequence = (Uint32)h->next_sequence++;
+        fh.sample_rate = h->sample_rate;
+        fh.channels = A3_AUDIO_CHANNELS_STEREO;
+        fh.sample_format = A3_AUDIO_FORMAT_S16LE;
+        fh.payload_bytes = 0;
+        fh.sample_start = h->generated_frames;
+        fh.sample_count = 0;
+        fh.planned_qpc = planned;
+        fh.actual_start_qpc = now;
+        fh.actual_end_qpc = now;
+        fh.qpc_frequency = h->qpc_frequency;
+        fh.capture_epoch_qpc = h->capture_epoch_qpc;
+        fh.flags |= A3_AUDIO_FLAG_LAST;
+        if (!h->sent_any) {
+            fh.flags |= A3_AUDIO_FLAG_FIRST;
+        }
+        if (h->pending_discontinuity_count > 0) {
+            fh.flags |= A3_AUDIO_FLAG_DISCONTINUITY;
+            fh.discontinuity_start = h->pending_discontinuity_start;
+            fh.discontinuity_count = h->pending_discontinuity_count;
+        }
+        if (h->overflow_events > 0) {
+            fh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
+        }
+        a3_audio_finalize_packet(&fh, NULL, 0);
+        h->final_header = fh;
+        h->final_requested = SDL_TRUE;
+    }
     h->stopping = SDL_TRUE;
     SDL_CondSignal(h->cond);
     SDL_Log("a3capture closing: generated=%llu queued=%llu written=%llu committed=%llu "
@@ -356,6 +450,10 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     SDL_memset(h->mixbuf, _this->spec.silence, h->payload_bytes);
     h->qpc_frequency = SDL_GetPerformanceFrequency();
     h->epoch_qpc = SDL_GetPerformanceCounter();
+    h->capture_epoch_qpc = h->epoch_qpc;
+    h->capture_id = h->epoch_qpc ^ ((Uint64)GetCurrentProcessId() << 32) ^
+                    (Uint64)(size_t)h;
+    h->generation = 1;
     h->next_deadline_qpc = h->epoch_qpc;
     h->out_path = path;
     const size_t ready_len = SDL_strlen(path) + 8; /* ".ready" + NUL */

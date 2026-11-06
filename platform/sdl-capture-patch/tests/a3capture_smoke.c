@@ -150,10 +150,26 @@ int main(int argc, char **argv)
 
     FILE *f = fopen(argv[2], "rb");
     long bytes = 0;
-    if (f) { fseek(f, 0, SEEK_END); bytes = ftell(f); fclose(f); }
+    unsigned char header[128] = {0};
+    size_t header_read = 0;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        bytes = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        header_read = fread(header, 1, sizeof(header), f);
+        fclose(f);
+    }
     char detail[160];
     const long expected = (long)run_ms * 44100L * 2L * 2L / 1000L;
     snprintf(detail, sizeof(detail), "bytes=%ld expected~%ld", bytes, expected);
+    if (header_read >= 128) {
+        const unsigned char *b = header;
+        check("framed_magic", b[0] == 'A' && b[1] == '3' && b[2] == 'A' && b[3] == 'P',
+              "first bytes are not A3AP");
+        check("framed_header_format",
+              b[4] == 1 && b[5] == 0 && b[6] == 0x80 && b[7] == 0,
+              "unexpected version/header size");
+    }
     if (getenv("A3CAPTURE_TEST_NO_PCM")) {
         check("no_pcm_expected", 1, "fault mode intentionally leaves no complete file");
     } else if (!getenv("A3CAPTURE_TEST_NO_THREAD")) {

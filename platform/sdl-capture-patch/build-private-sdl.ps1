@@ -30,6 +30,7 @@ $patchFiles = @(
     (Join-Path $scriptDir 'apply.py'),
     (Join-Path $scriptDir 'src\a3capture\SDL_a3capture.c'),
     (Join-Path $scriptDir 'tests\a3capture_smoke.c'),
+    (Join-Path $scriptDir 'tests\validate_framed.py'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.c'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.h')
 )
@@ -199,7 +200,14 @@ $info['smoke_exit'] = $smokeExit
 $info['smoke_log'] = $smokeLog
 $info['smoke_raw'] = $raw
 $info['smoke_raw_bytes'] = if (Test-Path -LiteralPath $raw) { (Get-Item -LiteralPath $raw).Length } else { 0 }
-if ($smokeExit -ne 0) {
+$validator = Join-Path $scriptDir 'tests\validate_framed.py'
+$framedJson = Join-Path $stage 'a3capture-smoke.framed.json'
+& $python $validator $raw --json $framedJson
+$framedExit = $LASTEXITCODE
+$info['framed_exit'] = $framedExit
+$info['framed_validation'] = if (Test-Path -LiteralPath $framedJson) { Get-Content -LiteralPath $framedJson -Raw } else { '' }
+$info | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+if ($smokeExit -ne 0 -or $framedExit -ne 0) {
     $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
     throw "a3capture smoke failed (exit $smokeExit)"
 }

@@ -56,6 +56,7 @@ add_executable(audio-core-tests
   src/audio/audio_clock.cpp
   src/audio/audio_clock_c.c
   ../audio-protocol/src/a3_audio_protocol.cpp
+  ../audio-protocol/src/a3_audio_protocol_c.c
 )
 target_compile_features(audio-core-tests PRIVATE cxx_std_17)
 target_compile_definitions(audio-core-tests PRIVATE

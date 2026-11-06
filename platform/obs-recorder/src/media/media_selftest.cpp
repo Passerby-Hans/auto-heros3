@@ -66,6 +66,7 @@
 #include "../json_util.hpp"
 #include "gen_av_source.hpp"
 #include "raw_audio_source.hpp"
+#include "framed_audio_source.hpp"
 #include "panel_source.hpp"
 
 namespace fs = std::filesystem;
@@ -256,7 +257,9 @@ struct Options {
 
     // S2a: raw VCMI game-audio.raw file as a native libobs audio source
     std::string audio_raw;            // empty => no raw audio source
+    std::string audio_framed;         // A4 a3-audio/1 source (instead of raw)
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
+    bool fixed_audio = false;          // A4: obs_reset_audio2 fixed buffering
 
     // S3a: persistent named-pipe IPC server (libobs stays initialized)
     bool serve = false;
@@ -365,12 +368,14 @@ struct State {
 
     // S2a raw-file audio source evidence
     bool audio_enabled = false;
+    bool framed_audio_enabled = false;
     obs_source_t* audio_source = nullptr;
     obs_source_t* panel_source = nullptr;
     std::string audio_applied_settings_json;
     int audio_source_monitoring_type = -1;
     float audio_source_volume = 0.0f;
     a3::RawAudioStats audio_stats;
+    a3::FramedAudioStats framed_audio_stats;
 
     // exit code to use when a specific step fails (0 => stage default)
     int failure_exit_code = 0;
@@ -1006,11 +1011,22 @@ bool InitObs(State& s)
     }
     AddStep(s, "load_selective_modules", true, "3/3 obs-ffmpeg, obs-x264, obs-outputs");
 
-    obs_audio_info aoi = {};
-    aoi.samples_per_sec = 44100;
-    aoi.speakers = SPEAKERS_STEREO;
-    s.audio_reset_ok = obs_reset_audio(&aoi);
-    AddStep(s, "obs_reset_audio", s.audio_reset_ok, "44100 Hz, SPEAKERS_STEREO");
+    if (s.opt.fixed_audio) {
+        obs_audio_info2 aoi2 = {};
+        aoi2.samples_per_sec = 44100;
+        aoi2.speakers = SPEAKERS_STEREO;
+        aoi2.max_buffering_ms = 1000;
+        aoi2.fixed_buffering = true;
+        s.audio_reset_ok = obs_reset_audio2(&aoi2);
+        AddStep(s, "obs_reset_audio2_fixed", s.audio_reset_ok,
+                "44100 Hz, SPEAKERS_STEREO, max_buffering_ms=1000, fixed_buffering=true");
+    } else {
+        obs_audio_info aoi = {};
+        aoi.samples_per_sec = 44100;
+        aoi.speakers = SPEAKERS_STEREO;
+        s.audio_reset_ok = obs_reset_audio(&aoi);
+        AddStep(s, "obs_reset_audio", s.audio_reset_ok, "44100 Hz, SPEAKERS_STEREO");
+    }
     if (!s.audio_reset_ok) {
         return false;
     }
@@ -1157,6 +1173,8 @@ bool CreateSceneForSource(State& s, const char* scene_name)
     return true;
 }
 
+bool CreateFramedAudioSource(State& s);
+
 bool CreatePipeline(State& s, const std::string& first_file_path)
 {
     // S1b in-memory synthetic media source (no capture at all).
@@ -1185,6 +1203,9 @@ bool CreatePipeline(State& s, const std::string& first_file_path)
 
     if (!CreateSceneForSource(s, "S1b Scene")) {
         s.failure_exit_code = 4;
+        return false;
+    }
+    if (!s.opt.audio_framed.empty() && !CreateFramedAudioSource(s)) {
         return false;
     }
     return CreateEncodersAndOutput(s, first_file_path);
@@ -1278,8 +1299,72 @@ bool WaitForWindowCapture(State& s)
 // to the same scene as the WGC window source.  Audio-only: no monitoring, no
 // audio device, no playback.  The source retries the open itself; the host waits
 // here and turns "file never opened" into an explicit failure (exit 9).
+bool CreateFramedAudioSource(State& s)
+{
+    if (s.opt.audio_framed.empty()) {
+        return false;
+    }
+    s.audio_enabled = true;
+    s.framed_audio_enabled = true;
+    AddStep(s, "audio_framed_mode", true,
+            "a3-audio/1 framed file -> timestamped FLOAT_PLANAR async source; path='" +
+                s.opt.audio_framed + "'");
+    a3::RegisterFramedAudioSource();
+    AddStep(s, "register_framed_audio_source", true, "obs_register_source_s(a3_framed_audio)");
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "path", s.opt.audio_framed.c_str());
+    s.audio_source = obs_source_create("a3_framed_audio", "A4 Framed VCMI Audio", settings, nullptr);
+    obs_data_release(settings);
+    AddStep(s, "create_framed_audio_source", s.audio_source != nullptr,
+            "a3_framed_audio (AUDIO|ASYNC, no resampling)");
+    if (!s.audio_source) {
+        s.failure_exit_code = 9;
+        return false;
+    }
+    const uint32_t flags = obs_source_get_output_flags(s.audio_source);
+    AddStep(s, "framed_audio_flags",
+            (flags & OBS_SOURCE_AUDIO) != 0 && (flags & OBS_SOURCE_ASYNC) != 0,
+            "output_flags=0x" + std::to_string(flags));
+    obs_data_t* applied = obs_source_get_settings(s.audio_source);
+    const char* applied_json = obs_data_get_json(applied);
+    s.audio_applied_settings_json = applied_json ? applied_json : "";
+    obs_data_release(applied);
+    s.audio_source_monitoring_type = static_cast<int>(obs_source_get_monitoring_type(s.audio_source));
+    s.audio_source_volume = obs_source_get_volume(s.audio_source);
+    s.framed_audio_stats = a3::GetFramedAudioStats();
+    AddStep(s, "framed_audio_settings", true, s.audio_applied_settings_json);
+    AddStep(s, "framed_audio_monitoring_none",
+            s.audio_source_monitoring_type == OBS_MONITORING_TYPE_NONE,
+            "monitoring_type=" + std::to_string(s.audio_source_monitoring_type));
+    obs_sceneitem_t* item = obs_scene_add(s.scene, s.audio_source);
+    AddStep(s, "scene_add_framed_audio_source", item != nullptr,
+            "framed audio source added to scene");
+    if (!item) {
+        s.failure_exit_code = 9;
+        return false;
+    }
+    const uint64_t deadline = os_gettime_ns() + 3000000000ULL;
+    while (os_gettime_ns() < deadline) {
+        s.framed_audio_stats = a3::GetFramedAudioStats();
+        if (s.framed_audio_stats.opened) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    AddStep(s, "framed_audio_opened", s.framed_audio_stats.opened,
+            "path='" + s.opt.audio_framed + "' error='" + s.framed_audio_stats.error + "'");
+    if (!s.framed_audio_stats.opened) {
+        s.failure_exit_code = 9;
+        return false;
+    }
+    return true;
+}
+
 bool CreateRawAudioSource(State& s)
 {
+    if (!s.opt.audio_framed.empty()) {
+        return CreateFramedAudioSource(s);
+    }
     if (s.opt.audio_raw.empty()) {
         return true;
     }
@@ -1570,8 +1655,19 @@ bool StopOutput(State& s)
                 "window_capture source is a synchronous render source (no worker thread of ours)");
     }
     if (s.audio_enabled) {
+        if (s.framed_audio_enabled) {
+            a3::StopFramedAudioSourceThread();
+            s.framed_audio_stats = a3::GetFramedAudioStats();
+            AddStep(s, "framed_audio_after_stop", true,
+                    "packets=" + std::to_string(s.framed_audio_stats.packets) +
+                        " pushed=" + std::to_string(s.framed_audio_stats.pushed_packets) +
+                        " frames=" + std::to_string(s.framed_audio_stats.pushed_frames) +
+                        " crc_errors=" + std::to_string(s.framed_audio_stats.crc_errors) +
+                        " saw_last=" + std::to_string(s.framed_audio_stats.saw_last ? 1 : 0));
+        }
         // Stop the raw-audio reader after the output drained (idempotent), then
         // snapshot its counters for the report.
+        if (!s.framed_audio_enabled) {
         a3::StopRawAudioSourceThread();
         s.audio_stats = a3::GetRawAudioStats();
         AddStep(s, "raw_audio_after_stop", true,
@@ -1580,6 +1676,7 @@ bool StopOutput(State& s)
                     " chunks=" + std::to_string(s.audio_stats.chunks_pushed) +
                     " silence_chunks=" + std::to_string(s.audio_stats.silence_chunks) +
                     " samples=" + std::to_string(s.audio_stats.samples_pushed));
+        }
     }
 
     // stop event details (code is set from mp4_output's end_data_capture path)
@@ -1739,6 +1836,22 @@ void CollectFinalEvidence(State& s)
                         !HasModule(s.process_modules, "win-wasapi.dll"),
                     "raw file audio source loaded without WASAPI/MMDevice endpoint (no playback/monitoring)");
         }
+    }
+    if (s.framed_audio_enabled) {
+        s.framed_audio_stats = a3::GetFramedAudioStats();
+        AddStep(s, "framed_audio_consumed",
+                s.framed_audio_stats.opened && s.framed_audio_stats.pushed_frames > 0 &&
+                    s.framed_audio_stats.crc_errors == 0,
+                "packets=" + std::to_string(s.framed_audio_stats.packets) +
+                    " pushed_packets=" + std::to_string(s.framed_audio_stats.pushed_packets) +
+                    " pushed_frames=" + std::to_string(s.framed_audio_stats.pushed_frames) +
+                    " crc_errors=" + std::to_string(s.framed_audio_stats.crc_errors) +
+                    " seq_gaps=" + std::to_string(s.framed_audio_stats.sequence_gaps) +
+                    " saw_first=" + std::to_string(s.framed_audio_stats.saw_first ? 1 : 0) +
+                    " saw_last=" + std::to_string(s.framed_audio_stats.saw_last ? 1 : 0) +
+                    " error='" + s.framed_audio_stats.error + "'");
+        AddStep(s, "framed_audio_no_resampling", true,
+                "source reads packet sample_count and emits exactly that many frames");
     }
 }
 
@@ -3329,7 +3442,9 @@ void PrintUsage()
                 "  --window-exe STR     window mode: target executable name (optional)\n"
                 "  --window-pid N       window mode: restrict to a process id (optional)\n"
                 "  --audio-raw PATH      also add native raw-file audio source (s16le/44100/2)\n"
+"  --audio-framed PATH   A4: add native a3-audio/1 framed timestamped source\n"
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
+"  --fixed-audio         A4: obs_reset_audio2 fixed buffering (max 1000ms)\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n  --max-size-mb N      size split threshold in MiB (0 disables; IPC allows 1..4096)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
@@ -3379,8 +3494,12 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.window_pid = std::atoi(next("--window-pid").c_str());
         } else if (a == "--audio-raw") {
             opt.audio_raw = next("--audio-raw");
+        } else if (a == "--audio-framed") {
+            opt.audio_framed = next("--audio-framed");
         } else if (a == "--audio-start-zero") {
             opt.audio_start_zero = true;
+        } else if (a == "--fixed-audio") {
+            opt.fixed_audio = true;
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
             opt.duration_explicit = true;

@@ -119,6 +119,8 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
     src/media/media_selftest.cpp
     src/media/gen_av_source.cpp
     src/media/raw_audio_source.cpp
+    src/media/framed_audio_source.cpp
+    ../audio-protocol/src/a3_audio_protocol_c.c
     src/media/panel_source.cpp
     src/json_util.cpp
   )
@@ -134,6 +136,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
   target_include_directories(obs-media-selftest PRIVATE
     "${OBS_SOURCE_LIBOBS_DIR}"
     "${OBS_SDK_GENERATED_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include"
   )
   target_link_libraries(obs-media-selftest PRIVATE
     "${OBS_SDK_LIB}"

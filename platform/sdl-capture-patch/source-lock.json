@@ -10,10 +10,11 @@
   "source_tag": "release-2.32.10",
   "protocol": "a3-audio/1",
   "runtime_dll": "vendor/vcmi-1.7.5/SDL2.dll",
-  "private_dll_sha256": "42736ee8ca74b995ead4d4c9cd7a4b79d6521eeacf195d1f0d06fc68c7236ce5",
+  "private_dll_sha256": "152200d5d58d581611561174d423b92df6d86b413dc00e1e6878c3fa436d6bf6",
   "private_dll_bytes": 1802752,
   "smoke": "PASS R2: explicit private DLL; driver=a3capture; 44.1k/s16/2ch/1024; 212992B in 1.2s; generated=queued=written=committed; rate bounds PASS; dependencies exclude MMDevAPI/audioses",
-  "a2_vcmi": "PASS R3: VCMI loaded a3capture; audio_ready marker created; raw PCM written; default disk path remains default",
-  "patch_sha256": "e80a9be129e7303258d36f157f0404b70ca1ebf2a21c44b502a7d0460b1fb695",
-  "source_lock_verified": true
+  "a2_vcmi": "PASS R3: VCMI loaded a3capture, audio_ready=true, non-zero raw PCM; no accurate timing window, not a rate claim",
+  "patch_sha256": "41bb73f0d4663c7b5624636c6d2be97093d3934ebbad746730ccfc796b4ce733",
+  "source_lock_verified": true,
+  "fault_injection": "PASS: queue overflow dropped=105472/failed=1; short write failed=1; counters visible in close log"
 }

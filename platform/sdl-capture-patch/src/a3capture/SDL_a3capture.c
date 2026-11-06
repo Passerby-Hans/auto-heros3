@@ -83,6 +83,9 @@ struct SDL_PrivateAudioData
     SDL_bool failed;
     SDL_bool closed;
     char write_error[128];
+    Uint32 test_worker_delay_ms;
+    SDL_bool test_short_write;
+    SDL_bool test_no_thread;
     Uint8 *mixbuf;
 };
 
@@ -113,6 +116,9 @@ static DWORD WINAPI A3Worker(LPVOID arg)
         SDL_UnlockMutex(h->lock);
 
         if (packet) {
+            if (h->test_worker_delay_ms) {
+                SDL_Delay(h->test_worker_delay_ms);
+            }
             const size_t expected = (size_t)packet->frames * 2u * 2u;
             if (!h->out || expected == 0) {
                 SDL_LockMutex(h->lock);
@@ -122,7 +128,9 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                 h->free_slots[h->free_count++] = packet;
                 SDL_UnlockMutex(h->lock);
             } else {
-                const size_t wrote = SDL_RWwrite(h->out, packet->data, 1, expected);
+                const size_t write_len =
+                    (h->test_short_write && expected > 1) ? expected - 1 : expected;
+                const size_t wrote = SDL_RWwrite(h->out, packet->data, 1, write_len);
                 SDL_LockMutex(h->lock);
                 if (wrote == expected) {
                     ++h->written_packets;
@@ -243,6 +251,16 @@ static void A3CAPTURE_CloseDevice(_THIS)
     SDL_LockMutex(h->lock);
     h->stopping = SDL_TRUE;
     SDL_CondSignal(h->cond);
+    SDL_Log("a3capture closing: generated=%llu queued=%llu written=%llu committed=%llu "
+            "dropped=%llu late=%llu overflow=%llu failed=%d error='%s'",
+            (unsigned long long)h->generated_frames,
+            (unsigned long long)h->queued_frames,
+            (unsigned long long)h->written_frames,
+            (unsigned long long)h->committed_frames,
+            (unsigned long long)h->dropped_frames,
+            (unsigned long long)h->late_events,
+            (unsigned long long)h->overflow_events,
+            h->failed ? 1 : 0, h->write_error);
     SDL_UnlockMutex(h->lock);
     if (h->worker) {
         const DWORD wait = WaitForSingleObject(h->worker, 5000);
@@ -286,11 +304,19 @@ static void A3CAPTURE_CloseDevice(_THIS)
 static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
 {
     struct SDL_PrivateAudioData *h;
-    const char *path = SDL_getenv("A3CAPTURE_FILE");
-    if (!path || !*path) {
-        path = A3CAPTURE_DEFAULT_FILE;
+    const char *env_path = SDL_getenv("A3CAPTURE_FILE");
+    if (!env_path || !*env_path) {
+        env_path = A3CAPTURE_DEFAULT_FILE;
+    }
+    // SDL_getenv returns a shared static buffer.  Copy before querying any
+    // other environment variable, otherwise the test-delay lookup overwrites
+    // this path pointer.
+    char *path = SDL_strdup(env_path);
+    if (!path) {
+        return SDL_OutOfMemory();
     }
     if (_this->iscapture) {
+        SDL_free(path);
         return SDL_SetError("a3capture has no capture devices");
     }
     SDL_Log("a3capture requested format=0x%x freq=%d channels=%u samples=%u size=%u",
@@ -298,18 +324,25 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
             (unsigned)_this->spec.samples, (unsigned)_this->spec.size);
     if (_this->spec.format != AUDIO_S16LSB || _this->spec.freq != 44100 ||
         _this->spec.channels != 2 || _this->spec.samples == 0) {
+        SDL_free(path);
         return SDL_SetError("a3capture requires s16le/44100/stereo");
     }
 
     h = (struct SDL_PrivateAudioData *)SDL_calloc(1, sizeof(*h));
     if (!h) {
+        SDL_free(path);
         return SDL_OutOfMemory();
     }
+    const char *test_delay = SDL_getenv("A3CAPTURE_TEST_WORKER_DELAY_MS");
+    h->test_worker_delay_ms = test_delay ? (Uint32)SDL_atoi(test_delay) : 0;
+    h->test_short_write = SDL_getenv("A3CAPTURE_TEST_SHORT_WRITE") ? SDL_TRUE : SDL_FALSE;
+    h->test_no_thread = SDL_getenv("A3CAPTURE_TEST_NO_THREAD") ? SDL_TRUE : SDL_FALSE;
     h->sample_rate = _this->spec.freq;
     h->samples_per_callback = _this->spec.samples;
     h->payload_bytes = _this->spec.size;
     h->mixbuf = (Uint8 *)SDL_malloc(h->payload_bytes);
     if (!h->mixbuf) {
+        SDL_free(path);
         SDL_free(h);
         return SDL_OutOfMemory();
     }
@@ -317,7 +350,7 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     h->qpc_frequency = SDL_GetPerformanceFrequency();
     h->epoch_qpc = SDL_GetPerformanceCounter();
     h->next_deadline_qpc = h->epoch_qpc;
-    h->out_path = SDL_strdup(path);
+    h->out_path = path;
     const size_t ready_len = SDL_strlen(path) + 8; /* ".ready" + NUL */
     h->ready_path = (char *)SDL_malloc(ready_len);
     if (h->ready_path) {
@@ -368,10 +401,12 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     h->free_count = A3CAPTURE_QUEUE_SLOTS;
     _this->hidden = h;
 
-    h->worker = CreateThread(NULL, 0, A3Worker, _this, 0, NULL);
-    if (!h->worker) {
-        A3CAPTURE_CloseDevice(_this);
-        return -1;
+    if (!h->test_no_thread) {
+        h->worker = CreateThread(NULL, 0, A3Worker, _this, 0, NULL);
+        if (!h->worker) {
+            A3CAPTURE_CloseDevice(_this);
+            return -1;
+        }
     }
     {
         SDL_RWops *ready = SDL_RWFromFile(h->ready_path, "wb");

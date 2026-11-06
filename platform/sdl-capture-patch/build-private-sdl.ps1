@@ -188,7 +188,7 @@ Write-Host ('SDL2.dll -> {0} sha256={1}' -f (Join-Path $stage 'SDL2.dll'), $hash
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $cl) { throw 'cl.exe not available for a3capture smoke' }
 $smoke = Join-Path $stage 'a3capture-smoke.exe'
-& cl.exe /nologo /W3 /O2 /Fe:"$smoke" (Join-Path $scriptDir 'tests\a3capture_smoke.c')
+& cl.exe /nologo /W3 /O2 /Fo:"$stage\a3capture_smoke.obj" /Fe:"$smoke" (Join-Path $scriptDir 'tests\a3capture_smoke.c')
 if ($LASTEXITCODE -ne 0) { throw 'a3capture smoke compile failed' }
 $raw = Join-Path $stage 'a3capture-smoke.raw'
 $smokeLog = Join-Path $stage 'a3capture-smoke.log'
@@ -199,6 +199,42 @@ $info['smoke_exit'] = $smokeExit
 $info['smoke_log'] = $smokeLog
 $info['smoke_raw'] = $raw
 $info['smoke_raw_bytes'] = if (Test-Path -LiteralPath $raw) { (Get-Item -LiteralPath $raw).Length } else { 0 }
+if ($smokeExit -ne 0) {
+    $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+    throw "a3capture smoke failed (exit $smokeExit)"
+}
+
+# A2.1 fault injection: queue overflow and short write must set failed and
+# expose dropped/committed counters, not freeze the sample cursor.
+$env:A3CAPTURE_TEST_FAULT = '1'
+$env:A3CAPTURE_TEST_WORKER_DELAY_MS = '250'
+$faultRaw = Join-Path $stage 'a3capture-fault-queue.raw'
+$faultLog = Join-Path $stage 'a3capture-fault-queue.log'
+& $smoke (Join-Path $stage 'SDL2.dll') $faultRaw 3000 *> $faultLog
+$queueExit = $LASTEXITCODE
+Remove-Item Env:A3CAPTURE_TEST_WORKER_DELAY_MS -ErrorAction SilentlyContinue
+$queueText = Get-Content -LiteralPath $faultLog -Raw
+$info['queue_fault_exit'] = $queueExit
+$info['queue_fault_log'] = $faultLog
+$info['queue_fault_counters'] = ($queueText -split "`r?`n" | Where-Object { $_ -match 'a3capture closing:' } | Select-Object -First 1)
+
+$env:A3CAPTURE_TEST_SHORT_WRITE = '1'
+$shortRaw = Join-Path $stage 'a3capture-fault-short.raw'
+$shortLog = Join-Path $stage 'a3capture-fault-short.log'
+& $smoke (Join-Path $stage 'SDL2.dll') $shortRaw 1200 *> $shortLog
+$shortExit = $LASTEXITCODE
+Remove-Item Env:A3CAPTURE_TEST_SHORT_WRITE -ErrorAction SilentlyContinue
+Remove-Item Env:A3CAPTURE_TEST_FAULT -ErrorAction SilentlyContinue
+$shortText = Get-Content -LiteralPath $shortLog -Raw
+$info['short_fault_exit'] = $shortExit
+$info['short_fault_log'] = $shortLog
+$info['short_fault_counters'] = ($shortText -split "`r?`n" | Where-Object { $_ -match 'a3capture closing:' } | Select-Object -First 1)
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
-if ($smokeExit -ne 0) { throw "a3capture smoke failed (exit $smokeExit)" }
-Write-Host 'A2 a3capture smoke PASS'
+
+if ($queueText -notmatch 'dropped=[1-9]' -or $queueText -notmatch 'failed=1' -or $queueExit -ne 0) {
+    throw 'a3capture queue-overflow fault injection failed'
+}
+if ($shortText -notmatch 'failed=1' -or $shortExit -ne 0) {
+    throw 'a3capture short-write fault injection failed'
+}
+Write-Host 'A2.1 fault injection PASS (queue overflow + short write)'

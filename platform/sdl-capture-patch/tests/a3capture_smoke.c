@@ -96,8 +96,10 @@ int main(int argc, char **argv)
     check("symbols", init && quit && current && open && pause && close && error && getver, "");
     if (g_failed) return 4;
 
+    printf("ARGV2=%s ARGV3=%s\n", argv[2], argc > 3 ? argv[3] : "(none)");
     SetEnvironmentVariableA("SDL_AUDIODRIVER", "a3capture");
     SetEnvironmentVariableA("A3CAPTURE_FILE", argv[2]);
+    printf("ENV_A3CAPTURE_FILE=%s\n", getenv("A3CAPTURE_FILE") ? getenv("A3CAPTURE_FILE") : "(null)");
     if (init(SDL_INIT_AUDIO) != 0) {
         printf("SDL_Init failed: %s\n", error ? error() : "?");
         return 5;
@@ -129,9 +131,14 @@ int main(int argc, char **argv)
              have.freq, have.channels, have.samples, have.size);
     check("format_44100_s16_stereo", have.freq == 44100 && have.channels == 2 &&
           have.format == AUDIO_S16LSB && have.samples == 1024, spec);
-    printf("STEP unpausing\n");
+    int run_ms = 1200;
+    if (argc > 3) {
+        run_ms = atoi(argv[3]);
+        if (run_ms < 200) run_ms = 200;
+    }
+    printf("STEP unpausing (%d ms)\n", run_ms);
     pause(dev, 0);
-    Sleep(1200);
+    Sleep((DWORD)run_ms);
     printf("STEP closing device\n");
     pause(dev, 1);
     close(dev);
@@ -145,11 +152,13 @@ int main(int argc, char **argv)
     long bytes = 0;
     if (f) { fseek(f, 0, SEEK_END); bytes = ftell(f); fclose(f); }
     char detail[160];
-    const long expected = 1200L * 44100L * 2L * 2L / 1000L; /* 1.2 s */
+    const long expected = (long)run_ms * 44100L * 2L * 2L / 1000L;
     snprintf(detail, sizeof(detail), "bytes=%ld expected~%ld", bytes, expected);
     check("pcm_written", bytes > 0, detail);
-    check("pcm_rate_bounds",
-          bytes >= expected * 95L / 100L && bytes <= expected * 105L / 100L, detail);
+    if (!getenv("A3CAPTURE_TEST_FAULT")) {
+        check("pcm_rate_bounds",
+              bytes >= expected * 95L / 100L && bytes <= expected * 105L / 100L, detail);
+    }
     printf("DLL_VERSION %u.%u.%u\n", ver.major, ver.minor, ver.patch);
     printf("DRIVER %s\n", driver ? driver : "");
     printf("AUDIO %s\n", spec);

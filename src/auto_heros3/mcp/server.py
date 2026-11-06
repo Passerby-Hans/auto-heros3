@@ -6882,7 +6882,7 @@ def _recording_stop_libobs() -> dict:
     result['segment'] = segment
     _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
                               'active': False, 'watchdog_stop': None,
-                              'watchdog': None, 'restart_lock': None})
+                              'watchdog': None, 'restart_lock': None, 'last_health': None})
     try:
         _recording_state_path().unlink()
     except OSError:

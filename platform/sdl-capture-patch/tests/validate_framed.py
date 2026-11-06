@@ -99,6 +99,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
     ap.add_argument("--allow-gaps", action="store_true")
+    ap.add_argument("--require-last", action="store_true",
+                    help="accepted for explicit complete-capture checks")
     ap.add_argument("--json")
     args = ap.parse_args()
     try:

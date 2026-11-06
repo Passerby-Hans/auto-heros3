@@ -32,6 +32,7 @@ $patchFiles = @(
     (Join-Path $scriptDir 'tests\a3capture_smoke.c'),
     (Join-Path $scriptDir 'tests\validate_framed.py'),
     (Join-Path $scriptDir 'tests\test_pipe.py'),
+    (Join-Path $scriptDir 'tests\test_stop.py'),
     (Join-Path $RepoRoot 'platform\audio-protocol\python\a3_framed.py'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.c'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.h')
@@ -225,6 +226,15 @@ $info['pipe_relay_exit'] = $pipeExit
 $info['pipe_relay_manifest'] = if (Test-Path (Join-Path $pipeOut 'manifest.json')) { Get-Content (Join-Path $pipeOut 'manifest.json') -Raw } else { '' }
 $info | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
 if ($pipeExit -ne 0) { throw 'framed named-pipe relay test failed' }
+
+$stopOut = Join-Path $stage 'a3graceful-stop'
+$stopTest = Join-Path $scriptDir 'tests\test_stop.py'
+& $python $stopTest --smoke $smoke --dll (Join-Path $stage 'SDL2.dll') --validator $validator --out $stopOut
+$stopExit = $LASTEXITCODE
+$info['graceful_stop_exit'] = $stopExit
+$info['graceful_stop_manifest'] = if (Test-Path (Join-Path $stopOut 'stop.framed.json')) { Get-Content (Join-Path $stopOut 'stop.framed.json') -Raw } else { '' }
+$info | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+if ($stopExit -ne 0) { throw 'graceful-stop integration test failed' }
 
 # A2.1 fault injection: queue overflow and short write must set failed and
 # expose dropped/committed counters, not freeze the sample cursor.

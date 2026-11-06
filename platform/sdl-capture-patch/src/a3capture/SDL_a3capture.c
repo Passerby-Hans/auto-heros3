@@ -50,6 +50,7 @@ struct SDL_PrivateAudioData
     SDL_RWops *out;
     char *out_path;
     char *ready_path;
+    char *stop_path;
     A3Packet packets[A3CAPTURE_QUEUE_SLOTS];
     A3Packet *free_slots[A3CAPTURE_QUEUE_SLOTS];
     A3Packet *queue[A3CAPTURE_QUEUE_SLOTS];
@@ -101,6 +102,52 @@ static int A3Deadline(const struct SDL_PrivateAudioData *h, Uint64 frame, Uint64
     return a3_qpc_deadline(&clock, frame, out);
 }
 
+/* Called with h->lock held.  The final header is written by the worker after
+ * it has drained all previously queued data packets. */
+static void A3MakeFinalLocked(struct SDL_PrivateAudioData *h)
+{
+    if (h->final_requested || h->final_written) {
+        return;
+    }
+    A3AudioPacketHeader fh = {0};
+    const Uint64 now = SDL_GetPerformanceCounter();
+    Uint64 planned = now;
+    A3Deadline(h, h->generated_frames, &planned);
+    memcpy(fh.magic, "A3AP", 4);
+    fh.version = A3_AUDIO_WIRE_VERSION;
+    fh.header_bytes = A3_AUDIO_HEADER_BYTES;
+    fh.capture_id = h->capture_id;
+    fh.generation = h->generation;
+    fh.sequence = (Uint32)h->next_sequence++;
+    fh.sample_rate = h->sample_rate;
+    fh.channels = A3_AUDIO_CHANNELS_STEREO;
+    fh.sample_format = A3_AUDIO_FORMAT_S16LE;
+    fh.payload_bytes = 0;
+    fh.sample_start = h->generated_frames;
+    fh.sample_count = 0;
+    fh.planned_qpc = planned;
+    fh.actual_start_qpc = now;
+    fh.actual_end_qpc = now;
+    fh.qpc_frequency = h->qpc_frequency;
+    fh.capture_epoch_qpc = h->capture_epoch_qpc;
+    fh.flags |= A3_AUDIO_FLAG_LAST;
+    if (!h->sent_any) {
+        fh.flags |= A3_AUDIO_FLAG_FIRST;
+    }
+    if (h->pending_discontinuity_count > 0) {
+        fh.flags |= A3_AUDIO_FLAG_DISCONTINUITY;
+        fh.discontinuity_start = h->pending_discontinuity_start;
+        fh.discontinuity_count = h->pending_discontinuity_count;
+    }
+    if (h->overflow_events > 0) {
+        fh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
+    }
+    a3_audio_finalize_packet(&fh, NULL, 0);
+    h->final_header = fh;
+    h->final_requested = SDL_TRUE;
+    h->stopping = SDL_TRUE;
+}
+
 static DWORD WINAPI A3Worker(LPVOID arg)
 {
     SDL_AudioDevice *device = (SDL_AudioDevice *)arg;
@@ -127,6 +174,14 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                     h->final_written = SDL_TRUE;
                     ++h->written_packets;
                     h->written_bytes += sizeof(final_header);
+                    SDL_Log("a3capture final written: generated=%llu queued=%llu "
+                            "written=%llu committed=%llu dropped=%llu failed=%d",
+                            (unsigned long long)h->generated_frames,
+                            (unsigned long long)h->queued_frames,
+                            (unsigned long long)h->written_frames,
+                            (unsigned long long)h->committed_frames,
+                            (unsigned long long)h->dropped_frames,
+                            h->failed ? 1 : 0);
                 } else {
                     h->failed = SDL_TRUE;
                     SDL_snprintf(h->write_error, sizeof(h->write_error),
@@ -189,6 +244,13 @@ static DWORD WINAPI A3Worker(LPVOID arg)
 static void A3CAPTURE_WaitDevice(_THIS)
 {
     struct SDL_PrivateAudioData *h = _this->hidden;
+    if (h->final_requested || h->stopping) {
+        /* The capture stream is closed; keep the SDL callback thread idle
+         * without charging post-stop callbacks as lateness. */
+        SDL_Delay(10);
+        h->actual_start_qpc = SDL_GetPerformanceCounter();
+        return;
+    }
     const Uint64 deadline = h->next_deadline_qpc;
     Uint64 now = SDL_GetPerformanceCounter();
     if (now < deadline) {
@@ -219,6 +281,10 @@ static void A3CAPTURE_PlayDevice(_THIS)
     Uint64 planned = 0;
 
     SDL_LockMutex(h->lock);
+    if (h->final_requested || h->stopping) {
+        SDL_UnlockMutex(h->lock);
+        return;
+    }
     const Uint64 sequence = h->next_sequence++;
     if (!A3Deadline(h, frame_start, &planned)) {
         h->failed = SDL_TRUE;
@@ -294,8 +360,15 @@ static void A3CAPTURE_PlayDevice(_THIS)
 
 static Uint8 *A3CAPTURE_GetDeviceBuf(_THIS)
 {
-    _this->hidden->callback_start_qpc = SDL_GetPerformanceCounter();
-    return _this->hidden->mixbuf;
+    struct SDL_PrivateAudioData *h = _this->hidden;
+    if (h->stop_path && GetFileAttributesA(h->stop_path) != INVALID_FILE_ATTRIBUTES) {
+        SDL_LockMutex(h->lock);
+        A3MakeFinalLocked(h);
+        SDL_CondSignal(h->cond);
+        SDL_UnlockMutex(h->lock);
+    }
+    h->callback_start_qpc = SDL_GetPerformanceCounter();
+    return h->mixbuf;
 }
 
 static void A3CAPTURE_CloseDevice(_THIS)
@@ -310,45 +383,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
     // then a harmless no-op, and an OpenDevice failure cannot free twice.
     _this->hidden = NULL;
     SDL_LockMutex(h->lock);
-    if (!h->final_requested && !h->final_written) {
-        A3AudioPacketHeader fh = {0};
-        const Uint64 now = SDL_GetPerformanceCounter();
-        Uint64 planned = now;
-        A3Deadline(h, h->generated_frames, &planned);
-        memcpy(fh.magic, "A3AP", 4);
-        fh.version = A3_AUDIO_WIRE_VERSION;
-        fh.header_bytes = A3_AUDIO_HEADER_BYTES;
-        fh.capture_id = h->capture_id;
-        fh.generation = h->generation;
-        fh.sequence = (Uint32)h->next_sequence++;
-        fh.sample_rate = h->sample_rate;
-        fh.channels = A3_AUDIO_CHANNELS_STEREO;
-        fh.sample_format = A3_AUDIO_FORMAT_S16LE;
-        fh.payload_bytes = 0;
-        fh.sample_start = h->generated_frames;
-        fh.sample_count = 0;
-        fh.planned_qpc = planned;
-        fh.actual_start_qpc = now;
-        fh.actual_end_qpc = now;
-        fh.qpc_frequency = h->qpc_frequency;
-        fh.capture_epoch_qpc = h->capture_epoch_qpc;
-        fh.flags |= A3_AUDIO_FLAG_LAST;
-        if (!h->sent_any) {
-            fh.flags |= A3_AUDIO_FLAG_FIRST;
-        }
-        if (h->pending_discontinuity_count > 0) {
-            fh.flags |= A3_AUDIO_FLAG_DISCONTINUITY;
-            fh.discontinuity_start = h->pending_discontinuity_start;
-            fh.discontinuity_count = h->pending_discontinuity_count;
-        }
-        if (h->overflow_events > 0) {
-            fh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
-        }
-        a3_audio_finalize_packet(&fh, NULL, 0);
-        h->final_header = fh;
-        h->final_requested = SDL_TRUE;
-    }
-    h->stopping = SDL_TRUE;
+    A3MakeFinalLocked(h);
     SDL_CondSignal(h->cond);
     SDL_Log("a3capture closing: generated=%llu queued=%llu written=%llu committed=%llu "
             "dropped=%llu late=%llu overflow=%llu failed=%d error='%s'",
@@ -395,6 +430,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
     for (int i = 0; i < A3CAPTURE_QUEUE_SLOTS; ++i) {
         SDL_free(h->packets[i].data);
     }
+    SDL_free(h->stop_path);
     SDL_free(h->ready_path);
     SDL_free(h->out_path);
     SDL_free(h);
@@ -461,9 +497,12 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     if (h->ready_path) {
         SDL_snprintf(h->ready_path, ready_len, "%s.ready", path);
     }
+    const char *stop_path = SDL_getenv("A3CAPTURE_STOP_FILE");
+    h->stop_path = (stop_path && *stop_path) ? SDL_strdup(stop_path) : NULL;
     h->lock = SDL_CreateMutex();
     h->cond = SDL_CreateCond();
     if (!h->out_path || !h->ready_path || !h->lock || !h->cond) {
+        SDL_free(h->stop_path);
         SDL_free(h->ready_path);
         SDL_free(h->out_path);
         SDL_DestroyCond(h->cond);
@@ -479,6 +518,7 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
         SDL_SetError("cannot open A3CAPTURE_FILE");
         SDL_DestroyCond(h->cond);
         SDL_DestroyMutex(h->lock);
+        SDL_free(h->stop_path);
         SDL_free(h->ready_path);
         SDL_free(h->out_path);
         SDL_free(h->mixbuf);
@@ -495,6 +535,7 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
             SDL_RWclose(h->out);
             SDL_DestroyCond(h->cond);
             SDL_DestroyMutex(h->lock);
+            SDL_free(h->stop_path);
             SDL_free(h->ready_path);
             SDL_free(h->out_path);
             SDL_free(h->mixbuf);

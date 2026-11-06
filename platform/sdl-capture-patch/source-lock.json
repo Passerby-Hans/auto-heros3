@@ -10,12 +10,13 @@
   "source_tag": "release-2.32.10",
   "protocol": "a3-audio/1",
   "runtime_dll": "vendor/vcmi-1.7.5/SDL2.dll",
-  "private_dll_sha256": "ebc67d528a8eefa51ea5111a2062db4574081d78a2fb234ba69fe73efb66cb1d",
-  "private_dll_bytes": 1802752,
+  "private_dll_sha256": "74e8080666238522cc2ac90eb25a8d60eec6683f062d915f616fb7b3cf885629",
+  "private_dll_bytes": 1805312,
   "smoke": "PASS R2: explicit private DLL; driver=a3capture; 44.1k/s16/2ch/1024; 212992B in 1.2s; generated=queued=written=committed; rate bounds PASS; dependencies exclude MMDevAPI/audioses",
   "a2_vcmi": "PASS R3: VCMI loaded a3capture, audio_ready=true, non-zero raw PCM; no accurate timing window, not a rate claim",
-  "patch_sha256": "166e233c623d9c060b55c097754142523e381078ff46d697e96892b399daf96d",
+  "patch_sha256": "e222dd24661104b5a9d9695d6e5458b80178782a6ef6273b2b12ac902b1aefd1",
   "source_lock_verified": true,
   "fault_injection": "PASS: queue overflow, short write, no-thread cleanup, close timeout (bounded 5s/detached)",
-  "a3_framed": "PASS: 53 packets, 53248 frames, first=1,last=2, header/payload CRC and sample continuity validated"
+  "a3_framed": "PASS: 53 packets, 53248 frames, first=1,last=2, header/payload CRC and sample continuity validated",
+  "graceful_stop": "PASS: test marker -> LAST, drain, final counters (GRACEFUL_STOP_PASS)"
 }

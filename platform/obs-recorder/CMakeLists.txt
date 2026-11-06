@@ -44,6 +44,36 @@ set_target_properties(obs-recorder PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A0/A1: wire protocol + absolute QPC scheduling core.
+#
+# This target is independent of libobs/SDL/OBS and is built by the normal
+# media build so the offline contract is reproducible.  It never touches game
+# state or a physical audio endpoint.
+# ---------------------------------------------------------------------------
+add_executable(audio-core-tests
+  tests/audio_core_tests.cpp
+  src/audio/audio_clock.cpp
+  ../audio-protocol/src/a3_audio_protocol.cpp
+)
+target_compile_features(audio-core-tests PRIVATE cxx_std_17)
+target_compile_definitions(audio-core-tests PRIVATE
+  UNICODE
+  _UNICODE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+  _WIN32_WINNT=0x0A00
+)
+target_compile_options(audio-core-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_include_directories(audio-core-tests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include"
+)
+set_target_properties(audio-core-tests PROPERTIES
+  OUTPUT_NAME "audio-core-tests"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# ---------------------------------------------------------------------------
 # S1b: libobs media self-test executable (obs-media-selftest.exe)
 #
 # This target is the first one in this directory that LINKS libobs instead of

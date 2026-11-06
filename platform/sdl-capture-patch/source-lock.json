@@ -1,0 +1,13 @@
+{
+  "source_sha256": null,
+  "runtime_sha256": "76ec39741feed5bb949a8126735ec3aec7737b8de6dfc4f6333b9f0eba3dc10c",
+  "runtime_version": "2.32.10.0",
+  "schema_version": 1,
+  "backend_status": "planned",
+  "note": "Private SDL2.dll must be built from pinned source and staged locally; do not replace Conan/system DLL.",
+  "source_url": "https://github.com/libsdl-org/SDL/releases/tag/release-2.32.10",
+  "backend_name": "a3capture",
+  "source_tag": "release-2.32.10",
+  "protocol": "a3-audio/1",
+  "runtime_dll": "vendor/vcmi-1.7.5/SDL2.dll"
+}

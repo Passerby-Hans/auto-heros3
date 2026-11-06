@@ -126,6 +126,50 @@ void ConvertChunk(RawAudioData* d, const uint8_t* bytes, uint32_t frames)
     }
 }
 
+// Stretch a short real-input block to a full 4410-frame output block.  This is
+// deliberately simple linear interpolation: the raw sink is ~1-2% slower than
+// wall time, and the user accepted the small pitch change.  Keeping the output
+// exactly one chunk per wall tick prevents OBS from inserting periodic 14 ms
+// silent gaps to reconcile sample-clock timestamps with the wall clock.
+void ConvertResampledChunk(RawAudioData* d, const uint8_t* bytes, uint32_t in_frames)
+{
+    const uint32_t out_frames = d->cfg.chunk_frames;
+    if (in_frames == 0) {
+        std::fill(d->left.begin(), d->left.end(), 0.0f);
+        std::fill(d->right.begin(), d->right.end(), 0.0f);
+        return;
+    }
+    auto sample_at = [&](uint32_t index, float& l, float& r) {
+        const uint8_t* p = bytes + static_cast<size_t>(index) * 4;
+        int16_t sl = 0;
+        int16_t sr = 0;
+        std::memcpy(&sl, p, sizeof(sl));
+        std::memcpy(&sr, p + sizeof(sl), sizeof(sr));
+        l = static_cast<float>(sl) / 32768.0f;
+        r = static_cast<float>(sr) / 32768.0f;
+    };
+    if (in_frames == 1) {
+        float l = 0.0f;
+        float r = 0.0f;
+        sample_at(0, l, r);
+        std::fill(d->left.begin(), d->left.end(), l);
+        std::fill(d->right.begin(), d->right.end(), r);
+        return;
+    }
+    const double scale = static_cast<double>(in_frames - 1) / (out_frames - 1);
+    for (uint32_t i = 0; i < out_frames; ++i) {
+        const double pos = i * scale;
+        const uint32_t i0 = static_cast<uint32_t>(pos);
+        const uint32_t i1 = std::min<uint32_t>(i0 + 1, in_frames - 1);
+        const float t = static_cast<float>(pos - i0);
+        float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
+        sample_at(i0, l0, r0);
+        sample_at(i1, l1, r1);
+        d->left[i] = l0 * (1.0f - t) + l1 * t;
+        d->right[i] = r0 * (1.0f - t) + r1 * t;
+    }
+}
+
 HANDLE TryOpen(const std::wstring& path, std::string& error)
 {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
@@ -198,8 +242,7 @@ void ReaderThread(RawAudioData* d)
     pending.reserve(read_ahead_bytes * 2);
     std::vector<uint8_t> readbuf(64 * 1024);
 
-    uint64_t next_ts = os_gettime_ns();   // wall-clock scheduler tick
-    uint64_t audio_ts = next_ts;          // sample-index-derived audio timestamp
+    uint64_t next_ts = os_gettime_ns();   // wall-clock scheduler and audio timestamp grid
     while (!d->stopping.load(std::memory_order_acquire)) {
         const uint64_t now = os_gettime_ns();
         if (now < next_ts) {
@@ -233,31 +276,39 @@ void ReaderThread(RawAudioData* d)
         }
 
         const size_t available_frames = pending.size() / frame_bytes;
-        const uint32_t frames = static_cast<uint32_t>(
+        const uint32_t in_frames = static_cast<uint32_t>(
             std::min<size_t>(available_frames, d->cfg.chunk_frames));
-        if (frames > 0) {
-            const size_t bytes = static_cast<size_t>(frames) * frame_bytes;
-            ConvertChunk(d, pending.data(), frames);
-            pending.erase(pending.begin(), pending.begin() + bytes);
-            PushAudio(d, frames, audio_ts);
-            ++stats.chunks_pushed;
-            if (frames < d->cfg.chunk_frames) {
+        if (in_frames > 0) {
+            const size_t bytes = static_cast<size_t>(in_frames) * frame_bytes;
+            if (in_frames < d->cfg.chunk_frames) {
+                ConvertResampledChunk(d, pending.data(), in_frames);
                 ++stats.partial_chunks;
+                ++stats.resampled_chunks;
+            } else {
+                ConvertChunk(d, pending.data(), in_frames);
             }
-            stats.samples_pushed += frames;
-            stats.frames_read += frames;
+            pending.erase(pending.begin(), pending.begin() + bytes);
+            // Output exactly one wall-clock chunk.  The input may be shorter;
+            // it has just been stretched to 4410 frames, so no 14-100 ms zero
+            // gap is injected by OBS's audio clock reconciliation.
+            PushAudio(d, d->cfg.chunk_frames, next_ts);
+            ++stats.chunks_pushed;
+            stats.samples_pushed += d->cfg.chunk_frames;
+            stats.frames_read += in_frames;
             stats.bytes_read += bytes;
-            audio_ts += static_cast<uint64_t>(frames) * 1000000000ULL / d->cfg.sample_rate;
         } else if (stats.samples_pushed == 0) {
             // Pre-roll: recording may start a tick before VCMI/SDL has produced
-            // its first PCM.  Do not turn that into a 100 ms silent block; it is
-            // a startup condition, not a mid-recording discontinuity.
+            // its first PCM.  Keep the wall-clock grid alive with one short
+            // startup block; the selftest reports this separately.
+            ConvertResampledChunk(d, pending.data(), 0);
+            PushAudio(d, d->cfg.chunk_frames, next_ts);
             ++stats.startup_underflow_events;
         } else {
-            // Do not manufacture a 100 ms all-zero block.  A mid-recording
-            // starvation is recorded; the stop gate rejects it.  The next real
-            // chunk is emitted with the sample-clock timestamp, not a fake
-            // wall-clock 100 ms zero block.
+            // Mid-recording starvation: emit a full silent block only to keep
+            // the timestamp grid, and record it so the stop gate rejects it.
+            ConvertResampledChunk(d, pending.data(), 0);
+            PushAudio(d, d->cfg.chunk_frames, next_ts);
+            ++stats.silence_chunks;
             ++stats.underflow_events;
         }
         SetStats(d, stats);

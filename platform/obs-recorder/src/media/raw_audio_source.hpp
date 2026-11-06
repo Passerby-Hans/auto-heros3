@@ -11,12 +11,12 @@
 //     game-audio.raw while recording; old samples are not replayed);
 //   * start_at_zero=true: read from the beginning (test mode for a static file).
 //
-// Variable-length output: the reader no longer requires a full 4410-frame chunk.
-// It emits whatever complete real frames are available (up to 4410) and records
-// partial_chunks/underflow_events.  It never manufactures a full silent chunk;
-// the source declares 44100 Hz and the AAC mux keeps that rate, with A/V duration
-// checked at stop.  Missing file: retried; no real samples after startup is
-// counted as an underflow.
+// Input is variable-length, output is wall-clock continuous: the reader takes
+// whatever real frames are available and, when they are fewer than 4410, linearly
+// resamples them to a full 4410-frame 100 ms output chunk.  It no longer
+// manufactures all-zero chunks for partial input.  The source declares 44100 Hz,
+// so the AAC mux remains 44100; small pitch changes from the stretch are accepted.
+// Missing file: retried; no real samples after startup is counted as underflow.
 #pragma once
 
 #include <cstdint>
@@ -44,7 +44,8 @@ struct RawAudioStats {
     uint64_t frames_read = 0;
     uint64_t chunks_pushed = 0;     // real (non-silence) chunks
     uint64_t silence_chunks = 0;    // legacy zero-filled chunks (must stay 0 in live capture)
-    uint64_t partial_chunks = 0;    // real chunks shorter than chunk_frames
+    uint64_t partial_chunks = 0;    // ticks whose real input was shorter than chunk_frames
+    uint64_t resampled_chunks = 0;  // partial real input stretched to a full 4410-frame output
     uint64_t underflow_events = 0;  // ticks after first real data with no available frames
     uint64_t startup_underflow_events = 0; // pre-roll ticks before the first real sample
     uint64_t eof_waits = 0;         // read attempts that hit current EOF

@@ -713,7 +713,7 @@ _RUN_EVIDENCE_FILES = ('actions.jsonl', 'results.log', 'events.jsonl', 'events_c
                        'last_battle_round.json', 'recording.json', 'recording.lock',
                        'action_index.json', 'run.json', 'epochs.jsonl', 'segments.jsonl',
                        'restore.json', 'restores.jsonl', 'lease.json', 'ui_tree.json',
-                       'terminal.json', 'prep_summary.json', 'cheat.txt',
+                       'terminal.json', 'pause.json', 'prep_summary.json', 'cheat.txt',
                        _RECORDING_SEGMENTS_FILE)
 
 
@@ -922,7 +922,7 @@ def _rotate_run(archive: bool = True) -> dict:
         # archiver copied it already.  Reset only what the new run must not inherit.
         for name in ('actions.jsonl', 'events.jsonl', 'events_cursor.json', 'events_state.json',
                      'unresolved.json', 'saves.json', 'last_battle_round.json',
-                     'terminal.json'):
+                     'terminal.json', 'pause.json'):
             try:
                 (_dir() / name).unlink()
             except OSError:
@@ -1145,7 +1145,7 @@ _ARCHIVE_FILES = ('actions.jsonl', 'results.log', 'events.jsonl', 'events_cursor
                   'recording.json', 'recording.lock', 'unresolved.json', 'action_index.json',
                   'last_battle_round.json', 'battle_actions.json', 'town_info.json',
                   'army_info.json', 'ui_tree.json', 'segments.jsonl', 'lease.json',
-                  'terminal.json', 'prep_summary.json', 'restore.json', 'restores.jsonl',
+                  'terminal.json', 'pause.json', 'prep_summary.json', 'restore.json', 'restores.jsonl',
                   'cheat.txt', _RECORDING_SEGMENTS_FILE)
 
 
@@ -2007,21 +2007,34 @@ def _read_terminal() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _pause_path() -> Path:
+    return _dir() / 'pause.json'
+
+
+def _read_pause() -> dict | None:
+    try:
+        data = json.loads(_pause_path().read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 @mcp.tool()
 def game_status() -> dict:
     a = _agent()
     st, error = _state_or_error()
     terminal = _read_terminal()
+    pause = _read_pause()
     if error:
         # A resigned/finished run has no live session; still return the recorded terminal state
         # so the caller can report the ending instead of misreading it as "no session".
-        return {'ok': False, 'error': error, 'terminal': terminal,
+        return {'ok': False, 'error': error, 'terminal': terminal, 'pause': pause,
                 'session': a.session.session_id if a.session else None}
     contract = a.contract or a.contract_status()
     return {'ok': True, 'day': (st.get('date') or {}).get('day'), 'status': st.get('status'),
             'session': a.session.session_id if a.session else None,
             'offscreen': a.window_is_offscreen(), 'rect': a._window_rect(),
-            'terminal': terminal,
+            'terminal': terminal, 'pause': pause,
             'contract': {'match': contract.get('match'),
                          'client_sha256': contract.get('actual_sha256'),
                          'pinned_at': contract.get('built_from_commit'),
@@ -2033,20 +2046,22 @@ def game_status() -> dict:
 def game_resign(reason: str) -> dict:
     """Terminate the game as a deliberate **surrender** and report the terminal state.
 
-    Use this only when the objective is genuinely unwinnable (for example: no hero, no town,
-    no recruitable army and no path to the enemy; an engine/quest dead end; or a board state
-    where the remaining enemy cannot be attacked at all).  Do **not** use it to avoid a normal
-    difficult battle or to save-scum a loss.  The action is recorded as ``status=resigned`` in
-    ``terminal.json`` and as a ``terminal`` line in overlay.jsonl, then the active recording is
-    finalized and the owned VCMI session is stopped.
+    The model may choose surrender when its own judgment says the loss/disadvantage is too
+    large and the remaining turns are likely garbage time (for example after losing most of the
+    army, several towns, or the last practical recovery route).  It is a deliberate
+    ``status=resigned`` ending, not a WIN and not the engine's LOSER result.  This is separate
+    from ``game_pause`` (still playable, but time budget too long) and ``game_blocked``
+    (engine/MCP/recorder failure).  The action is recorded in ``terminal.json`` and as a
+    ``terminal`` line in overlay.jsonl; the active recording is finalized and the owned VCMI
+    session is stopped.
 
     Returns the terminal record, the recording summary (when one was active) and the session
     stop result, so the caller can report a clean ending.
     """
     cleaned = (reason or '').strip()
-    if len(cleaned) < 8:
+    if len(cleaned) < 4:
         return {'ok': False, 'error': 'reason_too_short',
-                'hint': 'describe the concrete objective blocker (at least 8 characters)'}
+                'hint': 'state why the loss/disadvantage is too large (at least 4 characters)'}
     try:
         _require_lease()
     except Exception as exc:  # noqa: BLE001
@@ -2071,7 +2086,7 @@ def game_resign(reason: str) -> dict:
     }
     _atomic_write_json(_terminal_path(), terminal)
     _overlay('terminal', f'终局：投降 — {cleaned}')
-    _overlay('event', '游戏终止：投降（客观不可继续）')
+    _overlay('event', '游戏终止：主动投降（劣势过大/垃圾时间）')
     # Give the 1 Hz panel source a chance to show the terminal line in the last frames.
     time.sleep(1.2)
     recording = None
@@ -2096,6 +2111,148 @@ def game_resign(reason: str) -> dict:
     return {'ok': True, 'status': 'resigned', 'terminal': terminal,
             'recording': recording, 'session': session,
             'report': f'终局：投降（day {day}）— {cleaned}'}
+
+
+def _stop_active_recording() -> dict | None:
+    """Best-effort finalize of the active recording; never raises to the caller."""
+    try:
+        if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
+            return recording_stop()
+        record = _read_recording_state()
+        if record:
+            return recording_stop()
+    except Exception as exc:  # noqa: BLE001
+        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    return None
+
+
+@mcp.tool()
+@_serialized_mutation('game_pause')
+def game_pause(reason: str) -> dict:
+    """Pause a still-playable run when the time budget is too long; the user decides next.
+
+    This is **not** a terminal state and **not** a surrender.  Use it for ordinary losses,
+    temporary disadvantage, a plan that can still recover and recruit, or when finishing would
+    take too long.  The game is saved (best effort), the recording is finalized, and the VCMI
+    session is deliberately left running so the user can say continue/stop.  If the save fails
+    (for example in the middle of a battle), the session is still left running and the report
+    says ``save_ok=false``.
+    """
+    cleaned = (reason or '').strip()
+    if len(cleaned) < 4:
+        return {'ok': False, 'error': 'reason_too_short',
+                'hint': 'state why you want to pause/let the user decide'}
+    try:
+        _require_lease()
+    except Exception as exc:  # noqa: BLE001
+        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    st, state_error = _state_or_error()
+    day = (st.get('date') or {}).get('day') if st else None
+    identity = _evidence_identity()
+    day = day if day is not None else identity.get('day')
+    slot = time.strftime('pause-%Y%m%d-%H%M%S')
+    save = None
+    try:
+        save = save_game(slot)
+    except Exception as exc:  # noqa: BLE001
+        save = {'ok': False, 'status': 'unknown',
+                'error': f'{type(exc).__name__}: {exc}'}
+    save_ok = bool((save or {}).get('ok'))
+    pause = {
+        'schema_version': 1,
+        'status': 'paused',
+        'kind': 'pause',
+        'reason': cleaned,
+        'day': day,
+        'run_id': identity.get('run_id'),
+        'branch_id': identity.get('branch_id'),
+        'epoch': identity.get('epoch'),
+        'session_id': identity.get('session_id'),
+        'at': time.time(),
+        'at_local': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'state_error': state_error,
+        'save_slot': slot,
+        'save_ok': save_ok,
+        'save': save,
+    }
+    _atomic_write_json(_pause_path(), pause)
+    _overlay('pause', f'暂停：{cleaned}' + (f'（已存档 {slot}）' if save_ok else '（存档失败，会话保留）'))
+    _overlay('event', '游戏暂停：等待用户决定继续/终止')
+    time.sleep(1.0)
+    recording = _stop_active_recording()
+    pause['recording_dir'] = (recording or {}).get('dir')
+    pause['recording_ok'] = bool((recording or {}).get('ok'))
+    _atomic_write_json(_pause_path(), pause)
+    return {'ok': True, 'status': 'paused', 'pause': pause,
+            'save': save, 'save_ok': save_ok, 'recording': recording,
+            'session': None,
+            'hint': ('game_paused session_left_running; ask the user to continue or terminate'
+                     if not save_ok else
+                     f'game_paused save={slot}; ask the user to continue or terminate')}
+
+
+@mcp.tool()
+@_serialized_mutation('game_blocked')
+def game_blocked(reason: str, recoverable: bool = True,
+                 resume_slot: str | None = None) -> dict:
+    """Report an objective game/MCP/recorder block and distinguish recoverable vs not.
+
+    A **recoverable** block is an execution failure with a saved state / automatic recovery
+    path (for example a recorder crash that the watchdog restarted, or a known save slot).
+    An **unrecoverable** block has no save and no legal continuation.  This is not a voluntary
+    surrender (``game_resign``) and not an ordinary ``game_pause``.  The recording is finalized
+    and the session is stopped after writing ``terminal.json`` so the block cannot be mistaken
+    for a normal playable turn.
+    """
+    cleaned = (reason or '').strip()
+    if len(cleaned) < 4:
+        return {'ok': False, 'error': 'reason_too_short',
+                'hint': 'state the concrete engine/MCP/recorder failure'}
+    try:
+        _require_lease()
+    except Exception as exc:  # noqa: BLE001
+        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    st, state_error = _state_or_error()
+    day = (st.get('date') or {}).get('day') if st else None
+    identity = _evidence_identity()
+    day = day if day is not None else identity.get('day')
+    blocking = 'recoverable' if recoverable else 'unrecoverable'
+    terminal = {
+        'schema_version': 1,
+        'status': 'blocked',
+        'kind': 'blocked',
+        'blocking': blocking,
+        'recoverable': bool(recoverable),
+        'resume_slot': resume_slot,
+        'reason': cleaned,
+        'day': day,
+        'run_id': identity.get('run_id'),
+        'branch_id': identity.get('branch_id'),
+        'epoch': identity.get('epoch'),
+        'session_id': identity.get('session_id'),
+        'at': time.time(),
+        'at_local': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'state_error': state_error,
+    }
+    _atomic_write_json(_terminal_path(), terminal)
+    _overlay('terminal', f'阻塞·{"可恢复" if recoverable else "不可恢复"}：{cleaned}'
+             + (f'（存档 {resume_slot}）' if resume_slot else ''))
+    _overlay('event', f'游戏阻塞：{blocking}')
+    time.sleep(1.0)
+    recording = _stop_active_recording()
+    session = None
+    try:
+        session = _agent().stop()
+    except Exception as exc:  # noqa: BLE001
+        session = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    terminal['recording_dir'] = (recording or {}).get('dir')
+    terminal['recording_ok'] = bool((recording or {}).get('ok'))
+    terminal['session_stopped'] = bool(isinstance(session, dict) and session.get('ok', True))
+    _atomic_write_json(_terminal_path(), terminal)
+    return {'ok': True, 'status': blocking, 'terminal': terminal,
+            'recording': recording, 'session': session,
+            'hint': ('recoverable: keep the save slot and start a new session from it'
+                     if recoverable else 'unrecoverable: no save/continuation; report blocked')}
 
 
 @mcp.tool()

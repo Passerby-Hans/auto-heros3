@@ -356,13 +356,17 @@ void DrawPanel(PanelData* p) {
     const OverlayEntry* latest_thought = nullptr;
     std::vector<OverlayEntry> ops;
     std::wstring terminal = L"终局：进行中";
+    bool end_state_found = false;
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         if (it->kind == "thought" && !latest_thought) latest_thought = &*it;
-        if (it->kind == "terminal" || it->kind == "game_over") {
-            if (terminal == L"终局：进行中") terminal = Utf8ToWide(it->text);
+        // Newest end/pause marker wins.  Pause is not a terminal ending: it is shown as
+        // “暂停” and the user still decides whether to continue or terminate.
+        if (!end_state_found &&
+            (it->kind == "pause" || it->kind == "terminal" || it->kind == "game_over")) {
+            terminal = Utf8ToWide(it->text);
+            end_state_found = true;
         }
-        if ((it->kind == "action" || it->kind == "result" || it->kind == "event") &&
-            ops.size() < 5) {
+        if ((it->kind == "action" || it->kind == "result") && ops.size() < 5) {
             ops.push_back(*it);
         }
     }
@@ -437,9 +441,15 @@ void DrawPanel(PanelData* p) {
     RECT footer_rule{28, 914, 452, 915};
     FillRectColor(p->dc, footer_rule, RGB(44, 52, 64));
     COLORREF terminal_color = RGB(150, 163, 179);
-    if (terminal.find(L"投降") != std::wstring::npos ||
-        terminal.find(L"失败") != std::wstring::npos ||
-        terminal.find(L"LOSER") != std::wstring::npos) {
+    if (terminal.find(L"暂停") != std::wstring::npos) {
+        terminal_color = RGB(239, 190, 104);
+    } else if (terminal.find(L"可恢复") != std::wstring::npos &&
+               terminal.find(L"不可恢复") == std::wstring::npos) {
+        terminal_color = RGB(132, 186, 236);
+    } else if (terminal.find(L"不可恢复") != std::wstring::npos ||
+               terminal.find(L"投降") != std::wstring::npos ||
+               terminal.find(L"失败") != std::wstring::npos ||
+               terminal.find(L"LOSER") != std::wstring::npos) {
         terminal_color = RGB(232, 126, 104);
     } else if (terminal.find(L"胜利") != std::wstring::npos ||
                terminal.find(L"WINNER") != std::wstring::npos) {

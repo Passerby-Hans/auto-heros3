@@ -84,6 +84,7 @@ struct SDL_PrivateAudioData
     SDL_bool closed;
     char write_error[128];
     Uint32 test_worker_delay_ms;
+    Uint32 test_close_delay_ms;
     SDL_bool test_short_write;
     SDL_bool test_no_thread;
     Uint8 *mixbuf;
@@ -107,7 +108,11 @@ static DWORD WINAPI A3Worker(LPVOID arg)
             SDL_CondWait(h->cond, h->lock);
         }
         if (h->queue_count == 0 && h->stopping) {
+            const Uint32 close_delay = h->test_close_delay_ms;
             SDL_UnlockMutex(h->lock);
+            if (close_delay) {
+                SDL_Delay(close_delay);
+            }
             break;
         }
         packet = h->queue[h->queue_head];
@@ -335,6 +340,8 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     }
     const char *test_delay = SDL_getenv("A3CAPTURE_TEST_WORKER_DELAY_MS");
     h->test_worker_delay_ms = test_delay ? (Uint32)SDL_atoi(test_delay) : 0;
+    const char *close_delay = SDL_getenv("A3CAPTURE_TEST_CLOSE_DELAY_MS");
+    h->test_close_delay_ms = close_delay ? (Uint32)SDL_atoi(close_delay) : 0;
     h->test_short_write = SDL_getenv("A3CAPTURE_TEST_SHORT_WRITE") ? SDL_TRUE : SDL_FALSE;
     h->test_no_thread = SDL_getenv("A3CAPTURE_TEST_NO_THREAD") ? SDL_TRUE : SDL_FALSE;
     h->sample_rate = _this->spec.freq;

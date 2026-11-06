@@ -237,4 +237,35 @@ if ($queueText -notmatch 'dropped=[1-9]' -or $queueText -notmatch 'failed=1' -or
 if ($shortText -notmatch 'failed=1' -or $shortExit -ne 0) {
     throw 'a3capture short-write fault injection failed'
 }
-Write-Host 'A2.1 fault injection PASS (queue overflow + short write)'
+
+# Thread creation failure path: force no worker, must close safely.
+$env:A3CAPTURE_TEST_FAULT = '1'
+$env:A3CAPTURE_TEST_NO_THREAD = '1'
+$env:A3CAPTURE_TEST_NO_PCM = '1'
+$noThreadLog = Join-Path $stage 'a3capture-fault-nothread.log'
+& $smoke (Join-Path $stage 'SDL2.dll') (Join-Path $stage 'a3capture-fault-nothread.raw') 500 *> $noThreadLog
+$noThreadExit = $LASTEXITCODE
+Remove-Item Env:A3CAPTURE_TEST_NO_THREAD -ErrorAction SilentlyContinue
+Remove-Item Env:A3CAPTURE_TEST_NO_PCM -ErrorAction SilentlyContinue
+$info['no_thread_fault_exit'] = $noThreadExit
+$info['no_thread_fault_log'] = $noThreadLog
+if ($noThreadExit -ne 0) { throw 'a3capture no-thread fault injection failed' }
+
+# Bounded close path: worker delays beyond the 5 s wait, close must return
+# without UAF/double-free.
+$env:A3CAPTURE_TEST_CLOSE_DELAY_MS = '6000'
+$env:A3CAPTURE_TEST_NO_PCM = '1'
+$closeLog = Join-Path $stage 'a3capture-fault-closetimeout.log'
+& $smoke (Join-Path $stage 'SDL2.dll') (Join-Path $stage 'a3capture-fault-closetimeout.raw') 500 *> $closeLog
+$closeExit = $LASTEXITCODE
+Remove-Item Env:A3CAPTURE_TEST_CLOSE_DELAY_MS -ErrorAction SilentlyContinue
+Remove-Item Env:A3CAPTURE_TEST_NO_PCM -ErrorAction SilentlyContinue
+Remove-Item Env:A3CAPTURE_TEST_FAULT -ErrorAction SilentlyContinue
+$closeText = Get-Content -LiteralPath $closeLog -Raw
+$info['close_timeout_fault_exit'] = $closeExit
+$info['close_timeout_fault_log'] = $closeLog
+$info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+if ($closeExit -ne 0 -or $closeText -notmatch 'close timeout') {
+    throw 'a3capture close-timeout fault injection failed'
+}
+Write-Host 'A2.1 fault injection PASS (queue overflow + short write + no-thread + close timeout)'

@@ -154,10 +154,16 @@ int main(int argc, char **argv)
     char detail[160];
     const long expected = (long)run_ms * 44100L * 2L * 2L / 1000L;
     snprintf(detail, sizeof(detail), "bytes=%ld expected~%ld", bytes, expected);
-    check("pcm_written", bytes > 0, detail);
-    if (!getenv("A3CAPTURE_TEST_FAULT")) {
-        check("pcm_rate_bounds",
-              bytes >= expected * 95L / 100L && bytes <= expected * 105L / 100L, detail);
+    if (getenv("A3CAPTURE_TEST_NO_PCM")) {
+        check("no_pcm_expected", 1, "fault mode intentionally leaves no complete file");
+    } else if (!getenv("A3CAPTURE_TEST_NO_THREAD")) {
+        check("pcm_written", bytes > 0, detail);
+        if (!getenv("A3CAPTURE_TEST_FAULT")) {
+            check("pcm_rate_bounds",
+                  bytes >= expected * 95L / 100L && bytes <= expected * 105L / 100L, detail);
+        }
+    } else {
+        check("no_thread_close_survived", 1, "no worker by design");
     }
     printf("DLL_VERSION %u.%u.%u\n", ver.major, ver.minor, ver.patch);
     printf("DRIVER %s\n", driver ? driver : "");

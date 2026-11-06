@@ -53,6 +53,7 @@ struct SDL_PrivateAudioData
     SDL_bool worker_done;
     SDL_RWops *out;
     char *out_path;
+    char *ready_path;
     A3Packet packets[A3CAPTURE_QUEUE_SLOTS];
     A3Packet *free_slots[A3CAPTURE_QUEUE_SLOTS];
     A3Packet *queue[A3CAPTURE_QUEUE_SLOTS];
@@ -258,6 +259,9 @@ static void A3CAPTURE_CloseDevice(_THIS)
         SDL_RWclose(h->out);
         h->out = NULL;
     }
+    if (h->ready_path) {
+        DeleteFileA(h->ready_path);
+    }
     SDL_Log("a3capture closed: generated=%llu queued=%llu written=%llu committed=%llu "
             "dropped=%llu late=%llu overflow=%llu failed=%d error='%s'",
             (unsigned long long)h->generated_frames,
@@ -274,6 +278,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
     for (int i = 0; i < A3CAPTURE_QUEUE_SLOTS; ++i) {
         SDL_free(h->packets[i].data);
     }
+    SDL_free(h->ready_path);
     SDL_free(h->out_path);
     SDL_free(h);
 }
@@ -313,9 +318,15 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     h->epoch_qpc = SDL_GetPerformanceCounter();
     h->next_deadline_qpc = h->epoch_qpc;
     h->out_path = SDL_strdup(path);
+    const size_t ready_len = SDL_strlen(path) + 8; /* ".ready" + NUL */
+    h->ready_path = (char *)SDL_malloc(ready_len);
+    if (h->ready_path) {
+        SDL_snprintf(h->ready_path, ready_len, "%s.ready", path);
+    }
     h->lock = SDL_CreateMutex();
     h->cond = SDL_CreateCond();
-    if (!h->out_path || !h->lock || !h->cond) {
+    if (!h->out_path || !h->ready_path || !h->lock || !h->cond) {
+        SDL_free(h->ready_path);
         SDL_free(h->out_path);
         SDL_DestroyCond(h->cond);
         SDL_DestroyMutex(h->lock);
@@ -330,6 +341,7 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
         SDL_SetError("cannot open A3CAPTURE_FILE");
         SDL_DestroyCond(h->cond);
         SDL_DestroyMutex(h->lock);
+        SDL_free(h->ready_path);
         SDL_free(h->out_path);
         SDL_free(h->mixbuf);
         SDL_free(h);
@@ -345,6 +357,7 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
             SDL_RWclose(h->out);
             SDL_DestroyCond(h->cond);
             SDL_DestroyMutex(h->lock);
+            SDL_free(h->ready_path);
             SDL_free(h->out_path);
             SDL_free(h->mixbuf);
             SDL_free(h);
@@ -359,6 +372,15 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     if (!h->worker) {
         A3CAPTURE_CloseDevice(_this);
         return -1;
+    }
+    {
+        SDL_RWops *ready = SDL_RWFromFile(h->ready_path, "wb");
+        if (ready) {
+            SDL_RWwrite(ready, "ready", 1, 5);
+            SDL_RWclose(ready);
+        } else {
+            SDL_Log("a3capture ready marker open failed: %s", h->ready_path);
+        }
     }
     SDL_Log("a3capture opened: file='%s' format=s16le rate=%u ch=%u samples=%u qpc_freq=%llu",
             path, h->sample_rate, _this->spec.channels, h->samples_per_callback,

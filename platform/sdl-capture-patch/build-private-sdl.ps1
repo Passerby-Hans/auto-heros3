@@ -37,6 +37,9 @@ $patchConcat = ($patchFiles | ForEach-Object { (Get-Content -LiteralPath $_ -Raw
 $patchHash = [System.BitConverter]::ToString(
     [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($patchConcat))
 ).Replace('-', '').ToLowerInvariant()
+if ($lock.patch_sha256 -and $lock.patch_sha256 -ne $patchHash) {
+    throw "source lock patch mismatch: actual=$patchHash expected=$($lock.patch_sha256)"
+}
 Write-Host ("source lock verified: archive={0} patch={1}" -f $archiveHash, $patchHash)
 
 function Find-Tool([string[]]$Candidates) {
@@ -74,6 +77,19 @@ if (-not (Test-Path -LiteralPath $python)) { $python = 'python.exe' }
 $applyPy = Join-Path $scriptDir 'apply.py'
 & $python $applyPy --sdl-dir $SdlDir --patch-dir $scriptDir
 if ($LASTEXITCODE -ne 0) { throw 'SDL backend patch failed' }
+$patchedFiles = @(
+    (Join-Path $SdlDir 'CMakeLists.txt'),
+    (Join-Path $SdlDir 'include\SDL_config.h.cmake'),
+    (Join-Path $SdlDir 'src\audio\SDL_audio.c'),
+    (Join-Path $SdlDir 'src\audio\SDL_sysaudio.h'),
+    (Join-Path $SdlDir 'src\audio\a3capture\SDL_a3capture.c'),
+    (Join-Path $SdlDir 'src\audio\a3capture\audio_clock_c.c'),
+    (Join-Path $SdlDir 'src\audio\a3capture\audio_clock_c.h')
+)
+$patchedConcat = ($patchedFiles | ForEach-Object { (Get-Content -LiteralPath $_ -Raw) }) -join "`n---A3TREE---`n"
+$patchedTreeHash = [System.BitConverter]::ToString(
+    [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($patchedConcat))
+).Replace('-', '').ToLowerInvariant()
 
 $envBat = Join-Path $BuildDir 'vcvars_env.bat'
 Set-Content -LiteralPath $envBat -Encoding ASCII -Value @(
@@ -145,6 +161,7 @@ $info = [ordered]@{
     source_sha256 = $archiveHash
     source_lock_verified = $true
     patch_sha256 = $patchHash
+    patched_tree_sha256 = $patchedTreeHash
     output = (Join-Path $stage 'SDL2.dll')
     sha256 = $hash
     bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length

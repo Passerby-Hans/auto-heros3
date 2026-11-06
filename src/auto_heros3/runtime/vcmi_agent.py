@@ -210,6 +210,7 @@ class VcmiAgent:
         self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'disk').strip()
         self.a3capture_file = Path(os.environ.get(
             'AUTO_HEROS3_A3CAPTURE_FILE', str(self.dir / 'a3capture.raw'))).resolve()
+        self.a3capture_ready_path = Path(str(self.a3capture_file) + '.ready')
         self.session: Session | None = None
         self._pending_seq = 0
         self._seq_offset: dict[int, int] = {}
@@ -567,13 +568,30 @@ class VcmiAgent:
             self._stop_watch.clear()
             self._watch_thread = threading.Thread(target=self._offscreen_watchdog, daemon=True)
             self._watch_thread.start()
+        audio_ready = True
+        audio_ready_detail = 'disk relay path (legacy)'
+        if self.audio_driver == 'a3capture':
+            deadline = time.time() + 15.0
+            while time.time() < deadline and not self.a3capture_ready_path.exists():
+                time.sleep(0.05)
+            audio_ready = self.a3capture_ready_path.exists()
+            audio_ready_detail = (f'a3capture ready={audio_ready} '
+                                  f'path={self.a3capture_ready_path}')
+            if not audio_ready:
+                self._abort_start(client_pid=client_pid, create_time=create_time)
+                raise BridgeError('a3capture audio_ready=false')
         sess = Session(dir=str(self.dir), map_name=self.map_name, client_pid=client_pid,
                        client_create_time=create_time, launcher_pid=self.proc.pid,
                        created_at=time.time())
         rect = self._window_rect()
         sess.notes.append(f'window_rect={rect} offscreen={self.window_is_offscreen()}')
-        sess.notes.append(f'audio_sink=disk raw={self.audio_sink_path} '
-                          f'format=s16le/44100/2 physical_endpoint_untouched=true')
+        if self.audio_driver == 'a3capture':
+            sess.notes.append(f'audio_sink={self.audio_driver} raw={self.a3capture_file} '
+                              f'format=s16le/44100/2 physical_endpoint_untouched=true '
+                              f'{audio_ready_detail}')
+        else:
+            sess.notes.append(f'audio_sink=disk raw={self.audio_sink_path} '
+                              f'format=s16le/44100/2 physical_endpoint_untouched=true')
         if self.display_index is not None:
             sess.notes.append(f'target_display_index={self.display_index} '
                               f'first_placement_kept=true')

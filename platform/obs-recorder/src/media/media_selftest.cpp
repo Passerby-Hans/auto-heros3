@@ -260,6 +260,7 @@ struct Options {
     std::string audio_framed;         // A4 a3-audio/1 source (instead of raw)
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
     bool fixed_audio = false;          // A4: obs_reset_audio2 fixed buffering
+    bool mute_synthetic_audio = false; // A4 pulse test: keep synthetic video, mute its tone
 
     // S3a: persistent named-pipe IPC server (libobs stays initialized)
     bool serve = false;
@@ -1189,6 +1190,10 @@ bool CreatePipeline(State& s, const std::string& first_file_path)
     if (!s.source) {
         s.failure_exit_code = 4;
         return false;
+    }
+    if (s.opt.mute_synthetic_audio) {
+        obs_source_set_muted(s.source, true);
+        AddStep(s, "synthetic_audio_muted", true, "synthetic 440 Hz tone muted; framed source is the only audio");
     }
 
     s.source_monitoring_type = static_cast<int>(obs_source_get_monitoring_type(s.source));
@@ -3445,6 +3450,7 @@ void PrintUsage()
 "  --audio-framed PATH   A4: add native a3-audio/1 framed timestamped source\n"
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
 "  --fixed-audio         A4: obs_reset_audio2 fixed buffering (max 1000ms)\n"
+"  --mute-synthetic-audio  A4: keep synthetic video, mute synthetic tone\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n  --max-size-mb N      size split threshold in MiB (0 disables; IPC allows 1..4096)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
@@ -3500,6 +3506,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.audio_start_zero = true;
         } else if (a == "--fixed-audio") {
             opt.fixed_audio = true;
+        } else if (a == "--mute-synthetic-audio") {
+            opt.mute_synthetic_audio = true;
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
             opt.duration_explicit = true;

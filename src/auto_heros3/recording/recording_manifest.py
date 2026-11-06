@@ -223,9 +223,15 @@ class RecordingManifest:
         seg['state'] = new_state
         seg[f'{new_state}_at'] = _now()
         seg.update(fields)
+        # Persist the durable fields in the journal event itself; a crash after the
+        # event and before the manifest snapshot must not lose path/bytes/validation.
+        journal_fields = {k: v for k, v in seg.items()
+                          if k not in ('state', 'created_at', 'segment_id') and
+                          not k.endswith('_at')}
         self.append_event('segment_state', segment_id=segment_id,
                           event_key=f'segment_state:{segment_id}:{new_state}',
-                          from_state=old, to_state=new_state, reason=reason)
+                          from_state=old, to_state=new_state, reason=reason,
+                          **journal_fields)
         self.save()
         return seg
 

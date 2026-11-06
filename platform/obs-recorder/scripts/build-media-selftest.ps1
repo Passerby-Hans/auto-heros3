@@ -233,9 +233,20 @@ if ($configureExit -eq 0) {
 
 $exePath = Join-Path (Join-Path $BuildDir 'bin') 'obs-media-selftest.exe'
 $exeExists = Test-Path -LiteralPath $exePath
+$sourceCommit = ''
+$sourceTree = ''
+$sourceDirty = $null
+try {
+    $sourceCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null | Out-String).Trim()
+    $sourceTree = (& git -C $RepoRoot rev-parse 'HEAD^{tree}' 2>$null | Out-String).Trim()
+    $sourceDirty = [bool]((& git -C $RepoRoot status --porcelain 2>$null | Out-String).Trim())
+} catch { }
 $summary = [ordered]@{
     timestamp_utc        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     repo_root            = $RepoRoot
+    source_commit        = $sourceCommit
+    source_tree_hash     = $sourceTree
+    source_dirty         = $sourceDirty
     project_dir          = $projectDir
     build_dir            = $BuildDir
     obs_dir              = $ObsDir

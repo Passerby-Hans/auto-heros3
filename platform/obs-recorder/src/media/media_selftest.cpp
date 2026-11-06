@@ -385,6 +385,7 @@ struct State {
 void AddStep(State& s, const std::string& name, bool ok, const std::string& detail = "");
 
 std::atomic<bool> g_window_hooked {false};
+std::atomic<bool> g_window_unhooked {false};
 std::mutex g_hook_mutex;
 std::string g_hook_detail;
 
@@ -397,6 +398,8 @@ void ResetSignalGlobals()
 {
     g_stop_signal_seen.store(false);
     g_stop_code.store(-1);
+    g_window_hooked.store(false);
+    g_window_unhooked.store(false);
 }
 
 void RecordEvent(const std::string& name, const std::string& detail)
@@ -457,11 +460,14 @@ void OnWindowHooked(void*, calldata_t* cd)
         g_hook_detail = detail;
     }
     g_window_hooked.store(true);
+    g_window_unhooked.store(false);
     RecordEvent("window_capture_hooked", detail);
 }
 
 void OnWindowUnhooked(void*, calldata_t*)
 {
+    g_window_hooked.store(false);
+    g_window_unhooked.store(true);
     RecordEvent("window_capture_unhooked", "");
 }
 
@@ -1676,9 +1682,11 @@ void CollectFinalEvidence(State& s)
                                  s.applied_source_settings_json.find("\"capture_audio\":false") != std::string::npos &&
                                  s.applied_source_settings_json.find("\"client_area\":true") != std::string::npos;
         AddStep(s, "window_capture_settings_applied", settings_ok, s.applied_source_settings_json);
-        AddStep(s, "window_capture_still_hooked", s.capture_proc_hooked,
-                "proc get_hooked=" + std::to_string(s.capture_proc_hooked ? 1 : 0) + " title='" +
-                    s.capture_state_title + "' class='" + s.capture_state_class + "'");
+        AddStep(s, "window_capture_still_hooked",
+                s.capture_proc_hooked && !g_window_unhooked.load(),
+                "proc get_hooked=" + std::to_string(s.capture_proc_hooked ? 1 : 0) +
+                    " unhook_event=" + std::to_string(g_window_unhooked.load() ? 1 : 0) +
+                    " title='" + s.capture_state_title + "' class='" + s.capture_state_class + "'");
         AddStep(s, "window_capture_no_audio_capture",
                 !HasModule(s.process_modules, "MMDevAPI.dll") &&
                     !HasModule(s.process_modules, "audioses.dll") &&
@@ -1702,6 +1710,17 @@ void CollectFinalEvidence(State& s)
                     std::string("start_at_zero=") + (s.opt.audio_start_zero ? "true" : "false") +
                         " samples_pushed=" + std::to_string(s.audio_stats.samples_pushed) +
                         " (EOF mode may legitimately be silent if the file did not grow)");
+            // A live EOF capture must not manufacture audio.  A silence chunk means
+            // the reader outran the source or the source stopped; the output then has
+            // a hole even if the MP4/AAC container is valid.  Such a run is partial,
+            // never "validated/complete".
+            AddStep(s, "raw_audio_no_underrun",
+                    s.opt.audio_start_zero || s.audio_stats.silence_chunks == 0,
+                    "start_at_zero=" + std::string(s.opt.audio_start_zero ? "true" : "false") +
+                        " silence_chunks=" + std::to_string(s.audio_stats.silence_chunks) +
+                        " chunks=" + std::to_string(s.audio_stats.chunks_pushed) +
+                        " eof_waits=" + std::to_string(s.audio_stats.eof_waits) +
+                        " (live EOF capture must push only real samples)");
             AddStep(s, "raw_audio_monitoring_none_final",
                     s.audio_source_monitoring_type == OBS_MONITORING_TYPE_NONE,
                     "volume=" + std::to_string(s.audio_source_volume) + " mixers=" +

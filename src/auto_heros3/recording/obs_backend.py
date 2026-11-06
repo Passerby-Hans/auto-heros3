@@ -60,6 +60,8 @@ class ObsRecorder:
         self._responses: queue.Queue[dict] = queue.Queue()
         self._events: list[dict] = []
         self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self.last_error: str | None = None
 
     @property
     def pipe_path(self) -> str:
@@ -152,8 +154,29 @@ class ObsRecorder:
             pass
         return hello
 
-    def _read_response(self, request_id: str) -> dict:
+    def _abort_ipc(self, reason: str) -> None:
+        """Close the pipe so a blocked ReadFile cannot outlive its request deadline."""
+        handle = self._handle
+        self._handle = None
+        self._buf = b''
+        if handle is not None:
+            try:
+                import win32file
+                win32file.CloseHandle(handle)
+            except Exception:
+                pass
+        self.last_error = reason
+
+    def _read_response(self, request_id: str, timeout: float = 30.0) -> dict:
+        """Read one response with a real wall-clock deadline.
+
+        Named-pipe ReadFile is synchronous and has no timeout.  Peek first, then read
+        only when data is available; on deadline close the pipe (the caller gets a
+        deterministic error instead of hanging stop/cleanup forever).
+        """
         import win32file
+        import win32pipe
+        deadline = time.monotonic() + max(0.05, float(timeout))
         buf = getattr(self, '_buf', b'')
         while True:
             while b'\n' in buf:
@@ -172,21 +195,43 @@ class ObsRecorder:
                 if obj.get('request_id') in (request_id, None):
                     self._buf = buf
                     return obj
-            _rc, chunk = win32file.ReadFile(self._handle, 65536)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._abort_ipc(f'IPC timeout waiting for {request_id}')
+                raise ObsBackendError(f'IPC timeout waiting for {request_id}')
+            if self._handle is None:
+                raise ObsBackendError('recorder IPC not connected')
+            try:
+                _data, avail, _left = win32pipe.PeekNamedPipe(self._handle, 0)
+            except Exception as exc:
+                self._abort_ipc(f'native recorder closed IPC: {exc}')
+                raise ObsBackendError(f'native recorder closed IPC: {exc}') from exc
+            if not avail:
+                time.sleep(min(0.01, remaining))
+                continue
+            try:
+                _rc, chunk = win32file.ReadFile(self._handle, 65536)
+            except Exception as exc:
+                self._abort_ipc(f'IPC read failed: {exc}')
+                raise ObsBackendError(f'IPC read failed: {exc}') from exc
             if not chunk:
+                self._abort_ipc('native recorder closed IPC')
                 raise ObsBackendError('native recorder closed IPC')
             buf += chunk
 
     def request(self, command: str, timeout: float = 30.0, **args: Any) -> dict:
-        if self._handle is None:
-            raise ObsBackendError('recorder IPC not connected')
-        req = {'cmd': command, 'request_id': f'{command}-{uuid.uuid4().hex[:8]}', **args}
-        import win32file
-        try:
-            win32file.WriteFile(self._handle, (json.dumps(req, ensure_ascii=False) + '\n').encode('utf-8'))
-        except Exception as exc:
-            raise ObsBackendError(f'IPC write failed: {exc}') from exc
-        return self._read_response(req['request_id'])
+        with self._request_lock:
+            if self._handle is None:
+                raise ObsBackendError('recorder IPC not connected')
+            req = {'cmd': command, 'request_id': f'{command}-{uuid.uuid4().hex[:8]}', **args}
+            import win32file
+            try:
+                win32file.WriteFile(self._handle,
+                                    (json.dumps(req, ensure_ascii=False) + '\n').encode('utf-8'))
+            except Exception as exc:
+                self._abort_ipc(f'IPC write failed: {exc}')
+                raise ObsBackendError(f'IPC write failed: {exc}') from exc
+            return self._read_response(req['request_id'], timeout=timeout)
 
 
     def prepare(self, out_dir: Path, *, window_pid: int | None = None,
@@ -228,11 +273,13 @@ class ObsRecorder:
             return {}
 
     def close(self, force: bool = False) -> None:
-        if self._handle is not None:
+        """Close IPC/process; force cleanup never waits on an already-dead request channel."""
+        if self._handle is not None and not force:
             try:
                 self.shutdown()
             except Exception:
                 pass
+        if self._handle is not None:
             try:
                 import win32file
                 win32file.CloseHandle(self._handle)
@@ -241,20 +288,32 @@ class ObsRecorder:
             self._handle = None
         self._stop_reader = True
         if self.proc is not None:
-            try:
-                self.proc.wait(timeout=15)
-            except Exception:
-                if force or self.proc.poll() is None:
+            if force:
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    self.proc.wait(timeout=15)
+                except Exception:
                     try:
                         self.proc.terminate()
                     except Exception:
                         pass
             self.proc = None
         elif self.native_pid:
-            deadline = time.time() + 15
+            deadline = time.time() + (3 if force else 15)
             while time.time() < deadline and self.alive():
                 time.sleep(0.1)
-            if force and self.alive():
+            if self.alive():
                 try:
                     import psutil
                     psutil.Process(int(self.native_pid)).terminate()

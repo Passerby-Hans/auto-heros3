@@ -547,6 +547,8 @@ def _record_events(st: dict) -> list:
         game_status = st.get('status')
         if game_status in ('WINNER', 'LOSER') and state.get('game_status') != game_status:
             add('game_over', {'status': game_status})
+            _overlay('terminal', '终局：' + ('胜利' if game_status == 'WINNER' else '失败')
+                     + f'（引擎判定 {game_status}）')
         state['game_status'] = game_status
         levels = state.get('levels') if isinstance(state.get('levels'), dict) else {}
         for hero in st.get('heroes') or []:
@@ -711,7 +713,8 @@ _RUN_EVIDENCE_FILES = ('actions.jsonl', 'results.log', 'events.jsonl', 'events_c
                        'last_battle_round.json', 'recording.json', 'recording.lock',
                        'action_index.json', 'run.json', 'epochs.jsonl', 'segments.jsonl',
                        'restore.json', 'restores.jsonl', 'lease.json', 'ui_tree.json',
-                       'prep_summary.json', 'cheat.txt', _RECORDING_SEGMENTS_FILE)
+                       'terminal.json', 'prep_summary.json', 'cheat.txt',
+                       _RECORDING_SEGMENTS_FILE)
 
 
 def _archive_run(old_run: dict) -> dict | None:
@@ -918,7 +921,8 @@ def _rotate_run(archive: bool = True) -> dict:
         # Do not delete the old overlay feed: recording_start rotates it per clip and the
         # archiver copied it already.  Reset only what the new run must not inherit.
         for name in ('actions.jsonl', 'events.jsonl', 'events_cursor.json', 'events_state.json',
-                     'unresolved.json', 'saves.json', 'last_battle_round.json'):
+                     'unresolved.json', 'saves.json', 'last_battle_round.json',
+                     'terminal.json'):
             try:
                 (_dir() / name).unlink()
             except OSError:
@@ -1141,8 +1145,8 @@ _ARCHIVE_FILES = ('actions.jsonl', 'results.log', 'events.jsonl', 'events_cursor
                   'recording.json', 'recording.lock', 'unresolved.json', 'action_index.json',
                   'last_battle_round.json', 'battle_actions.json', 'town_info.json',
                   'army_info.json', 'ui_tree.json', 'segments.jsonl', 'lease.json',
-                  'prep_summary.json', 'restore.json', 'restores.jsonl', 'cheat.txt',
-                  _RECORDING_SEGMENTS_FILE)
+                  'terminal.json', 'prep_summary.json', 'restore.json', 'restores.jsonl',
+                  'cheat.txt', _RECORDING_SEGMENTS_FILE)
 
 
 def _file_sha256(path: Path) -> str | None:
@@ -1991,20 +1995,107 @@ def _state_or_error() -> tuple[dict | None, str | None]:
         return None, f'{type(exc).__name__}: {exc}'
 
 
+def _terminal_path() -> Path:
+    return _dir() / 'terminal.json'
+
+
+def _read_terminal() -> dict | None:
+    try:
+        data = json.loads(_terminal_path().read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 @mcp.tool()
 def game_status() -> dict:
     a = _agent()
     st, error = _state_or_error()
+    terminal = _read_terminal()
     if error:
-        return {'ok': False, 'error': error}
+        # A resigned/finished run has no live session; still return the recorded terminal state
+        # so the caller can report the ending instead of misreading it as "no session".
+        return {'ok': False, 'error': error, 'terminal': terminal,
+                'session': a.session.session_id if a.session else None}
     contract = a.contract or a.contract_status()
     return {'ok': True, 'day': (st.get('date') or {}).get('day'), 'status': st.get('status'),
             'session': a.session.session_id if a.session else None,
             'offscreen': a.window_is_offscreen(), 'rect': a._window_rect(),
+            'terminal': terminal,
             'contract': {'match': contract.get('match'),
                          'client_sha256': contract.get('actual_sha256'),
                          'pinned_at': contract.get('built_from_commit'),
                          'protocol': st.get('protocol')}}
+
+
+@mcp.tool()
+@_serialized_mutation('game_resign')
+def game_resign(reason: str) -> dict:
+    """Terminate the game as a deliberate **surrender** and report the terminal state.
+
+    Use this only when the objective is genuinely unwinnable (for example: no hero, no town,
+    no recruitable army and no path to the enemy; an engine/quest dead end; or a board state
+    where the remaining enemy cannot be attacked at all).  Do **not** use it to avoid a normal
+    difficult battle or to save-scum a loss.  The action is recorded as ``status=resigned`` in
+    ``terminal.json`` and as a ``terminal`` line in overlay.jsonl, then the active recording is
+    finalized and the owned VCMI session is stopped.
+
+    Returns the terminal record, the recording summary (when one was active) and the session
+    stop result, so the caller can report a clean ending.
+    """
+    cleaned = (reason or '').strip()
+    if len(cleaned) < 8:
+        return {'ok': False, 'error': 'reason_too_short',
+                'hint': 'describe the concrete objective blocker (at least 8 characters)'}
+    try:
+        _require_lease()
+    except Exception as exc:  # noqa: BLE001
+        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    st, state_error = _state_or_error()
+    day = (st.get('date') or {}).get('day') if st else None
+    identity = _evidence_identity()
+    day = day if day is not None else identity.get('day')
+    terminal = {
+        'schema_version': 1,
+        'status': 'resigned',
+        'kind': 'surrender',
+        'reason': cleaned,
+        'day': day,
+        'run_id': identity.get('run_id'),
+        'branch_id': identity.get('branch_id'),
+        'epoch': identity.get('epoch'),
+        'session_id': identity.get('session_id'),
+        'at': time.time(),
+        'at_local': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'state_error': state_error,
+    }
+    _atomic_write_json(_terminal_path(), terminal)
+    _overlay('terminal', f'终局：投降 — {cleaned}')
+    _overlay('event', '游戏终止：投降（客观不可继续）')
+    # Give the 1 Hz panel source a chance to show the terminal line in the last frames.
+    time.sleep(1.2)
+    recording = None
+    try:
+        if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
+            recording = recording_stop()
+        else:
+            record = _read_recording_state()
+            if record:
+                recording = recording_stop()
+    except Exception as exc:  # noqa: BLE001
+        recording = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    session = None
+    try:
+        session = _agent().stop()
+    except Exception as exc:  # noqa: BLE001
+        session = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+    terminal['recording_dir'] = (recording or {}).get('dir')
+    terminal['recording_ok'] = bool((recording or {}).get('ok'))
+    terminal['session_stopped'] = bool(isinstance(session, dict) and session.get('ok', True))
+    _atomic_write_json(_terminal_path(), terminal)
+    return {'ok': True, 'status': 'resigned', 'terminal': terminal,
+            'recording': recording, 'session': session,
+            'report': f'终局：投降（day {day}）— {cleaned}'}
 
 
 @mcp.tool()
@@ -3915,9 +4006,10 @@ def game_act(action: str, args: dict | None = None, request_id: str | None = Non
       error='query_pending' - a UI query is open; only `answer`/`close_window` are accepted.
                              Answer it, re-observe (query must be null), then send the action.
 
-    thought: one short line of reasoning to put on the recording's "思考" panel *before* the
-    action runs. Pass it on every non-trivial action - the panel only ever shows lines that were
-    written to <state-dir>/overlay.jsonl, so reasoning that is not passed here is not recorded.
+    thought: 2-5 sentences of detailed Chinese reasoning for the recording's large "思考" panel
+    *before* the action runs: current situation, objective, risk, why this action, expected next
+    step. Pass it on every non-trivial action - the panel only ever shows lines written to
+    <state-dir>/overlay.jsonl, so reasoning not passed here is not recorded.
 
     recruit-specific: args are town/level/amount plus an optional `creature` (CreatureID; the
     default is that level's base creature). The bridge reports the creature, the requested and
@@ -6124,6 +6216,16 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     stamp = time.strftime('%Y%m%d-%H%M%S')
     out = _recordings_root() / f'obs-{stamp}'
     out.mkdir(parents=True, exist_ok=True)
+    # 每次 libobs 录制都使用新的侧栏输入，避免把上一局/上一段的 LLM 行带进画面。
+    overlay_path = _dir() / 'overlay.jsonl'
+    if overlay_path.exists() and overlay_path.stat().st_size > 0:
+        try:
+            overlay_path.replace(_dir() / 'overlay.jsonl.prev')
+        except OSError:
+            pass
+    if not overlay_path.exists():
+        overlay_path.write_text('', encoding='utf-8')
+    _overlay('event', '录制开始：libobs 4:3 游戏 + 中文状态栏')
     recording_run_id = f'obs-{stamp}-{os.getpid()}'
     manifest_dir = out / 's4b'
     try:
@@ -6140,7 +6242,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
             out, client_pid=int(client_pid), audio_raw=audio_raw,
             max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
             max_size_mb=_size_cap_mb(max_segment_gb),
-            overlay_path=_dir() / 'overlay.jsonl')
+            overlay_path=overlay_path)
         run_manifest.transition_run('recording')
     except Exception as exc:  # noqa: BLE001
         try:
@@ -6162,7 +6264,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
               'max_time_sec': int(rollover_seconds) if rollover_seconds else 900,
               'max_size_mb': _size_cap_mb(max_segment_gb),
               'max_segment_gb': float(max_segment_gb),
-              'overlay_path': str(_dir() / 'overlay.jsonl')}
+              'overlay_path': str(overlay_path)}
     rec = _RUNTIME.recorder
     rec.clear()
     rec.update({'proc': client.proc, 'dir': out, 'started': time.time(),

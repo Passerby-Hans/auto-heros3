@@ -94,16 +94,11 @@ RawAudioStats CopyStats(RawAudioData* d)
     return d->stats;
 }
 
-void PushAudio(RawAudioData* d, bool real_data, uint64_t timestamp_ns)
+void PushAudio(RawAudioData* d, uint32_t frames, uint64_t timestamp_ns)
 {
-    const uint32_t frames = d->cfg.chunk_frames;
-    if (real_data) {
-        // left/right already hold the converted real samples
-    } else {
-        std::fill(d->left.begin(), d->left.end(), 0.0f);
-        std::fill(d->right.begin(), d->right.end(), 0.0f);
+    if (!frames || frames > d->cfg.chunk_frames) {
+        return;
     }
-
     obs_source_audio audio = {};
     audio.data[0] = reinterpret_cast<const uint8_t*>(d->left.data());
     audio.data[1] = reinterpret_cast<const uint8_t*>(d->right.data());
@@ -115,11 +110,10 @@ void PushAudio(RawAudioData* d, bool real_data, uint64_t timestamp_ns)
     obs_source_output_audio(d->source, &audio);
 }
 
-// Converts one chunk of interleaved s16le stereo bytes into the float planar
-// buffers (full-scale +-1.0; 1/32768 scaling).
-void ConvertChunk(RawAudioData* d, const uint8_t* bytes)
+// Converts interleaved s16le stereo bytes into the float planar buffers
+// (full-scale +-1.0; 1/32768 scaling).
+void ConvertChunk(RawAudioData* d, const uint8_t* bytes, uint32_t frames)
 {
-    const uint32_t frames = d->cfg.chunk_frames;
     const uint8_t* p = bytes;
     for (uint32_t i = 0; i < frames; ++i) {
         int16_t l = 0;
@@ -200,10 +194,12 @@ void ReaderThread(RawAudioData* d)
         static_cast<uint64_t>(d->cfg.chunk_frames) * 1000000000ULL / d->cfg.sample_rate;
 
     std::vector<uint8_t> pending;
-    pending.reserve(chunk_bytes * 4);
+    const size_t read_ahead_bytes = static_cast<size_t>(chunk_bytes) * 10; // ~1 s
+    pending.reserve(read_ahead_bytes * 2);
     std::vector<uint8_t> readbuf(64 * 1024);
 
-    uint64_t next_ts = os_gettime_ns();
+    uint64_t next_ts = os_gettime_ns();   // wall-clock scheduler tick
+    uint64_t audio_ts = next_ts;          // sample-index-derived audio timestamp
     while (!d->stopping.load(std::memory_order_acquire)) {
         const uint64_t now = os_gettime_ns();
         if (now < next_ts) {
@@ -211,43 +207,58 @@ void ReaderThread(RawAudioData* d)
             os_sleepto_ns(target);
             continue;
         }
-        if (now > next_ts + 500000000ULL) {
-            // Large hiccup: resync the timestamp grid to "now" instead of
-            // pushing a burst of stale samples.  For live capture this drops
-            // audio that is already in the past; for a static test file the
-            // remaining bytes are still read on the new grid.
-            next_ts = now;
-        }
 
-        // Read more bytes if needed; never block, the file may still grow.
-        if (pending.size() < chunk_bytes) {
+        // Top up the read-ahead buffer, but never block: the relay may still
+        // be appending.  A partial tick is now legal; only a tick with zero
+        // real frames is an underflow.
+        bool read_failed = false;
+        while (pending.size() < read_ahead_bytes) {
             DWORD got = 0;
             const BOOL ok = ReadFile(file, readbuf.data(), static_cast<DWORD>(readbuf.size()), &got, nullptr);
             if (!ok) {
                 stats.open_error = "read failed: " + Win32ErrorText(GetLastError());
                 stats.opened = false;
                 SetStats(d, stats);
+                read_failed = true;
                 break;
             }
             if (got == 0) {
                 ++stats.eof_waits;
-            } else {
-                pending.insert(pending.end(), readbuf.data(), readbuf.data() + got);
+                break;
             }
+            pending.insert(pending.end(), readbuf.data(), readbuf.data() + got);
+        }
+        if (read_failed) {
+            break;
         }
 
-        uint64_t ts = next_ts;
-        if (pending.size() >= chunk_bytes) {
-            ConvertChunk(d, pending.data());
-            pending.erase(pending.begin(), pending.begin() + chunk_bytes);
-            PushAudio(d, true, ts);
+        const size_t available_frames = pending.size() / frame_bytes;
+        const uint32_t frames = static_cast<uint32_t>(
+            std::min<size_t>(available_frames, d->cfg.chunk_frames));
+        if (frames > 0) {
+            const size_t bytes = static_cast<size_t>(frames) * frame_bytes;
+            ConvertChunk(d, pending.data(), frames);
+            pending.erase(pending.begin(), pending.begin() + bytes);
+            PushAudio(d, frames, audio_ts);
             ++stats.chunks_pushed;
-            stats.samples_pushed += d->cfg.chunk_frames;
-            stats.frames_read += d->cfg.chunk_frames;
-            stats.bytes_read += chunk_bytes;
+            if (frames < d->cfg.chunk_frames) {
+                ++stats.partial_chunks;
+            }
+            stats.samples_pushed += frames;
+            stats.frames_read += frames;
+            stats.bytes_read += bytes;
+            audio_ts += static_cast<uint64_t>(frames) * 1000000000ULL / d->cfg.sample_rate;
+        } else if (stats.samples_pushed == 0) {
+            // Pre-roll: recording may start a tick before VCMI/SDL has produced
+            // its first PCM.  Do not turn that into a 100 ms silent block; it is
+            // a startup condition, not a mid-recording discontinuity.
+            ++stats.startup_underflow_events;
         } else {
-            PushAudio(d, false, ts);
-            ++stats.silence_chunks;
+            // Do not manufacture a 100 ms all-zero block.  A mid-recording
+            // starvation is recorded; the stop gate rejects it.  The next real
+            // chunk is emitted with the sample-clock timestamp, not a fake
+            // wall-clock 100 ms zero block.
+            ++stats.underflow_events;
         }
         SetStats(d, stats);
         next_ts += chunk_period_ns;

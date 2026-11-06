@@ -1703,6 +1703,8 @@ void CollectFinalEvidence(State& s)
                         " bytes_read=" + std::to_string(s.audio_stats.bytes_read) +
                         " frames_read=" + std::to_string(s.audio_stats.frames_read) +
                         " chunks=" + std::to_string(s.audio_stats.chunks_pushed) +
+                        " partial_chunks=" + std::to_string(s.audio_stats.partial_chunks) +
+                        " underflow_events=" + std::to_string(s.audio_stats.underflow_events) +
                         " silence_chunks=" + std::to_string(s.audio_stats.silence_chunks) +
                         " eof_waits=" + std::to_string(s.audio_stats.eof_waits));
             AddStep(s, "raw_audio_data_pushed_when_start_zero",
@@ -1715,12 +1717,17 @@ void CollectFinalEvidence(State& s)
             // a hole even if the MP4/AAC container is valid.  Such a run is partial,
             // never "validated/complete".
             AddStep(s, "raw_audio_no_underrun",
-                    s.opt.audio_start_zero || s.audio_stats.silence_chunks == 0,
+                    s.opt.audio_start_zero || (s.audio_stats.silence_chunks == 0 &&
+                                               s.audio_stats.underflow_events == 0),
                     "start_at_zero=" + std::string(s.opt.audio_start_zero ? "true" : "false") +
                         " silence_chunks=" + std::to_string(s.audio_stats.silence_chunks) +
+                        " underflow_events=" + std::to_string(s.audio_stats.underflow_events) +
+                        " startup_underflow_events=" +
+                        std::to_string(s.audio_stats.startup_underflow_events) +
+                        " partial_chunks=" + std::to_string(s.audio_stats.partial_chunks) +
                         " chunks=" + std::to_string(s.audio_stats.chunks_pushed) +
                         " eof_waits=" + std::to_string(s.audio_stats.eof_waits) +
-                        " (live EOF capture must push only real samples)");
+                        " (live EOF capture must push real samples every tick)");
             AddStep(s, "raw_audio_monitoring_none_final",
                     s.audio_source_monitoring_type == OBS_MONITORING_TYPE_NONE,
                     "volume=" + std::to_string(s.audio_source_volume) + " mixers=" +
@@ -2026,6 +2033,12 @@ void WriteReport(State& s, int exit_code)
     w.value_uint(s.audio_stats.chunks_pushed);
     w.key("silence_chunks");
     w.value_uint(s.audio_stats.silence_chunks);
+    w.key("partial_chunks");
+    w.value_uint(s.audio_stats.partial_chunks);
+    w.key("underflow_events");
+    w.value_uint(s.audio_stats.underflow_events);
+    w.key("startup_underflow_events");
+    w.value_uint(s.audio_stats.startup_underflow_events);
     w.key("eof_waits");
     w.value_uint(s.audio_stats.eof_waits);
     w.key("samples_pushed");
@@ -2398,6 +2411,12 @@ void WriteRawAudioStatsJson(JsonWriter& w, const a3::RawAudioStats& st, bool ena
     w.value_uint(st.chunks_pushed);
     w.key("silence_chunks");
     w.value_uint(st.silence_chunks);
+    w.key("partial_chunks");
+    w.value_uint(st.partial_chunks);
+    w.key("underflow_events");
+    w.value_uint(st.underflow_events);
+    w.key("startup_underflow_events");
+    w.value_uint(st.startup_underflow_events);
     w.key("eof_waits");
     w.value_uint(st.eof_waits);
     w.key("samples_pushed");

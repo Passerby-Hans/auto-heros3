@@ -65,6 +65,107 @@ bool ReadWholeFile(const std::string& path, std::vector<uint8_t>& out, std::stri
     return true;
 }
 
+void LiveReaderThread(FramedAudioData* d)
+{
+    FramedAudioStats stats;
+    stats.created = true;
+    stats.path = d->cfg.path;
+    std::ifstream f;
+    uint64_t offset = 0;
+    while (!d->stopping.load(std::memory_order_acquire)) {
+        if (!f.is_open()) {
+            f.open(d->cfg.path, std::ios::binary);
+            if (!f.is_open()) {
+                stats.error = "cannot open";
+                os_sleep_ms(50);
+                continue;
+            }
+            stats.opened = true;
+            stats.error.clear();
+            if (!d->cfg.start_at_zero) {
+                f.seekg(0, std::ios::end);
+                offset = static_cast<uint64_t>(f.tellg());
+            }
+        }
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        A3AudioPacketHeader h = {};
+        f.read(reinterpret_cast<char*>(&h), sizeof(h));
+        if (f.gcount() != static_cast<std::streamsize>(sizeof(h))) {
+            os_sleep_ms(10);
+            continue;
+        }
+        if (std::memcmp(h.magic, "A3AP", 4) != 0 || h.version != 1 ||
+            h.header_bytes != A3_AUDIO_HEADER_BYTES ||
+            h.sample_rate != 44100 || h.channels != 2 ||
+            h.sample_format != A3_AUDIO_FORMAT_S16LE ||
+            h.payload_bytes != static_cast<uint32_t>(h.sample_count) * 4 ||
+            h.qpc_frequency == 0) {
+            stats.error = "invalid framed header";
+            break;
+        }
+        std::vector<uint8_t> payload(h.payload_bytes);
+        if (h.payload_bytes) {
+            f.read(reinterpret_cast<char*>(payload.data()), h.payload_bytes);
+            if (f.gcount() != static_cast<std::streamsize>(h.payload_bytes)) {
+                os_sleep_ms(10);
+                continue;
+            }
+        }
+        A3AudioPacketHeader zeroed = h;
+        zeroed.header_crc32 = 0;
+        if (a3_audio_crc32(&zeroed, sizeof(zeroed)) != h.header_crc32 ||
+            a3_audio_crc32(payload.data(), payload.size()) != h.payload_crc32) {
+            ++stats.crc_errors;
+            stats.error = "CRC mismatch";
+            break;
+        }
+        const uint32_t frames = static_cast<uint32_t>(h.sample_count);
+        if (frames) {
+            std::vector<float> left(frames);
+            std::vector<float> right(frames);
+            const uint8_t* p = payload.data();
+            for (uint32_t i = 0; i < frames; ++i) {
+                int16_t l = 0;
+                int16_t r = 0;
+                std::memcpy(&l, p, 2);
+                std::memcpy(&r, p + 2, 2);
+                p += 4;
+                left[i] = static_cast<float>(l) / 32768.0f;
+                right[i] = static_cast<float>(r) / 32768.0f;
+            }
+            obs_source_audio audio = {};
+            audio.data[0] = reinterpret_cast<const uint8_t*>(left.data());
+            audio.data[1] = reinterpret_cast<const uint8_t*>(right.data());
+            audio.frames = frames;
+            audio.speakers = SPEAKERS_STEREO;
+            audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+            audio.samples_per_sec = 44100;
+            audio.timestamp = os_gettime_ns();
+            obs_source_output_audio(d->source, &audio);
+            ++stats.pushed_packets;
+            stats.pushed_frames += frames;
+            stats.last_timestamp_ns = audio.timestamp;
+        }
+        ++stats.packets;
+        stats.frames += frames;
+        stats.saw_last = (h.flags & A3_AUDIO_FLAG_LAST) != 0;
+        if (stats.saw_last) {
+            offset += sizeof(h) + h.payload_bytes;
+            break;
+        }
+        offset += sizeof(h) + h.payload_bytes;
+        {
+            std::lock_guard<std::mutex> lock(d->stats_mutex);
+            d->stats = stats;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(d->stats_mutex);
+        d->stats = stats;
+    }
+}
+
 void ReaderThread(FramedAudioData* d)
 {
     FramedAudioStats stats;
@@ -207,6 +308,8 @@ const char* FramedGetName(void*)
 void FramedGetDefaults(obs_data_t* defaults)
 {
     obs_data_set_default_string(defaults, "path", "");
+    obs_data_set_default_bool(defaults, "live", false);
+    obs_data_set_default_bool(defaults, "start_at_zero", true);
 }
 
 void* FramedCreate(obs_data_t* settings, obs_source_t* source)
@@ -215,10 +318,12 @@ void* FramedCreate(obs_data_t* settings, obs_source_t* source)
     d->source = source;
     const char* path = obs_data_get_string(settings, "path");
     d->cfg.path = path ? path : "";
+    d->cfg.live = obs_data_get_bool(settings, "live");
+    d->cfg.start_at_zero = obs_data_get_bool(settings, "start_at_zero");
     d->stats.created = true;
     d->stats.path = d->cfg.path;
     g_last_source.store(d, std::memory_order_release);
-    d->thread = std::thread(ReaderThread, d);
+    d->thread = std::thread(d->cfg.live ? LiveReaderThread : ReaderThread, d);
     return d;
 }
 

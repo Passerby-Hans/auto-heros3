@@ -11,6 +11,8 @@ struct FramedAudioConfig {
     std::string path;
     uint32_t sample_rate = 44100;
     uint32_t channels = 2;
+    bool live = false;
+    bool start_at_zero = true;
 };
 
 struct FramedAudioStats {

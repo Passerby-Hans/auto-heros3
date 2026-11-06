@@ -258,6 +258,7 @@ struct Options {
     // S2a: raw VCMI game-audio.raw file as a native libobs audio source
     std::string audio_raw;            // empty => no raw audio source
     std::string audio_framed;         // A4 a3-audio/1 source (instead of raw)
+    bool audio_framed_live = false;    // A4: follow a growing framed file
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
     bool fixed_audio = false;          // A4: obs_reset_audio2 fixed buffering
     bool mute_synthetic_audio = false; // A4 pulse test: keep synthetic video, mute its tone
@@ -1318,6 +1319,8 @@ bool CreateFramedAudioSource(State& s)
     AddStep(s, "register_framed_audio_source", true, "obs_register_source_s(a3_framed_audio)");
     obs_data_t* settings = obs_data_create();
     obs_data_set_string(settings, "path", s.opt.audio_framed.c_str());
+    obs_data_set_bool(settings, "live", s.opt.audio_framed_live);
+    obs_data_set_bool(settings, "start_at_zero", true);
     s.audio_source = obs_source_create("a3_framed_audio", "A4 Framed VCMI Audio", settings, nullptr);
     obs_data_release(settings);
     AddStep(s, "create_framed_audio_source", s.audio_source != nullptr,
@@ -3448,6 +3451,7 @@ void PrintUsage()
                 "  --window-pid N       window mode: restrict to a process id (optional)\n"
                 "  --audio-raw PATH      also add native raw-file audio source (s16le/44100/2)\n"
 "  --audio-framed PATH   A4: add native a3-audio/1 framed timestamped source\n"
+"  --audio-framed-live   A4: follow growing framed file instead of one-shot\n"
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
 "  --fixed-audio         A4: obs_reset_audio2 fixed buffering (max 1000ms)\n"
 "  --mute-synthetic-audio  A4: keep synthetic video, mute synthetic tone\n"
@@ -3502,6 +3506,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.audio_raw = next("--audio-raw");
         } else if (a == "--audio-framed") {
             opt.audio_framed = next("--audio-framed");
+        } else if (a == "--audio-framed-live") {
+            opt.audio_framed_live = true;
         } else if (a == "--audio-start-zero") {
             opt.audio_start_zero = true;
         } else if (a == "--fixed-audio") {

@@ -22,6 +22,7 @@ struct AvSourceConfig {
     uint32_t audio_chunk_frames = 4410; // 100 ms per pushed PCM block
     double tone_frequency_hz = 440.0;
     double tone_amplitude = 0.2;   // 0.2 full scale (never near clipping)
+    bool pulse_video = false;      // 0.25 s white / 0.75 s black, aligned with pulse audio
 };
 
 // Registers the source type with id "a3_test_av_source".  Must be called after

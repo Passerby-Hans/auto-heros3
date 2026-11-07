@@ -262,6 +262,7 @@ struct Options {
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
     bool fixed_audio = false;          // A4: obs_reset_audio2 fixed buffering
     bool mute_synthetic_audio = false; // A4 pulse test: keep synthetic video, mute its tone
+    bool video_pulse = false;          // A4: white/black video pulse source
 
     // S3a: persistent named-pipe IPC server (libobs stays initialized)
     bool serve = false;
@@ -1185,6 +1186,7 @@ bool CreatePipeline(State& s, const std::string& first_file_path)
     AddStep(s, "register_test_source", true, "obs_register_source_s(a3_test_av_source)");
 
     obs_data_t* source_settings = obs_data_create();
+    obs_data_set_bool(source_settings, "pulse_video", s.opt.video_pulse);
     s.source = obs_source_create("a3_test_av_source", "S1b In-Memory Test AV", source_settings, nullptr);
     obs_data_release(source_settings);
     AddStep(s, "create_test_source", s.source != nullptr, "async video (I420 1920x1080@60) + PCM audio");
@@ -3469,6 +3471,7 @@ void PrintUsage()
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
 "  --fixed-audio         A4: obs_reset_audio2 fixed buffering (max 1000ms)\n"
 "  --mute-synthetic-audio  A4: keep synthetic video, mute synthetic tone\n"
+"  --video-pulse         A4: white/black video pulse aligned with audio pulse\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n  --max-size-mb N      size split threshold in MiB (0 disables; IPC allows 1..4096)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
@@ -3528,6 +3531,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.fixed_audio = true;
         } else if (a == "--mute-synthetic-audio") {
             opt.mute_synthetic_audio = true;
+        } else if (a == "--video-pulse") {
+            opt.video_pulse = true;
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
             opt.duration_explicit = true;

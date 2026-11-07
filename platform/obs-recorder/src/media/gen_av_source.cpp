@@ -103,14 +103,19 @@ void PushVideoFrame(AvSourceData* d, uint64_t timestamp_ns)
 
     std::memcpy(d->y_plane.data(), d->y_template.data(), d->y_template.size());
 
-    // Moving bright vertical bar; wraps around the frame edge.
-    const uint32_t bar_x = static_cast<uint32_t>((frame_idx * 16) % w);
-    for (uint32_t y = 0; y < h; ++y) {
-        uint8_t* row = d->y_plane.data() + static_cast<size_t>(y) * w;
-        const uint32_t first = std::min(bar_w, w - bar_x);
-        std::memset(row + bar_x, 235, first);
-        if (first < bar_w) {
-            std::memset(row, 235, bar_w - first);
+    if (d->cfg.pulse_video) {
+        const uint8_t value = (frame_idx % 60) < 15 ? 235 : 16;
+        std::memset(d->y_plane.data(), value, d->y_plane.size());
+    } else {
+        // Moving bright vertical bar; wraps around the frame edge.
+        const uint32_t bar_x = static_cast<uint32_t>((frame_idx * 16) % w);
+        for (uint32_t y = 0; y < h; ++y) {
+            uint8_t* row = d->y_plane.data() + static_cast<size_t>(y) * w;
+            const uint32_t first = std::min(bar_w, w - bar_x);
+            std::memset(row + bar_x, 235, first);
+            if (first < bar_w) {
+                std::memset(row, 235, bar_w - first);
+            }
         }
     }
 
@@ -213,11 +218,12 @@ const char* AvGetName(void*)
     return kSourceName;
 }
 
-void* AvCreate(obs_data_t* /*settings*/, obs_source_t* source)
+void* AvCreate(obs_data_t* settings, obs_source_t* source)
 {
     auto data = std::make_unique<AvSourceData>();
     data->source = source;
     data->cfg = AvSourceConfig{};
+    data->cfg.pulse_video = settings && obs_data_get_bool(settings, "pulse_video");
 
     FillYTemplate(data.get());
     data->y_plane.resize(data->y_template.size());

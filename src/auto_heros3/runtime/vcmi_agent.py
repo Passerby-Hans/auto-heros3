@@ -208,8 +208,11 @@ class VcmiAgent:
         # A2 spike hook.  Default remains the existing SDL disk sink.  The
         # private backend is selected explicitly for staged-DLL experiments.
         self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'disk').strip()
-        self.a3capture_file = Path(os.environ.get(
-            'AUTO_HEROS3_A3CAPTURE_FILE', str(self.dir / 'a3capture.raw'))).resolve()
+        a3path = os.environ.get('AUTO_HEROS3_A3CAPTURE_FILE',
+                                str(self.dir / 'a3capture.raw'))
+        self.a3capture_file = Path(a3path)
+        if not str(a3path).startswith('\\\\.\\pipe\\'):
+            self.a3capture_file = self.a3capture_file.resolve()
         self.a3capture_ready_path = Path(str(self.a3capture_file) + '.ready')
         self.session: Session | None = None
         self._pending_seq = 0
@@ -578,15 +581,21 @@ class VcmiAgent:
         audio_ready = True
         audio_ready_detail = 'disk relay path (legacy)'
         if self.audio_driver == 'a3capture':
-            deadline = time.time() + 15.0
-            while time.time() < deadline and not self.a3capture_ready_path.exists():
-                time.sleep(0.05)
-            audio_ready = self.a3capture_ready_path.exists()
-            audio_ready_detail = (f'a3capture ready={audio_ready} '
-                                  f'path={self.a3capture_ready_path}')
-            if not audio_ready:
-                self._abort_start(client_pid=client_pid, create_time=create_time)
-                raise BridgeError('a3capture audio_ready=false')
+            if str(self.a3capture_file).startswith('\\\\.\\pipe\\'):
+                # Live framed transport: the relay owns the pipe; a filesystem
+                # ready sidecar is not meaningful for this path.
+                audio_ready = True
+                audio_ready_detail = f'a3capture pipe={self.a3capture_file}'
+            else:
+                deadline = time.time() + 15.0
+                while time.time() < deadline and not self.a3capture_ready_path.exists():
+                    time.sleep(0.05)
+                audio_ready = self.a3capture_ready_path.exists()
+                audio_ready_detail = (f'a3capture ready={audio_ready} '
+                                      f'path={self.a3capture_ready_path}')
+                if not audio_ready:
+                    self._abort_start(client_pid=client_pid, create_time=create_time)
+                    raise BridgeError('a3capture audio_ready=false')
         sess = Session(dir=str(self.dir), map_name=self.map_name, client_pid=client_pid,
                        client_create_time=create_time, launcher_pid=self.proc.pid,
                        created_at=time.time())

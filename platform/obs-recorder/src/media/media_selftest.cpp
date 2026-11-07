@@ -2845,10 +2845,17 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     }
     std::string audio_raw;
     found = false;
-    if (!GetStringArg(req, "audio_raw", &audio_raw, &found, err) || !found || audio_raw.empty()) {
+    if (!GetStringArg(req, "audio_raw", &audio_raw, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    std::string audio_framed;
+    if (!GetStringArg(req, "audio_framed", &audio_framed, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (audio_raw.empty() && audio_framed.empty())
         return ReplyError(sess, req, "invalid_args",
-                          found ? "\"audio_raw\" is required" : (err.empty() ? "\"audio_raw\" is required" : err));
-    }
+                          "\"audio_raw\" or \"audio_framed\" is required");
+    if (!audio_raw.empty() && !audio_framed.empty())
+        return ReplyError(sess, req, "invalid_args",
+                          "audio_raw and audio_framed are mutually exclusive");
     std::string title, cls, exe;
     bool f = false;
     if (!GetStringArg(req, "window_title", &title, &f, err))
@@ -2889,14 +2896,16 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
                           "a window target is required (window_pid or window_title/class/exe)");
     if (!EnsureDir(out_dir))
         return ReplyError(sess, req, "invalid_out_dir", "cannot create out_dir: " + out_dir);
-    if (!FileExists(audio_raw))
-        return ReplyError(sess, req, "audio_raw_not_found",
-                          "audio_raw file does not exist: " + audio_raw);
+    const std::string &audio_path = audio_framed.empty() ? audio_raw : audio_framed;
+    if (!FileExists(audio_path))
+        return ReplyError(sess, req, audio_framed.empty() ? "audio_raw_not_found"
+                                                          : "audio_framed_not_found",
+                          "audio file does not exist: " + audio_path);
     std::error_code ec;
-    const uintmax_t audio_size = fs::file_size(Utf8ToWide(audio_raw), ec);
+    const uintmax_t audio_size = fs::file_size(Utf8ToWide(audio_path), ec);
     if (ec)
-        return ReplyError(sess, req, "audio_raw_unreadable",
-                          "cannot stat audio_raw: " + audio_raw + " (" + ec.message() + ")");
+        return ReplyError(sess, req, "audio_unreadable",
+                          "cannot stat audio: " + audio_path + " (" + ec.message() + ")");
 
     // Fresh per-recording evidence.
     s.steps.clear();
@@ -2918,10 +2927,15 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     s.capture_proc_hooked = false;
     s.capture_signal_hooked = false;
     s.audio_enabled = false;
+    s.framed_audio_enabled = false;
     s.audio_stats = a3::RawAudioStats{};
+    s.framed_audio_stats = a3::FramedAudioStats{};
 
     s.opt.out_dir = out_dir;
     s.opt.audio_raw = audio_raw;
+    s.opt.audio_framed = audio_framed;
+    s.opt.audio_framed_live = !audio_framed.empty();
+    s.opt.fixed_audio = !audio_framed.empty();
     s.opt.audio_start_zero = false; // live semantics: default EOF
     s.opt.window_title = title;
     s.opt.window_class = cls;

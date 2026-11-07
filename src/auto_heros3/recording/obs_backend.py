@@ -237,6 +237,7 @@ class ObsRecorder:
     def prepare(self, out_dir: Path, *, window_pid: int | None = None,
                 window_title: str | None = None, window_class: str | None = None,
                 window_exe: str | None = None, audio_raw: Path | None = None,
+                audio_framed: Path | None = None,
                 max_time_sec: int = 900, max_size_mb: int = 0,
                 overlay_path: Path | None = None,
                 duration_ms: int = 0) -> dict:
@@ -255,6 +256,8 @@ class ObsRecorder:
             args['window_exe'] = window_exe
         if audio_raw:
             args['audio_raw'] = str(audio_raw)
+        if audio_framed:
+            args['audio_framed'] = str(audio_framed)
         return self.request('prepare', timeout=30.0, **args)
 
     def start_recording(self, timeout: float = 30.0) -> dict:

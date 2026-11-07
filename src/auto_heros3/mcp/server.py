@@ -6224,6 +6224,7 @@ def _size_cap_mb(max_segment_gb: float) -> int:
 
 
 def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
+                         audio_framed: Path | None = None,
                          max_time_sec: int, max_size_mb: int = 0,
                          overlay_path: Path | None = None) -> tuple[object, dict]:
     """Create/connect/prepare/start one native recorder process for a run."""
@@ -6232,7 +6233,9 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                          log_path=Path(out) / 'server.log')
     try:
         client.connect()
-        prep = client.prepare(Path(out), window_pid=int(client_pid), audio_raw=Path(audio_raw),
+        prep = client.prepare(Path(out), window_pid=int(client_pid),
+                              audio_raw=Path(audio_raw) if audio_raw else None,
+                              audio_framed=Path(audio_framed) if audio_framed else None,
                               max_time_sec=int(max_time_sec), max_size_mb=int(max_size_mb),
                               overlay_path=overlay_path, duration_ms=0)
         if not prep.get('ok'):
@@ -6414,7 +6417,8 @@ def _active_recording_info() -> dict | None:
 
 
 def _recording_start_libobs(fps: int, height: int, crf: int,
-                            rollover_seconds: float, max_segment_gb: float = 1.5) -> dict:
+                            rollover_seconds: float, max_segment_gb: float = 1.5,
+                            audio_framed: str = "") -> dict:
     """Start the native libobs IPC recorder (experimental S3b path)."""
     exe = _obs_recorder_exe()
     if not exe.exists():
@@ -6424,7 +6428,12 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     if not client_pid:
         return {'ok': False, 'error': 'no_owned_client', 'identity': identity}
     audio_raw = _dir() / 'game-audio.raw'
-    if not audio_raw.exists():
+    framed_path = Path(audio_framed) if audio_framed else None
+    if framed_path is not None and not framed_path.is_absolute():
+        framed_path = _dir() / framed_path
+    if framed_path is not None and not framed_path.exists():
+        return {'ok': False, 'error': 'audio_framed_missing', 'path': str(framed_path)}
+    if framed_path is None and not audio_raw.exists():
         return {'ok': False, 'error': 'game_audio_raw_missing', 'path': str(audio_raw)}
     lock = _acquire_recording_lock(identity)
     if not lock.get('ok'):
@@ -6457,6 +6466,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     try:
         client, prep = _libobs_start_client(
             out, client_pid=int(client_pid), audio_raw=audio_raw,
+            audio_framed=framed_path,
             max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
             max_size_mb=_size_cap_mb(max_segment_gb),
             overlay_path=overlay_path)
@@ -6899,7 +6909,8 @@ def _recording_stop_libobs() -> dict:
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
                     backend: str = 'legacy',
-                    max_segment_gb: float = 1.5) -> dict:
+                    max_segment_gb: float = 1.5,
+                    audio_framed: str = "") -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -6920,7 +6931,7 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                 'hint': 'stop the existing recorder before starting another one'}
     if backend == 'libobs':
         return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds),
-                                           float(max_segment_gb))
+                                           float(max_segment_gb), audio_framed)
     if _RUNTIME.recorder.get('client') is not None:
         return {'ok': False, 'error': 'recording_active', 'backend': 'libobs'}
     import subprocess

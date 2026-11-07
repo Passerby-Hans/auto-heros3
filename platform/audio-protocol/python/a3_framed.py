@@ -259,7 +259,8 @@ def run_pipe(pipe_name: str, ready: Path, framed_path: Path, raw_path: Path,
     ready.write_text("ready", encoding="utf-8")
     try:
         win32pipe.ConnectNamedPipe(server, None)
-        with open(framed_path, "wb") as framed, open(raw_path, "wb") as raw, \
+        with open(framed_path, "wb", buffering=0) as framed, \
+                open(raw_path, "wb", buffering=0) as raw, \
                 open(index_path, "w", encoding="utf-8") as index:
             while True:
                 try:

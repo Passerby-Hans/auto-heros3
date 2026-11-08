@@ -1896,10 +1896,6 @@ static size_t mp4_write_elst(struct mp4_mux *mux, struct mp4_track *track)
 		}
 
 		delay = util_mul_div64(dts_offset, track->timescale, track->timebase_den);
-	} else if (track->type == TRACK_AUDIO && track->first_pts < 0) {
-		delay = util_mul_div64(llabs(track->first_pts), track->timescale, track->timebase_den);
-		/* Subtract priming delay from total duration */
-		duration -= util_mul_div64(delay, 1000, track->timescale);
 	}
 
 	if (audio_delay_ms) {

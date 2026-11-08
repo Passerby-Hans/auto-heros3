@@ -6986,8 +6986,9 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     fps: target frame rate (default 60).  height: canvas height, 768 (1366x768) or
     1080 (1920x1080).  crf: x264 quality; 10 is visually near-lossless, 0 = lossless.
     Frames are streamed straight into the encoder - no intermediate files to clean up.
-    backend='libobs' is the default native path; backend='legacy' remains the
-    manual fallback (set AUTO_HEROS3_AUDIO_DRIVER=disk and restart the session).
+    backend='legacy' is the current default; backend='libobs' is the explicit
+    native path.  Manual fallback: set AUTO_HEROS3_AUDIO_DRIVER=disk and restart
+    the session before using backend='legacy'.
     """
     if backend not in ('legacy', 'libobs'):
         return {'ok': False, 'error': 'invalid_backend', 'backend': backend}

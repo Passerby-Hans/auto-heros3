@@ -85,10 +85,14 @@ def check(path: Path) -> dict:
     audio_tkhd = int(audio["tkhd"] or 0)
     video_tkhd = int(video["tkhd"] or 0)
     audio_elst = [list(x) for x in audio["elst"]]
-    ok = bool(video_tkhd and audio_tkhd and audio_tkhd <= video_tkhd and audio_elst)
+    elst_sum = sum(int(d) for d, _ in audio_elst)
+    sum_ok = bool(audio_elst) and audio_tkhd == elst_sum
+    ok = bool(video_tkhd and audio_tkhd and audio_tkhd <= video_tkhd and
+              audio_elst and sum_ok)
     return {"clip": path.name, "ok": ok,
             "video_tkhd_ms": video_tkhd, "audio_tkhd_ms": audio_tkhd,
-            "audio_elst": audio_elst,
+            "audio_elst": audio_elst, "elst_sum_ms": elst_sum,
+            "elst_sum_matches_tkhd": sum_ok,
             "overhang_ms": max(0, audio_tkhd - video_tkhd)}
 
 
@@ -104,6 +108,8 @@ def main() -> int:
     bad = [r for r in results if not r["ok"]]
     print(json.dumps({"clips": len(results), "failed": len(bad),
                       "overhang_clips": sum(1 for r in results if r.get("overhang_ms")),
+                      "elst_sum_mismatch": sum(1 for r in results
+                                               if not r.get("elst_sum_matches_tkhd", True)),
                       "results": results}, indent=2))
     return 0 if results and not bad else 1
 

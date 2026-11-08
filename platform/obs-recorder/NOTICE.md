@@ -35,8 +35,8 @@ source. They are not part of the source delivery and are excluded by
 
 ## Default policy
 
-The native path is experimental. The repository default is native only for
-this checkpoint's controlled tests; the documented manual fallback is:
+The native path is experimental. The repository default is **legacy/disk**;
+the documented manual fallback from a failed native attempt is:
 
 ```text
 AUTO_HEROS3_AUDIO_DRIVER=disk

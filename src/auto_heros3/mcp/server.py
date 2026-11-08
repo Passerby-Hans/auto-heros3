@@ -6756,9 +6756,17 @@ def _recording_stop_libobs() -> dict:
                 restart_lock.release()
             except RuntimeError:
                 pass
-        return {'ok': False, 'backend': 'libobs', 'partial': True, 'dir': str(out),
-                'error': rec.get('recording_failed') or 'obs_client_missing',
-                'runs': runs, 'restart_count': int(rec.get('restart_count') or 0)}
+        result = {'ok': False, 'backend': 'libobs', 'partial': True,
+                  'dir': str(out) if out else None,
+                  'error': rec.get('recording_failed') or 'obs_client_missing',
+                  'runs': runs,
+                  'restart_count': int(rec.get('restart_count') or 0)}
+        if out:
+            try:
+                _atomic_write_json(Path(out) / 'obs-result.json', result)
+            except OSError:
+                pass
+        return result
     try:
         status = client.status()
         stop = client.stop()

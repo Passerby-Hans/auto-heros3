@@ -6362,6 +6362,20 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
         old_snap['recording_run_id'] = old_run_id
         rec.setdefault('runs', []).append(old_snap)
         cfg = dict(rec.get('config') or {})
+        # Deterministic race-injection hook for tests: pause after closing the
+        # old owner but before creating the replacement.
+        try:
+            delay = float(os.environ.get('AUTO_HEROS3_TEST_RESTART_DELAY_S', '0'))
+        except ValueError:
+            delay = 0.0
+        if delay > 0:
+            deadline = time.time() + delay
+            while time.time() < deadline and not rec.get('stop_requested'):
+                time.sleep(0.05)
+            if rec.get('stop_requested'):
+                rec.update({'client': None, 'proc': None, 'active': False,
+                            'restarting': False})
+                return
         n = int(rec.get('restart_count') or 0) + 1
         new_out = old_out.parent / f'{old_out.name}-r{n}'
         new_out.mkdir(parents=True, exist_ok=True)
@@ -6547,6 +6561,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
                 'restart_count': 0, 'stop_requested': False,
                 'watchdog_stop': threading.Event(), 'restart_lock': threading.Lock(),
               'stop_lock': threading.Lock(), 'last_stop_result': None,
+                'last_stop_token': None, 'run_token': uuid.uuid4().hex,
                 'runs': [_libobs_run_snapshot(out, 'recording') |
                          {'recording_run_id': recording_run_id}]})
     _atomic_write_json(_recording_state_path(),
@@ -7126,18 +7141,23 @@ def recording_stop() -> dict:
     if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
         rec = _RUNTIME.recorder
         lock = rec.get('stop_lock')
+        token = rec.get('run_token')
         if lock is not None:
-            if not lock.acquire(blocking=False):
-                # A concurrent stop owns the teardown.  Wait for its result and
-                # return the same idempotent answer instead of touching a
-                # half-closed IPC client.
-                if lock.acquire(timeout=30.0):
-                    lock.release()
-                return rec.get('last_stop_result') or {
-                    'ok': False, 'backend': 'libobs', 'error': 'stop_in_progress'}
+            # Blocking serialization: the second request wakes only after the
+            # first has stored its terminal result.
+            if not lock.acquire(timeout=30.0):
+                return {'ok': False, 'backend': 'libobs', 'error': 'stop_in_progress'}
             try:
+                # The first owner may already have completed while this request
+                # was waiting.  Never run teardown a second time on a closed client.
+                if rec.get('run_token') != token:
+                    return {'ok': False, 'backend': 'libobs', 'error': 'not_recording'}
+                if (rec.get('last_stop_token') == token and
+                        rec.get('last_stop_result') is not None):
+                    return rec['last_stop_result']
                 result = _recording_stop_libobs()
                 rec['last_stop_result'] = result
+                rec['last_stop_token'] = token
                 return result
             finally:
                 lock.release()

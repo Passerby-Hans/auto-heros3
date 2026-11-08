@@ -6974,7 +6974,7 @@ def _recording_stop_libobs() -> dict:
 @mcp.tool()
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
-                    backend: str = 'libobs',
+                    backend: str = 'legacy',
                     max_segment_gb: float = 1.5,
                     audio_framed: str = "",
                     audio_framed_live: bool = False) -> dict:

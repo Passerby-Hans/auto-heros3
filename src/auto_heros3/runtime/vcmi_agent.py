@@ -207,7 +207,7 @@ class VcmiAgent:
         self.audio_pipe_name: str | None = None
         # A2 spike hook.  Default remains the existing SDL disk sink.  The
         # private backend is selected explicitly for staged-DLL experiments.
-        self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'a3capture').strip()
+        self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'disk').strip()
         a3path = os.environ.get('AUTO_HEROS3_A3CAPTURE_FILE',
                                 str(self.dir / 'a3capture.raw'))
         self.a3capture_file = Path(a3path)

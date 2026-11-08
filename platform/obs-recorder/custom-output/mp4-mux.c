@@ -204,6 +204,50 @@ static size_t mp4_write_mvhd(struct mp4_mux *mux)
 	return write_box_size(s, start);
 }
 
+
+static uint64_t a3_div_round(uint64_t n, uint64_t d)
+{
+	return d ? (n + d / 2) / d : 0;
+}
+
+static uint64_t a3_usec_to_samples(int64_t usec, uint32_t timescale)
+{
+	if (usec <= 0) return 0;
+	return a3_div_round((uint64_t)usec * (uint64_t)timescale, 1000000);
+}
+
+static uint64_t a3_video_duration_ms(struct mp4_mux *mux)
+{
+	for (size_t i = 0; i < mux->tracks.num; i++) {
+		struct mp4_track *t = &mux->tracks.array[i];
+		if (t->type == TRACK_VIDEO)
+			return a3_div_round(t->duration * 1000ULL, t->timebase_den);
+	}
+	return 0;
+}
+
+/* Audio presentation is computed in the sample domain first, then rounded
+ * once to the movie timescale.  This avoids subtracting independently
+ * rounded millisecond trims (the source of 1 ms declared overhang). */
+static uint64_t a3_audio_presentation_ms(struct mp4_mux *mux,
+					 struct mp4_track *track,
+					 uint64_t *media_time)
+{
+	uint64_t media = track->duration;
+	uint64_t head = a3_usec_to_samples(mux->audio_trim_usec, track->timescale);
+	uint64_t tail = a3_usec_to_samples(mux->audio_end_trim_usec, track->timescale);
+	if (track->first_pts < 0)
+		head += (uint64_t)llabs(track->first_pts);
+	if (head > media) head = media;
+	if (tail > media - head) tail = media - head;
+	if (media_time) *media_time = head;
+	uint64_t present = media - head - tail;
+	uint64_t ms = a3_div_round(present * 1000ULL, track->timescale);
+	uint64_t video = a3_video_duration_ms(mux);
+	if (video && ms > video) ms = video;
+	return ms;
+}
+
 /// 8.3.2 Track Header Box
 static size_t mp4_write_tkhd(struct mp4_mux *mux, struct mp4_track *track)
 {
@@ -212,25 +256,12 @@ static size_t mp4_write_tkhd(struct mp4_mux *mux, struct mp4_track *track)
 
 	uint64_t duration = util_mul_div64(track->duration, 1000, track->timebase_den);
 	if (track->type == TRACK_AUDIO) {
-		/* tkhd describes the presentation interval after elst trimming,
-		 * not the raw media interval stored in mdhd. */
-		if (mux->audio_trim_usec > 0) {
-			uint64_t trim_ms = util_mul_div64((uint64_t)mux->audio_trim_usec, 1000, 1000000);
-			if (trim_ms > duration) trim_ms = duration;
-			duration -= trim_ms;
-		}
-		if (mux->audio_delay_usec > 0)
-			duration += util_mul_div64((uint64_t)mux->audio_delay_usec, 1000, 1000000);
-		if (mux->audio_end_trim_usec > 0) {
-			uint64_t tail = util_mul_div64((uint64_t)mux->audio_end_trim_usec, 1000, 1000000);
-			if (tail > duration) tail = duration;
-			duration -= tail;
-		}
-		if (track->first_pts < 0) {
-			uint64_t priming = util_mul_div64((uint64_t)llabs(track->first_pts),
-				1000, track->timebase_den);
-			if (priming > duration) priming = duration;
-			duration -= priming;
+		uint64_t media_time = 0;
+		duration = a3_audio_presentation_ms(mux, track, &media_time);
+		if (mux->audio_delay_usec > 0) {
+			duration += a3_div_round((uint64_t)mux->audio_delay_usec * 1000ULL, 1000000);
+			uint64_t video = a3_video_duration_ms(mux);
+			if (video && duration > video) duration = video;
 		}
 	}
 	bool extended_ts = duration > UINT32_MAX || mux->creation_time > UINT32_MAX;
@@ -1837,26 +1868,15 @@ static size_t mp4_write_elst(struct mp4_mux *mux, struct mp4_track *track)
 	uint64_t delay = 0;
 	uint64_t audio_delay_ms =
 		track->type == TRACK_AUDIO && mux->audio_delay_usec > 0
-			? util_mul_div64((uint64_t)mux->audio_delay_usec, 1000, 1000000)
+			? a3_div_round((uint64_t)mux->audio_delay_usec * 1000ULL, 1000000)
 			: 0;
+	if (track->type == TRACK_AUDIO) {
+		uint64_t media_time = 0;
+		duration = a3_audio_presentation_ms(mux, track, &media_time);
+		delay = media_time;
+	}
 	if (audio_delay_ms > duration) audio_delay_ms = duration;
 	s_wb32(s, audio_delay_ms ? 2 : 1); // entry count
-
-	if (track->type == TRACK_AUDIO && mux->audio_trim_usec > 0) {
-		/* a3: skip the portion of the first audio packet that belongs to
-		 * the previous segment.  This is an edit-list trim, not a packet
-		 * timestamp rewrite. */
-		uint64_t trim = util_mul_div64((uint64_t)mux->audio_trim_usec, track->timescale, 1000000);
-		uint64_t trim_ms = util_mul_div64((uint64_t)mux->audio_trim_usec, 1000, 1000000);
-		if (trim_ms > duration) trim_ms = duration;
-		delay = trim;
-		duration -= trim_ms;
-	}
-	if (track->type == TRACK_AUDIO && mux->audio_end_trim_usec > 0) {
-		uint64_t tail_ms = util_mul_div64((uint64_t)mux->audio_end_trim_usec, 1000, 1000000);
-		if (tail_ms > duration) tail_ms = duration;
-		duration -= tail_ms;
-	}
 
 	if (track->type == TRACK_VIDEO && !(mux->flags & MP4_USE_NEGATIVE_CTS)) {
 		/* Compensate for frame-reordering delay (for example, when

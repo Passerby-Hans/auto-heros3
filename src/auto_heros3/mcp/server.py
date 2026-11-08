@@ -6234,11 +6234,10 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
         Path(__file__).resolve().parents[3] / 'platform' / 'obs-recorder' / 'bin' / 'a3-obs-outputs.dll',
         Path(__file__).resolve().parents[3] / 'platform' / 'obs-recorder' / 'build-media' / 'a3outputs' / 'a3-obs-outputs.dll',
     ]
-    for private_outputs in private_outputs_candidates:
-        if private_outputs.exists():
-            os.environ.setdefault('AUTO_HEROS3_OUTPUTS_DLL', str(private_outputs))
-            break
-    outputs_module = private_outputs if 'private_outputs' in locals() and private_outputs.exists() else None
+    private_outputs = next((p for p in private_outputs_candidates if p.exists()), None)
+    if private_outputs is None and os.environ.get('AUTO_HEROS3_ALLOW_SYSTEM_OUTPUTS') != '1':
+        raise RuntimeError('private_outputs_missing: platform/obs-recorder/bin/a3-obs-outputs.dll')
+    outputs_module = private_outputs
     client = ObsRecorder(_obs_recorder_exe(), obs_dir=Path(r'C:\Program Files\obs-studio'),
                          outputs_module=outputs_module,
                          log_path=Path(out) / 'server.log')
@@ -6975,7 +6974,7 @@ def _recording_stop_libobs() -> dict:
 @mcp.tool()
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
-                    backend: str = 'legacy',
+                    backend: str = 'libobs',
                     max_segment_gb: float = 1.5,
                     audio_framed: str = "",
                     audio_framed_live: bool = False) -> dict:
@@ -6987,8 +6986,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     fps: target frame rate (default 60).  height: canvas height, 768 (1366x768) or
     1080 (1920x1080).  crf: x264 quality; 10 is visually near-lossless, 0 = lossless.
     Frames are streamed straight into the encoder - no intermediate files to clean up.
-    backend='legacy' is the default Python overlay recorder; backend='libobs' is the
-    native path and requires the private outputs module + live a3capture.
+    backend='libobs' is the default native path; backend='legacy' remains the
+    manual fallback (set AUTO_HEROS3_AUDIO_DRIVER=disk and restart the session).
     """
     if backend not in ('legacy', 'libobs'):
         return {'ok': False, 'error': 'invalid_backend', 'backend': backend}

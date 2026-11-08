@@ -65,11 +65,12 @@ $manifest = [ordered]@{
     dll = $dll
     sha256 = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant()
     bytes = (Get-Item -LiteralPath $dll).Length
-    obs_dll = $obs
-    obs_dll_sha256 = (Get-FileHash -LiteralPath $obs -Algorithm SHA256).Hash.ToLowerInvariant()
+    obs_lib = $obs
+    obs_lib_sha256 = (Get-FileHash -LiteralPath $obs -Algorithm SHA256).Hash.ToLowerInvariant()
     compiler = $vcvars
     sources = $sources
     source_root = $root
+    source_commit = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
     source_dirty = [bool]((& git -C $root status --porcelain 2>$null | Out-String).Trim())
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'a3-obs-outputs.build.json') -Encoding UTF8

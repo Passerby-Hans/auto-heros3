@@ -55,6 +55,7 @@ add_executable(audio-core-tests
   tests/audio_wire_c_test.c
   src/audio/audio_clock.cpp
   src/audio/audio_clock_c.c
+  src/audio/framed_core.cpp
   ../audio-protocol/src/a3_audio_protocol.cpp
   ../audio-protocol/src/a3_audio_protocol_c.c
 )
@@ -75,6 +76,26 @@ set_target_properties(audio-core-tests PROPERTIES
   OUTPUT_NAME "audio-core-tests"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+
+# N1-N3: deterministic framed parser/stream/timeline tests (no libobs).
+add_executable(framed-core-tests
+  tests/framed_core_tests.cpp
+  src/audio/framed_core.cpp
+  src/audio/audio_clock_c.c
+  ../audio-protocol/src/a3_audio_protocol.cpp
+  ../audio-protocol/src/a3_audio_protocol_c.c
+)
+target_compile_features(framed-core-tests PRIVATE cxx_std_17)
+target_compile_definitions(framed-core-tests PRIVATE
+  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_options(framed-core-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_include_directories(framed-core-tests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include")
+set_target_properties(framed-core-tests PROPERTIES
+  OUTPUT_NAME "framed-core-tests"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # ---------------------------------------------------------------------------
 # S1b: libobs media self-test executable (obs-media-selftest.exe)
@@ -120,6 +141,9 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
     src/media/gen_av_source.cpp
     src/media/raw_audio_source.cpp
     src/media/framed_audio_source.cpp
+    src/audio/framed_core.cpp
+    src/audio/audio_clock_c.c
+    ../audio-protocol/src/a3_audio_protocol.cpp
     ../audio-protocol/src/a3_audio_protocol_c.c
     src/media/panel_source.cpp
     src/json_util.cpp
@@ -136,6 +160,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
   target_include_directories(obs-media-selftest PRIVATE
     "${OBS_SOURCE_LIBOBS_DIR}"
     "${OBS_SDK_GENERATED_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
     "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include"
   )
   target_link_libraries(obs-media-selftest PRIVATE
@@ -192,4 +217,33 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
       "$<TARGET_FILE_DIR:obs-media-selftest>/auto-heros3-recorder.exe"
     COMMENT "Publishing auto-heros3-recorder.exe"
   )
+
+  # Source-only native smoke: no output, no recording, no media decode.
+  add_executable(framed-source-smoke
+    tests/framed_source_smoke.cpp
+    src/media/framed_audio_source.cpp
+    src/audio/framed_core.cpp
+    src/audio/audio_clock_c.c
+    ../audio-protocol/src/a3_audio_protocol.cpp
+    ../audio-protocol/src/a3_audio_protocol_c.c
+  )
+  target_compile_features(framed-source-smoke PRIVATE cxx_std_17)
+  target_compile_definitions(framed-source-smoke PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+  target_compile_options(framed-source-smoke PRIVATE /W3 /permissive- /EHsc /utf-8)
+  target_include_directories(framed-source-smoke PRIVATE
+    "${OBS_SOURCE_LIBOBS_DIR}" "${OBS_SDK_GENERATED_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/media"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include")
+  target_link_libraries(framed-source-smoke PRIVATE "${OBS_SDK_LIB}" advapi32 gdi32 version)
+  set_target_properties(framed-source-smoke PROPERTIES
+    OUTPUT_NAME "framed-source-smoke"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  foreach(dll IN LISTS OBS_MEDIA_RUNTIME_DLLS)
+    add_custom_command(TARGET framed-source-smoke POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${OBS_RUNTIME_BIN_DIR}/${dll}" "$<TARGET_FILE_DIR:framed-source-smoke>/${dll}")
+  endforeach()
+
 endif()

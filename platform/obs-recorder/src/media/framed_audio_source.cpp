@@ -1,8 +1,7 @@
 #include "framed_audio_source.hpp"
 
 #include "a3_audio_protocol_c.h"
-
-#include <windows.h>
+#include "framed_core.hpp"
 
 #include <obs.h>
 #include <obs-source.h>
@@ -12,7 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <fstream>
+#include <windows.h>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -40,130 +39,43 @@ FramedAudioStats CopyStats(FramedAudioData* d)
     return d->stats;
 }
 
-bool ReadWholeFile(const std::string& path, std::vector<uint8_t>& out, std::string& error)
+void Publish(FramedAudioData* d, const FramedAudioStats& stats)
 {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        error = "cannot open";
-        return false;
-    }
-    f.seekg(0, std::ios::end);
-    const std::streamoff size = f.tellg();
-    f.seekg(0, std::ios::beg);
-    if (size < 0) {
-        error = "tellg failed";
-        return false;
-    }
-    out.resize(static_cast<size_t>(size));
-    if (size > 0) {
-        f.read(reinterpret_cast<char*>(out.data()), size);
-        if (!f) {
-            error = "read failed";
-            return false;
-        }
-    }
-    return true;
+    std::lock_guard<std::mutex> lock(d->stats_mutex);
+    d->stats = stats;
 }
 
-void LiveReaderThread(FramedAudioData* d)
+void ConvertAndPush(FramedAudioData* d, const audio::ParsedPacket& packet,
+                    uint64_t timestamp_ns, FramedAudioStats* stats)
 {
-    FramedAudioStats stats;
-    stats.created = true;
-    stats.path = d->cfg.path;
-    std::ifstream f;
-    uint64_t offset = 0;
-    while (!d->stopping.load(std::memory_order_acquire)) {
-        if (!f.is_open()) {
-            f.open(d->cfg.path, std::ios::binary);
-            if (!f.is_open()) {
-                stats.error = "cannot open";
-                os_sleep_ms(50);
-                continue;
-            }
-            stats.opened = true;
-            stats.error.clear();
-            if (!d->cfg.start_at_zero) {
-                f.seekg(0, std::ios::end);
-                offset = static_cast<uint64_t>(f.tellg());
-            }
-        }
-        f.clear();
-        f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-        A3AudioPacketHeader h = {};
-        f.read(reinterpret_cast<char*>(&h), sizeof(h));
-        if (f.gcount() != static_cast<std::streamsize>(sizeof(h))) {
-            os_sleep_ms(10);
-            continue;
-        }
-        if (std::memcmp(h.magic, "A3AP", 4) != 0 || h.version != 1 ||
-            h.header_bytes != A3_AUDIO_HEADER_BYTES ||
-            h.sample_rate != 44100 || h.channels != 2 ||
-            h.sample_format != A3_AUDIO_FORMAT_S16LE ||
-            h.payload_bytes != static_cast<uint32_t>(h.sample_count) * 4 ||
-            h.qpc_frequency == 0) {
-            stats.error = "invalid framed header";
-            break;
-        }
-        std::vector<uint8_t> payload(h.payload_bytes);
-        if (h.payload_bytes) {
-            f.read(reinterpret_cast<char*>(payload.data()), h.payload_bytes);
-            if (f.gcount() != static_cast<std::streamsize>(h.payload_bytes)) {
-                os_sleep_ms(10);
-                continue;
-            }
-        }
-        A3AudioPacketHeader zeroed = h;
-        zeroed.header_crc32 = 0;
-        if (a3_audio_crc32(&zeroed, sizeof(zeroed)) != h.header_crc32 ||
-            a3_audio_crc32(payload.data(), payload.size()) != h.payload_crc32) {
-            ++stats.crc_errors;
-            stats.error = "CRC mismatch";
-            break;
-        }
-        const uint32_t frames = static_cast<uint32_t>(h.sample_count);
-        if (frames) {
-            std::vector<float> left(frames);
-            std::vector<float> right(frames);
-            const uint8_t* p = payload.data();
-            for (uint32_t i = 0; i < frames; ++i) {
-                int16_t l = 0;
-                int16_t r = 0;
-                std::memcpy(&l, p, 2);
-                std::memcpy(&r, p + 2, 2);
-                p += 4;
-                left[i] = static_cast<float>(l) / 32768.0f;
-                right[i] = static_cast<float>(r) / 32768.0f;
-            }
-            obs_source_audio audio = {};
-            audio.data[0] = reinterpret_cast<const uint8_t*>(left.data());
-            audio.data[1] = reinterpret_cast<const uint8_t*>(right.data());
-            audio.frames = frames;
-            audio.speakers = SPEAKERS_STEREO;
-            audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
-            audio.samples_per_sec = 44100;
-            audio.timestamp = os_gettime_ns();
-            obs_source_output_audio(d->source, &audio);
-            ++stats.pushed_packets;
-            stats.pushed_frames += frames;
-            stats.last_timestamp_ns = audio.timestamp;
-        }
-        ++stats.packets;
-        stats.frames += frames;
-        stats.saw_last = (h.flags & A3_AUDIO_FLAG_LAST) != 0;
-        if (stats.saw_last) {
-            offset += sizeof(h) + h.payload_bytes;
-            break;
-        }
-        offset += sizeof(h) + h.payload_bytes;
-        {
-            std::lock_guard<std::mutex> lock(d->stats_mutex);
-            d->stats = stats;
-        }
+    const uint32_t frames = static_cast<uint32_t>(packet.header.sample_count);
+    if (frames == 0) return;
+    std::vector<float> left(frames);
+    std::vector<float> right(frames);
+    const uint8_t* p = packet.payload.data();
+    for (uint32_t i = 0; i < frames; ++i) {
+        int16_t l = 0;
+        int16_t r = 0;
+        std::memcpy(&l, p, 2);
+        std::memcpy(&r, p + 2, 2);
+        p += 4;
+        left[i] = static_cast<float>(l) / 32768.0f;
+        right[i] = static_cast<float>(r) / 32768.0f;
     }
-    {
-        std::lock_guard<std::mutex> lock(d->stats_mutex);
-        d->stats = stats;
-    }
+    obs_source_audio audio = {};
+    audio.data[0] = reinterpret_cast<const uint8_t*>(left.data());
+    audio.data[1] = reinterpret_cast<const uint8_t*>(right.data());
+    audio.frames = frames;
+    audio.speakers = SPEAKERS_STEREO;
+    audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+    audio.samples_per_sec = 44100;
+    audio.timestamp = timestamp_ns;
+    obs_source_output_audio(d->source, &audio);
+    stats->submitted_packets++;
+    stats->submitted_frames += frames;
+    stats->submitted_end_sample = packet.header.sample_start + frames;
+    if (stats->first_timestamp_ns == 0) stats->first_timestamp_ns = timestamp_ns;
+    stats->last_timestamp_ns = timestamp_ns;
 }
 
 void ReaderThread(FramedAudioData* d)
@@ -171,133 +83,268 @@ void ReaderThread(FramedAudioData* d)
     FramedAudioStats stats;
     stats.created = true;
     stats.path = d->cfg.path;
-    std::vector<uint8_t> bytes;
-    while (!d->stopping.load(std::memory_order_acquire)) {
-        std::string error;
-        if (ReadWholeFile(d->cfg.path, bytes, error)) {
-            stats.opened = true;
-            stats.error.clear();
-            break;
+    stats.mode = d->cfg.live ? "live_capture" : "replay";
+    audio::FramedParser parser;
+    audio::FramedStreamValidator validator;
+    audio::SampleTimeline timeline;
+    bool stream_started = false;
+    bool first_submitted = false;
+    bool fatal_error = false;
+    bool replay_finished = false;
+    uint64_t last_progress_ns = os_gettime_ns();
+    std::string err;
+    std::vector<uint8_t> readbuf(65536);
+    uint64_t offset = 0;
+    HANDLE file = INVALID_HANDLE_VALUE;
+
+    auto fail = [&](const std::string& code, const std::string& detail) {
+        if (!fatal_error) {
+            stats.error_code = code;
+            stats.error = detail;
         }
-        stats.error = error;
-        {
-            std::lock_guard<std::mutex> lock(d->stats_mutex);
-            d->stats = stats;
+        fatal_error = true;
+        stats.stream_integrity_ok = false;
+        stats.packet_integrity_ok = false;
+        stats.timeline_ok = false;
+        stats.validation_performed = true;
+        if (code.find("crc") != std::string::npos) stats.crc_errors++;
+        Publish(d, stats);
+    };
+
+    auto open_file = [&]() -> HANDLE {
+        return CreateFileA(d->cfg.path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    };
+    const uint64_t open_deadline_ns = os_gettime_ns() + 10000000000ULL;
+    while (!d->cfg.live && file == INVALID_HANDLE_VALUE &&
+           !d->stopping.load(std::memory_order_acquire) &&
+           os_gettime_ns() < open_deadline_ns) {
+        file = open_file();
+        if (file == INVALID_HANDLE_VALUE) {
+            stats.error = "cannot open";
+            os_sleep_ms(50);
         }
-        os_sleep_ms(50);
     }
-    if (!stats.opened) {
+    if (d->cfg.live) {
+        if (!d->cfg.start_at_zero) {
+            fail("attach_not_ready", "live attach requires a validated descriptor");
+            return;
+        }
+        for (int i = 0; i < 200 && !d->stopping.load(std::memory_order_acquire); ++i) {
+            file = open_file();
+            if (file != INVALID_HANDLE_VALUE) break;
+            os_sleep_ms(50);
+        }
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        if (stats.error.empty()) stats.error = d->stopping.load() ? "stopped" : "cannot open";
+        stats.error_code = "open_failed";
+        stats.stream_integrity_ok = false;
+        stats.timeline_ok = false;
+        Publish(d, stats);
         return;
     }
-    stats.file_bytes = bytes.size();
+    stats.opened = true;
+    Publish(d, stats);
 
-    std::vector<float> left;
-    std::vector<float> right;
-    size_t offset = 0;
-    uint64_t first_qpc = 0;
-    uint64_t qpc_freq = 0;
-    uint32_t expected_sequence = 0;
-    bool have_sequence = false;
-    const uint64_t anchor_ns = os_gettime_ns();
     while (!d->stopping.load(std::memory_order_acquire)) {
-        if (offset + sizeof(A3AudioPacketHeader) > bytes.size()) {
-            break;
-        }
-        A3AudioPacketHeader h = {};
-        std::memcpy(&h, bytes.data() + offset, sizeof(h));
-        if (std::memcmp(h.magic, "A3AP", 4) != 0 || h.version != 1 ||
-            h.header_bytes != A3_AUDIO_HEADER_BYTES ||
-            h.sample_rate != 44100 || h.channels != 2 ||
-            h.sample_format != A3_AUDIO_FORMAT_S16LE ||
-            h.payload_bytes != static_cast<uint32_t>(h.sample_count) * 4 ||
-            h.qpc_frequency == 0) {
-            stats.error = "invalid framed header";
-            break;
-        }
-        if (offset + sizeof(h) + h.payload_bytes > bytes.size()) {
-            stats.error = "truncated framed payload";
-            break;
-        }
-        A3AudioPacketHeader zeroed = h;
-        zeroed.header_crc32 = 0;
-        if (a3_audio_crc32(&zeroed, sizeof(zeroed)) != h.header_crc32 ||
-            a3_audio_crc32(bytes.data() + offset + sizeof(h), h.payload_bytes) !=
-                h.payload_crc32) {
-            ++stats.crc_errors;
-            stats.error = "CRC mismatch";
-            break;
-        }
-        if (have_sequence && h.sequence != expected_sequence) {
-            ++stats.sequence_gaps;
-        }
-        expected_sequence = h.sequence + 1;
-        have_sequence = true;
-        if (h.sequence == 0 || first_qpc == 0) {
-            first_qpc = h.actual_start_qpc;
-            qpc_freq = h.qpc_frequency;
-            stats.capture_id = h.capture_id;
-            stats.generation = h.generation;
-            stats.saw_first = (h.flags & A3_AUDIO_FLAG_FIRST) != 0;
-            stats.first_timestamp_ns = anchor_ns;
-        }
-        if (h.flags & A3_AUDIO_FLAG_DISCONTINUITY) {
-            ++stats.discontinuity_packets;
-        }
-        const uint64_t ts = anchor_ns +
-            (h.actual_start_qpc - first_qpc) * 1000000000ULL / qpc_freq;
-        while (!d->stopping.load(std::memory_order_acquire)) {
-            const uint64_t now = os_gettime_ns();
-            if (now >= ts) {
+        LARGE_INTEGER li;
+        li.QuadPart = static_cast<LONGLONG>(offset);
+        SetFilePointerEx(file, li, nullptr, FILE_BEGIN);
+        DWORD got = 0;
+        const BOOL read_ok = ReadFile(file, readbuf.data(),
+                                      static_cast<DWORD>(readbuf.size()), &got, nullptr);
+        if (!read_ok) {
+            const DWORD read_error = GetLastError();
+            if (read_error != ERROR_HANDLE_EOF) {
+                fail("io_error", "ReadFile error " + std::to_string(read_error));
                 break;
             }
-            os_sleepto_ns(std::min(ts, now + 2000000ULL));
+            got = 0;
         }
-        if (d->stopping.load(std::memory_order_acquire)) {
-            break;
+        if (got > 0) last_progress_ns = os_gettime_ns();
+        if (got > 0)
+        if (got > 0) {
+            offset += static_cast<uint64_t>(got);
+            stats.file_bytes = offset;
+            std::vector<audio::ParsedPacket> packets;
+            if (!parser.feed(readbuf.data(), got, packets, &err)) {
+                fail(err, err);
+                break;
+            }
+            stats.packet_integrity_ok = true;
+            stats.validation_performed = true;
+            for (auto& packet : packets) {
+                if (!stream_started) {
+                    if (!validator.StartAtFirst(&err)) {
+                        fail("stream_start", err);
+                        break;
+                    }
+                    audio::TimelineConfig tc;
+                    tc.mode = d->cfg.live ? audio::TimelineMode::LiveCapture
+                                          : audio::TimelineMode::Replay;
+                    tc.sample_rate = packet.header.sample_rate;
+                    tc.qpc_frequency = packet.header.qpc_frequency;
+                    tc.capture_epoch_qpc = packet.header.capture_epoch_qpc;
+                    tc.replay_origin_ns = d->cfg.replay_origin_ns;
+                    tc.replay_start_sample = packet.header.sample_start;
+                    if (!d->cfg.live && d->cfg.replay_origin_ns == 0) {
+                        fail("replay_origin_required", "replay_origin_ns must be provided");
+                        break;
+                    }
+                    if (!timeline.Configure(tc, &err)) {
+                        fail("timeline_config", err);
+                        break;
+                    }
+                    stats.qpc_frequency = tc.qpc_frequency;
+                    stats.capture_epoch_qpc = tc.capture_epoch_qpc;
+                    stream_started = true;
+                }
+                if (!validator.Accept(packet, &err)) {
+                    fail(err, err);
+                    break;
+                }
+                const bool planned_ok = timeline.PlannedMatches(packet.header, &err);
+                if (!planned_ok) {
+                    fail("timeline_planned", err);
+                    break;
+                }
+                uint64_t ts = 0;
+                if (d->cfg.live) {
+                    if (!timeline.LiveSampleTimeNs(packet.header.sample_start, &ts, &err)) {
+                        fail("timeline_live", err);
+                        break;
+                    }
+                    const uint64_t now = os_gettime_ns();
+                    const uint64_t age = now > ts ? now - ts : 0;
+                    if (age > d->cfg.late_budget_ns) {
+                        stats.max_packet_age_ns = std::max(stats.max_packet_age_ns, age);
+                        stats.late_packets++;
+                        if (!first_submitted) {
+                            /* live attach: skip pre-roll history, but keep the
+                             * validated sample timeline unchanged. */
+                            stats.preroll_skipped_packets++;
+                            stats.preroll_skipped_frames += packet.header.sample_count;
+                            continue;
+                        }
+                        fail("late_budget_exceeded",
+                             "packet age " + std::to_string(age) + "ns");
+                        break;
+                    }
+                    stats.max_packet_age_ns = std::max(stats.max_packet_age_ns, age);
+                    if (age > 0) stats.late_packets++;
+                } else {
+                    if (!timeline.ReplaySampleTimeNs(packet.header.sample_start, &ts, &err)) {
+                        fail("timeline_replay", err);
+                        break;
+                    }
+                    while (!d->stopping.load(std::memory_order_acquire) &&
+                           os_gettime_ns() < ts) {
+                        os_sleepto_ns(std::min(ts, os_gettime_ns() + 2000000ULL));
+                    }
+                    if (d->stopping.load(std::memory_order_acquire)) break;
+                }
+                if (stats.submitted_packets > 0 &&
+                    packet.header.sample_start != stats.submitted_end_sample) {
+                    stats.submitted_gaps++;
+                    fail("submitted_gap", "submitted samples are not contiguous");
+                    break;
+                }
+                if (stats.submitted_packets == 0)
+                    stats.submitted_start_sample = packet.header.sample_start;
+                ConvertAndPush(d, packet, ts, &stats);
+                if (packet.header.sample_count > 0) first_submitted = true;
+            }
+            stats.validated_packets = validator.stats().validated_packets;
+            stats.validated_frames = validator.stats().validated_frames;
+            stats.sequence_gaps = validator.stats().sequence_gaps;
+            stats.sample_gaps = validator.stats().sample_gaps;
+            stats.sample_overlaps = validator.stats().sample_overlaps;
+            stats.discontinuity_packets = validator.stats().discontinuity_packets;
+            stats.overflow_packets = validator.stats().overflow_packets;
+            stats.producer_error_packets = validator.stats().producer_error_packets;
+            stats.first_sample = validator.stats().first_sample;
+            stats.validated_end_sample = validator.stats().validated_end_sample;
+            stats.saw_first = validator.saw_first();
+            stats.saw_last = validator.saw_last();
+            stats.pending_bytes = parser.pending_bytes();
+            Publish(d, stats);
+            if (!stats.error.empty()) break;
         }
-        const uint32_t frames = static_cast<uint32_t>(h.sample_count);
-        left.resize(frames);
-        right.resize(frames);
-        const uint8_t* p = bytes.data() + offset + sizeof(h);
-        for (uint32_t i = 0; i < frames; ++i) {
-            int16_t l = 0;
-            int16_t r = 0;
-            std::memcpy(&l, p, 2);
-            std::memcpy(&r, p + 2, 2);
-            p += 4;
-            left[i] = static_cast<float>(l) / 32768.0f;
-            right[i] = static_cast<float>(r) / 32768.0f;
-        }
-        if (frames) {
-            obs_source_audio audio = {};
-            audio.data[0] = reinterpret_cast<const uint8_t*>(left.data());
-            audio.data[1] = reinterpret_cast<const uint8_t*>(right.data());
-            audio.frames = frames;
-            audio.speakers = SPEAKERS_STEREO;
-            audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
-            audio.samples_per_sec = 44100;
-            audio.timestamp = ts;
-            obs_source_output_audio(d->source, &audio);
-            ++stats.pushed_packets;
-            stats.pushed_frames += frames;
-            stats.last_timestamp_ns = ts;
-        }
-        ++stats.packets;
-        stats.frames += frames;
-        stats.saw_last = (h.flags & A3_AUDIO_FLAG_LAST) != 0;
-        {
-            std::lock_guard<std::mutex> lock(d->stats_mutex);
-            d->stats = stats;
-        }
-        offset += sizeof(h) + h.payload_bytes;
-        if (stats.saw_last) {
-            break;
+        if (d->cfg.live) {
+            if (got == 0 && d->stopping.load(std::memory_order_acquire)) break;
+            if (got == 0) {
+                /* A synchronous handle can remain at its old EOF while the
+                 * SDL worker appends.  Reopen to refresh the file size. */
+                if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+                file = open_file();
+                if (file == INVALID_HANDLE_VALUE) {
+                    fail("io_error", "cannot reopen live framed file");
+                    break;
+                }
+                LARGE_INTEGER file_size;
+                if (GetFileSizeEx(file, &file_size) &&
+                    static_cast<uint64_t>(file_size.QuadPart) < offset) {
+                    fail("file_truncated", "live framed file shrank below read offset");
+                    break;
+                }
+                if (os_gettime_ns() - last_progress_ns > 5000000000ULL) {
+                    fail("capture_stalled", "live framed file made no progress for 5s");
+                    break;
+                }
+                os_sleep_ms(10);
+            }
+        } else {
+            if (got == 0) {
+                replay_finished = true;
+                break;
+            }
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(d->stats_mutex);
-        d->stats = stats;
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+
+    if (!stream_started) {
+        if (stats.error.empty()) {
+            stats.error_code = d->cfg.live ? "capture_not_ready" : "empty_stream";
+            stats.error = stats.error_code;
+        }
+        Publish(d, stats);
+        return;
     }
+    if (!parser.finish(&err)) {
+        fail("truncated", err);
+    }
+    bool complete = false;
+    const bool host_stopped = d->stopping.load(std::memory_order_acquire);
+    if (!validator.Finish(!d->cfg.live && !host_stopped, &complete, &err)) {
+        fail(err, err);
+    } else {
+        stats.stream_integrity_ok = validator.integrity_ok() && !fatal_error;
+        stats.packet_integrity_ok = !fatal_error;
+        stats.validation_performed = true;
+        stats.saw_first = validator.saw_first();
+        stats.saw_last = validator.saw_last();
+        stats.validated_end_sample = validator.stats().validated_end_sample;
+        if (!fatal_error) {
+            stats.error.clear();
+            stats.error_code.clear();
+        }
+    }
+    stats.timeline_ok = !fatal_error;
+    stats.submitted_end_sample = stats.submitted_packets
+        ? stats.submitted_end_sample : 0;
+    if (fatal_error) {
+        stats.stream_integrity_ok = false;
+        stats.packet_integrity_ok = false;
+        stats.timeline_ok = false;
+    }
+    if (!d->cfg.live && replay_finished && !stats.saw_last) {
+        stats.stream_integrity_ok = false;
+        stats.error_code = "missing_last";
+        stats.error = "replay ended without LAST";
+    }
+    Publish(d, stats);
 }
 
 const char* FramedGetName(void*)
@@ -310,6 +357,8 @@ void FramedGetDefaults(obs_data_t* defaults)
     obs_data_set_default_string(defaults, "path", "");
     obs_data_set_default_bool(defaults, "live", false);
     obs_data_set_default_bool(defaults, "start_at_zero", true);
+    obs_data_set_default_int(defaults, "replay_origin_ns", 0);
+    obs_data_set_default_int(defaults, "late_budget_ns", 500000000);
 }
 
 void* FramedCreate(obs_data_t* settings, obs_source_t* source)
@@ -320,24 +369,24 @@ void* FramedCreate(obs_data_t* settings, obs_source_t* source)
     d->cfg.path = path ? path : "";
     d->cfg.live = obs_data_get_bool(settings, "live");
     d->cfg.start_at_zero = obs_data_get_bool(settings, "start_at_zero");
+    d->cfg.replay_origin_ns =
+        static_cast<uint64_t>(obs_data_get_int(settings, "replay_origin_ns"));
+    d->cfg.late_budget_ns =
+        static_cast<uint64_t>(obs_data_get_int(settings, "late_budget_ns"));
     d->stats.created = true;
     d->stats.path = d->cfg.path;
     g_last_source.store(d, std::memory_order_release);
-    d->thread = std::thread(d->cfg.live ? LiveReaderThread : ReaderThread, d);
+    d->thread = std::thread(ReaderThread, d);
     return d;
 }
 
 void FramedDestroy(void* ptr)
 {
     auto* d = static_cast<FramedAudioData*>(ptr);
-    if (!d) {
-        return;
-    }
+    if (!d) return;
     g_last_source.store(nullptr, std::memory_order_release);
     d->stopping.store(true, std::memory_order_release);
-    if (d->thread.joinable()) {
-        d->thread.join();
-    }
+    if (d->thread.joinable()) d->thread.join();
     delete d;
 }
 
@@ -353,7 +402,7 @@ const obs_source_info kFramedAudioInfo = [] {
     return info;
 }();
 
-} // namespace
+}  // namespace
 
 void RegisterFramedAudioSource()
 {
@@ -363,24 +412,18 @@ void RegisterFramedAudioSource()
 void StopFramedAudioSourceThread()
 {
     FramedAudioData* d = g_last_source.load(std::memory_order_acquire);
-    if (!d) {
-        return;
-    }
+    if (!d) return;
     d->stopping.store(true, std::memory_order_release);
-    if (d->thread.joinable()) {
-        d->thread.join();
-    }
+    if (d->thread.joinable()) d->thread.join();
 }
 
 FramedAudioStats GetFramedAudioStats()
 {
     FramedAudioData* d = g_last_source.load(std::memory_order_acquire);
-    if (!d) {
-        return {};
-    }
+    if (!d) return {};
     FramedAudioStats stats = CopyStats(d);
     stats.created = true;
     return stats;
 }
 
-} // namespace a3
+}  // namespace a3

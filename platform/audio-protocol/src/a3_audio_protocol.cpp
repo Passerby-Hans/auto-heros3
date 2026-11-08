@@ -40,39 +40,27 @@ void FinalizePacket(PacketHeader& header, const void* payload, size_t payload_by
     header.header_crc32 = Crc32(&header, sizeof(header));
 }
 
-bool ValidatePacket(const PacketHeader& header, const void* payload,
-                    size_t available_payload_bytes, std::string* error)
+bool ValidateHeader(const PacketHeader& header, std::string* error)
 {
     if (header.magic[0] != kMagic[0] || header.magic[1] != kMagic[1] ||
         header.magic[2] != kMagic[2] || header.magic[3] != kMagic[3]) {
         return Fail(error, "bad_magic");
     }
-    if (header.version != kVersion) {
-        return Fail(error, "unsupported_version");
-    }
-    if (header.header_bytes != kHeaderBytes) {
-        return Fail(error, "bad_header_bytes");
-    }
-    if (header.flags & ~kKnownFlags) {
-        return Fail(error, "unknown_flags");
-    }
-    if (header.sample_rate == 0 || header.channels != kChannelsStereo ||
+    if (header.version != kVersion) return Fail(error, "unsupported_version");
+    if (header.header_bytes != kHeaderBytes) return Fail(error, "bad_header_bytes");
+    if (header.flags & ~kKnownFlags) return Fail(error, "unknown_flags");
+    if (header.sample_rate != kNativeSampleRate ||
+        header.channels != kChannelsStereo ||
         header.sample_format != kFormatS16LE) {
         return Fail(error, "unsupported_format");
     }
-    if (header.qpc_frequency == 0) {
-        return Fail(error, "bad_qpc_frequency");
-    }
-    if (header.actual_end_qpc < header.actual_start_qpc) {
+    if (header.qpc_frequency == 0) return Fail(error, "bad_qpc_frequency");
+    if (header.payload_bytes > kMaxPayloadBytes)
+        return Fail(error, "payload_too_large");
+    if (header.actual_end_qpc < header.actual_start_qpc)
         return Fail(error, "bad_qpc_interval");
-    }
-    if (header.sample_count > 0 &&
-        header.actual_end_qpc == header.actual_start_qpc) {
+    if (header.sample_count > 0 && header.actual_end_qpc == header.actual_start_qpc)
         return Fail(error, "empty_qpc_interval");
-    }
-    if (header.payload_bytes != available_payload_bytes) {
-        return Fail(error, "payload_length_mismatch");
-    }
     if (header.sample_count >
         (std::numeric_limits<uint64_t>::max() - header.sample_start)) {
         return Fail(error, "sample_range_overflow");
@@ -83,18 +71,12 @@ bool ValidatePacket(const PacketHeader& header, const void* payload,
     }
     const size_t expected_bytes = static_cast<size_t>(header.sample_count) *
                                   kChannelsStereo * 2u;
-    if (header.payload_bytes != expected_bytes) {
+    if (header.payload_bytes != expected_bytes)
         return Fail(error, "sample_count_payload_mismatch");
-    }
-    if (header.payload_bytes > 0 && payload == nullptr) {
-        return Fail(error, "null_payload");
-    }
-    if (header.sample_count == 0 && !(header.flags & kFlagLast)) {
+    if (header.sample_count == 0 && !(header.flags & kFlagLast))
         return Fail(error, "empty_packet_without_last");
-    }
-    if (header.reserved0 != 0 || header.reserved1 != 0) {
+    if (header.reserved0 != 0 || header.reserved1 != 0)
         return Fail(error, "nonzero_reserved");
-    }
     if ((header.flags & kFlagDiscontinuity) != 0) {
         if (header.discontinuity_count == 0 ||
             header.discontinuity_start >
@@ -104,21 +86,32 @@ bool ValidatePacket(const PacketHeader& header, const void* payload,
     } else if (header.discontinuity_count != 0) {
         return Fail(error, "discontinuity_without_flag");
     }
-    // CRC32 value 0 is a legal result; presence is proven by comparing the
-    // computed value with the field, not by a non-zero sentinel.
-
     PacketHeader copy = header;
     copy.header_crc32 = 0;
-    if (Crc32(&copy, sizeof(copy)) != header.header_crc32) {
+    if (Crc32(&copy, sizeof(copy)) != header.header_crc32)
         return Fail(error, "bad_header_crc");
-    }
-    if (header.payload_crc32 != Crc32(payload, header.payload_bytes)) {
-        return Fail(error, "bad_payload_crc");
-    }
-    if (error) {
-        error->clear();
-    }
+    if (error) error->clear();
     return true;
+}
+
+bool ValidatePayload(const PacketHeader& header, const void* payload,
+                     size_t available_payload_bytes, std::string* error)
+{
+    if (header.payload_bytes != available_payload_bytes)
+        return Fail(error, "payload_length_mismatch");
+    if (header.payload_bytes > 0 && payload == nullptr)
+        return Fail(error, "null_payload");
+    if (header.payload_crc32 != Crc32(payload, header.payload_bytes))
+        return Fail(error, "bad_payload_crc");
+    if (error) error->clear();
+    return true;
+}
+
+bool ValidatePacket(const PacketHeader& header, const void* payload,
+                    size_t available_payload_bytes, std::string* error)
+{
+    if (!ValidateHeader(header, error)) return false;
+    return ValidatePayload(header, payload, available_payload_bytes, error);
 }
 
 std::string ProtocolDescriptor()

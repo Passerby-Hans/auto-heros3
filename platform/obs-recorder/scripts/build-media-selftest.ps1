@@ -225,7 +225,7 @@ if ($configureExit -eq 0) {
     $showIncludesPatched = Repair-NinjaShowIncludesPrefix $BuildDir $includePrefix
     Write-Host ("MSVC /showIncludes prefix patched in {0} Ninja file(s)" -f $showIncludesPatched)
     $buildArgs = @('--build', $BuildDir, '--target', 'obs-media-selftest',
-        'audio-core-tests', '--config', $Config)
+        'audio-core-tests', 'framed-core-tests', 'framed-source-smoke', '--config', $Config)
     $buildOutput = (& $cmake @buildArgs 2>&1 | Out-String)
     $buildExit = $LASTEXITCODE
     Write-Log (Join-Path $logsDir 'build.log') $buildOutput

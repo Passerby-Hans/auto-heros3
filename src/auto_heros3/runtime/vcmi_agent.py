@@ -366,6 +366,40 @@ class VcmiAgent:
         }
 
     # ------------------------------------------------------------------ audio relay
+    def _sdl_paths(self):
+        stage = ROOT / 'platform' / 'sdl-capture-patch' / 'stage'
+        return stage / 'SDL2.dll', stage / 'SDL2-original.dll', EXE.parent / 'SDL2.dll'
+
+    def _restore_private_sdl(self) -> None:
+        """Restore the pinned original SDL2.dll before a non-a3capture run."""
+        import hashlib
+        import shutil
+        private, original, dst = self._sdl_paths()
+        if not original.exists() or not dst.exists():
+            return
+        private_hash = hashlib.sha256(private.read_bytes()).hexdigest() if private.exists() else ''
+        dst_hash = hashlib.sha256(dst.read_bytes()).hexdigest()
+        if dst_hash == private_hash:
+            shutil.copy2(original, dst)
+            self._print(f'[agent] restored original SDL2.dll from {original}')
+
+    def _ensure_private_sdl(self) -> None:
+        """Stage the pinned a3capture SDL2 build next to VCMI_client.exe."""
+        import hashlib
+        import shutil
+        src, original, dst = self._sdl_paths()
+        if not src.exists() or not original.exists():
+            raise BridgeError(f'a3capture private SDL2/original missing under {src.parent}')
+        src_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+        dst_hash = hashlib.sha256(dst.read_bytes()).hexdigest() if dst.exists() else None
+        if dst_hash == src_hash:
+            return
+        # The canonical original is the staged build artifact, not whatever a
+        # previous experiment left in the app directory.
+        shutil.copy2(original, EXE.parent / 'SDL2.dll.original')
+        shutil.copy2(src, dst)
+        self._print(f'[agent] staged private SDL2.dll sha256={src_hash[:12]} -> {dst}')
+
     def _start_audio_relay(self) -> None:
         """Create the SDL disk-audio pipe relay before the client starts.
 
@@ -503,6 +537,10 @@ class VcmiAgent:
             except OSError:
                 pass
         self._restore_video_settings()
+        if self.audio_driver == 'a3capture':
+            self._ensure_private_sdl()
+        else:
+            self._restore_private_sdl()
         self._patch_video_settings()
         try:
             self._start_audio_relay()

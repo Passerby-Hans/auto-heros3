@@ -3,3 +3,6 @@
 # S1b media self-test build tree (generated OBS SDK obs.lib/obsconfig.h and
 # staged OBS runtime DLLs also live here; nothing generated is committed)
 /build-media/
+
+# private output DLL/artifacts are kept as external artifacts with manifest
+/bin/

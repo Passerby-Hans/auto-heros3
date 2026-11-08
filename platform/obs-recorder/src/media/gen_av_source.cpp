@@ -104,7 +104,10 @@ void PushVideoFrame(AvSourceData* d, uint64_t timestamp_ns)
     std::memcpy(d->y_plane.data(), d->y_template.data(), d->y_template.size());
 
     if (d->cfg.pulse_video) {
-        const uint8_t value = (frame_idx % 60) < 15 ? 235 : 16;
+        if (d->cfg.pulse_origin_ns == 0)
+            d->cfg.pulse_origin_ns = d->cfg.replay_origin_ns ? d->cfg.replay_origin_ns : timestamp_ns;
+        const uint64_t phase = (timestamp_ns - d->cfg.pulse_origin_ns) % 1000000000ULL;
+        const uint8_t value = phase < 250000000ULL ? 235 : 16;
         std::memset(d->y_plane.data(), value, d->y_plane.size());
     } else {
         // Moving bright vertical bar; wraps around the frame edge.
@@ -179,37 +182,33 @@ void PushAudioChunk(AvSourceData* d, uint64_t timestamp_ns)
 // libobs/media-io/audio-io.c audio_thread()).
 void SourceThread(AvSourceData* d)
 {
-    const uint64_t video_period_ns =
-        1000000000ULL / static_cast<uint64_t>(d->cfg.fps);
-    const uint64_t audio_period_ns =
-        static_cast<uint64_t>(d->cfg.audio_chunk_frames) * 1000000000ULL /
-        d->cfg.audio_rate;
-
-    uint64_t next_video = os_gettime_ns();
-    uint64_t next_audio = next_video;
+    const uint64_t origin = d->cfg.replay_origin_ns ? d->cfg.replay_origin_ns
+                                                    : os_gettime_ns();
+    const uint64_t fps = static_cast<uint64_t>(d->cfg.fps);
+    const uint64_t audio_chunk = static_cast<uint64_t>(d->cfg.audio_chunk_frames);
+    const uint64_t audio_rate = static_cast<uint64_t>(d->cfg.audio_rate);
+    uint64_t video_index = 0;
+    uint64_t audio_index = 0;
 
     while (!d->stopping.load(std::memory_order_acquire)) {
         const uint64_t now = os_gettime_ns();
-
-        // Bound catch-up: if the thread was descheduled for a long time, snap
-        // the grid back to "now" instead of pushing a burst of stale frames.
-        if (now > next_video + 100000000ULL) {
-            next_video = now;
-        }
-        if (now > next_audio + 300000000ULL) {
-            next_audio = now;
-        }
+        /* Absolute grid, not accumulated floor(period): frame 60 at 60 fps
+         * must be exactly 1.000000000 s after the origin, never 999999960 ns. */
+        const uint64_t next_video = origin + video_index * 1000000000ULL / fps;
+        const uint64_t next_audio = origin + audio_index * audio_chunk * 1000000000ULL / audio_rate;
 
         if (now >= next_video) {
             PushVideoFrame(d, next_video);
-            next_video += video_period_ns;
+            video_index++;
         }
         if (now >= next_audio) {
             PushAudioChunk(d, next_audio);
-            next_audio += audio_period_ns;
+            audio_index++;
         }
 
-        os_sleepto_ns(std::min(next_video, next_audio));
+        const uint64_t wake_video = origin + video_index * 1000000000ULL / fps;
+        const uint64_t wake_audio = origin + audio_index * audio_chunk * 1000000000ULL / audio_rate;
+        os_sleepto_ns(std::min(wake_video, wake_audio));
     }
 }
 
@@ -224,6 +223,10 @@ void* AvCreate(obs_data_t* settings, obs_source_t* source)
     data->source = source;
     data->cfg = AvSourceConfig{};
     data->cfg.pulse_video = settings && obs_data_get_bool(settings, "pulse_video");
+    if (settings) {
+        data->cfg.replay_origin_ns = static_cast<uint64_t>(
+            obs_data_get_int(settings, "replay_origin_ns"));
+    }
 
     FillYTemplate(data.get());
     data->y_plane.resize(data->y_template.size());

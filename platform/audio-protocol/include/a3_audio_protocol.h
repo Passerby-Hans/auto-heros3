@@ -23,6 +23,9 @@ constexpr uint16_t kVersion = 1;
 constexpr uint16_t kHeaderBytes = 128;
 constexpr uint16_t kChannelsStereo = 2;
 constexpr uint16_t kFormatS16LE = 1;
+// Consumer-side upper bound.  It does not change the producer block size.
+constexpr uint32_t kMaxPayloadBytes = 64u * 1024u;
+constexpr uint32_t kNativeSampleRate = 44100;
 
 enum PacketFlags : uint32_t {
     kFlagFirst = 1u << 0,          // first packet of a capture generation
@@ -85,6 +88,9 @@ void FinalizePacket(PacketHeader& header, const void* payload, size_t payload_by
 
 // Validates all version/format/range/CRC invariants.  Returns false and sets
 // *error to a short machine-readable reason.  Never trusts payload_bytes alone.
+bool ValidateHeader(const PacketHeader& header, std::string* error = nullptr);
+bool ValidatePayload(const PacketHeader& header, const void* payload,
+                     size_t available_payload_bytes, std::string* error = nullptr);
 bool ValidatePacket(const PacketHeader& header, const void* payload,
                     size_t available_payload_bytes, std::string* error = nullptr);
 

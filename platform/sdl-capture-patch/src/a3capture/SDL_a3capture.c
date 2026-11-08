@@ -31,7 +31,7 @@
 /* SDL_sysaudio.h undefines _THIS at its end; re-establish the backend macro. */
 #define _THIS SDL_AudioDevice *_this
 
-#define A3CAPTURE_QUEUE_SLOTS 16
+#define A3CAPTURE_QUEUE_SLOTS 256
 #define A3CAPTURE_DEFAULT_FILE "a3capture.raw"
 
 typedef struct A3Packet
@@ -436,6 +436,92 @@ static void A3CAPTURE_CloseDevice(_THIS)
     SDL_free(h);
 }
 
+
+/* A shared-read/write Windows file RWops.  The original SDL_RWFromFile("wb")
+ * opens the file through the CRT with a share mode that denies readers; the
+ * native recorder must follow the growing framed file while VCMI writes it. */
+typedef struct A3WinFile {
+    HANDLE handle;
+} A3WinFile;
+
+static Sint64 A3WinFileSize(SDL_RWops *rw)
+{
+    A3WinFile *f = (A3WinFile *)rw->hidden.unknown.data1;
+    LARGE_INTEGER size;
+    if (!f || !GetFileSizeEx(f->handle, &size)) return -1;
+    return (Sint64)size.QuadPart;
+}
+
+static Sint64 A3WinFileSeek(SDL_RWops *rw, Sint64 offset, int whence)
+{
+    A3WinFile *f = (A3WinFile *)rw->hidden.unknown.data1;
+    LARGE_INTEGER distance, result;
+    DWORD move;
+    if (!f) return -1;
+    if (whence == RW_SEEK_CUR) move = FILE_CURRENT;
+    else if (whence == RW_SEEK_END) move = FILE_END;
+    else move = FILE_BEGIN;
+    distance.QuadPart = offset;
+    if (!SetFilePointerEx(f->handle, distance, &result, move)) return -1;
+    return (Sint64)result.QuadPart;
+}
+
+static size_t A3WinFileRead(SDL_RWops *rw, void *ptr, size_t size, size_t maxnum)
+{
+    A3WinFile *f = (A3WinFile *)rw->hidden.unknown.data1;
+    DWORD total = (DWORD)(size * maxnum), got = 0;
+    if (!f || size == 0 || maxnum == 0) return 0;
+    if (!ReadFile(f->handle, ptr, total, &got, NULL)) return 0;
+    return got / size;
+}
+
+static size_t A3WinFileWrite(SDL_RWops *rw, const void *ptr, size_t size, size_t num)
+{
+    A3WinFile *f = (A3WinFile *)rw->hidden.unknown.data1;
+    DWORD total = (DWORD)(size * num), wrote = 0;
+    if (!f || size == 0 || num == 0) return 0;
+    if (!WriteFile(f->handle, ptr, total, &wrote, NULL)) return 0;
+    return wrote / size;
+}
+
+static int A3WinFileClose(SDL_RWops *rw)
+{
+    A3WinFile *f = (A3WinFile *)rw->hidden.unknown.data1;
+    if (f) {
+        CloseHandle(f->handle);
+        SDL_free(f);
+    }
+    SDL_FreeRW(rw);
+    return 0;
+}
+
+static SDL_RWops *A3WinFileOpen(const char *path)
+{
+    A3WinFile *f;
+    SDL_RWops *rw;
+    HANDLE h = CreateFileA(path, GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    f = (A3WinFile *)SDL_calloc(1, sizeof(*f));
+    rw = SDL_AllocRW();
+    if (!f || !rw) {
+        if (f) SDL_free(f);
+        if (rw) SDL_FreeRW(rw);
+        CloseHandle(h);
+        return NULL;
+    }
+    f->handle = h;
+    rw->size = A3WinFileSize;
+    rw->seek = A3WinFileSeek;
+    rw->read = A3WinFileRead;
+    rw->write = A3WinFileWrite;
+    rw->close = A3WinFileClose;
+    rw->type = SDL_RWOPS_UNKNOWN;
+    rw->hidden.unknown.data1 = f;
+    return rw;
+}
+
 static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
 {
     struct SDL_PrivateAudioData *h;
@@ -512,7 +598,7 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
         return SDL_OutOfMemory();
     }
     SDL_Log("a3capture opening file='%s'", path);
-    h->out = SDL_RWFromFile(path, "wb");
+    h->out = A3WinFileOpen(path);
     if (!h->out) {
         SDL_Log("a3capture file open failed path='%s'", path);
         SDL_SetError("cannot open A3CAPTURE_FILE");

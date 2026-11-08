@@ -6225,17 +6225,29 @@ def _size_cap_mb(max_segment_gb: float) -> int:
 
 def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                          audio_framed: Path | None = None,
+                         audio_framed_live: bool = False,
                          max_time_sec: int, max_size_mb: int = 0,
                          overlay_path: Path | None = None) -> tuple[object, dict]:
     """Create/connect/prepare/start one native recorder process for a run."""
     from auto_heros3.recording.obs_backend import ObsRecorder
+    private_outputs_candidates = [
+        Path(__file__).resolve().parents[3] / 'platform' / 'obs-recorder' / 'bin' / 'a3-obs-outputs.dll',
+        Path(__file__).resolve().parents[3] / 'platform' / 'obs-recorder' / 'build-media' / 'a3outputs' / 'a3-obs-outputs.dll',
+    ]
+    for private_outputs in private_outputs_candidates:
+        if private_outputs.exists():
+            os.environ.setdefault('AUTO_HEROS3_OUTPUTS_DLL', str(private_outputs))
+            break
+    outputs_module = private_outputs if 'private_outputs' in locals() and private_outputs.exists() else None
     client = ObsRecorder(_obs_recorder_exe(), obs_dir=Path(r'C:\Program Files\obs-studio'),
+                         outputs_module=outputs_module,
                          log_path=Path(out) / 'server.log')
     try:
         client.connect()
         prep = client.prepare(Path(out), window_pid=int(client_pid),
                               audio_raw=Path(audio_raw) if audio_raw else None,
                               audio_framed=Path(audio_framed) if audio_framed else None,
+                              audio_framed_live=bool(audio_framed_live),
                               max_time_sec=int(max_time_sec), max_size_mb=int(max_size_mb),
                               overlay_path=overlay_path, duration_ms=0)
         if not prep.get('ok'):
@@ -6302,15 +6314,26 @@ def _libobs_watchdog(rec: dict) -> None:
                 rec['last_health'] = {'ok': False, 'error': f'{type(exc).__name__}: {exc}',
                                       'at': time.time()}
                 if not rec.get('stop_requested'):
-                    _libobs_restart_after_death(rec, 'status_failed')
+                    _libobs_restart_after_death(rec, 'status_failed', force=True)
                 continue
+            framed = native.get('framed_audio') or {}
+            framed_bad = bool(framed.get('enabled')) and (
+                not framed.get('opened') or framed.get('error_code') or
+                not framed.get('packet_integrity_ok', False) or
+                not framed.get('stream_integrity_ok', False) or
+                not framed.get('timeline_ok', False) or
+                int(framed.get('submitted_gaps') or 0) != 0)
             rec['last_health'] = {'ok': True, 'active': bool(native.get('active')),
-                                  'state': native.get('state'), 'at': time.time()}
+                                  'state': native.get('state'),
+                                  'framed_error': framed.get('error_code') if framed_bad else '',
+                                  'at': time.time()}
             if not native.get('active') and not rec.get('stop_requested'):
-                _libobs_restart_after_death(rec, 'native_output_inactive')
+                _libobs_restart_after_death(rec, 'native_output_inactive', force=True)
+            elif framed_bad and not rec.get('stop_requested'):
+                _libobs_restart_after_death(rec, 'framed_audio_failed', force=True)
 
 
-def _libobs_restart_after_death(rec: dict, returncode) -> None:
+def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -> None:
     lock = rec.get('restart_lock')
     if lock is None:
         return
@@ -6321,10 +6344,10 @@ def _libobs_restart_after_death(rec: dict, returncode) -> None:
         rec['restarting'] = True
         proc = rec.get('proc')
         client = rec.get('client')
-        if proc is not None and proc.poll() is None:
+        if proc is not None and proc.poll() is None and not force:
             rec['restarting'] = False
             return
-        if proc is None and client is not None and client.alive():
+        if proc is None and client is not None and client.alive() and not force:
             rec['restarting'] = False
             return
         old_out = Path(rec.get('dir') or '')
@@ -6352,7 +6375,10 @@ def _libobs_restart_after_death(rec: dict, returncode) -> None:
                 game_identity=rec.get('identity') or {},
                 metadata={'restart_of': old_run_id, 'restart_count': n})
             client, prep = _libobs_start_client(
-                new_out, client_pid=int(cfg['client_pid']), audio_raw=Path(cfg['audio_raw']),
+                new_out, client_pid=int(cfg['client_pid']),
+                audio_raw=Path(cfg['audio_raw']) if cfg.get('audio_raw') and not cfg.get('audio_framed') else None,
+                audio_framed=Path(cfg['audio_framed']) if cfg.get('audio_framed') else None,
+                audio_framed_live=bool(cfg.get('audio_framed_live')),
                 max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0),
                 overlay_path=Path(cfg['overlay_path']) if cfg.get('overlay_path') else None)
             m.transition_run('recording')
@@ -6418,8 +6444,12 @@ def _active_recording_info() -> dict | None:
 
 def _recording_start_libobs(fps: int, height: int, crf: int,
                             rollover_seconds: float, max_segment_gb: float = 1.5,
-                            audio_framed: str = "") -> dict:
+                            audio_framed: str = "", audio_framed_live: bool = False) -> dict:
     """Start the native libobs IPC recorder (experimental S3b path)."""
+    if int(fps) != 60 or int(height) != 1080 or float(crf) != 10.0:
+        return {'ok': False, 'error': 'unsupported_native_recording_parameters',
+                'fps': int(fps), 'height': int(height), 'crf': float(crf),
+                'supported': {'fps': 60, 'height': 1080, 'crf': 10}}
     exe = _obs_recorder_exe()
     if not exe.exists():
         return {'ok': False, 'error': 'obs_recorder_missing', 'path': str(exe)}
@@ -6429,6 +6459,18 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         return {'ok': False, 'error': 'no_owned_client', 'identity': identity}
     audio_raw = _dir() / 'game-audio.raw'
     framed_path = Path(audio_framed) if audio_framed else None
+    if framed_path is None:
+        # Default native path: use this session's a3capture file, never an
+        # arbitrary old file in the bridge directory.
+        try:
+            agent = _agent()
+            candidate = Path(agent.a3capture_file)
+            candidate_ready = Path(str(candidate) + '.ready')
+            if agent.audio_driver == 'a3capture' and candidate.exists() and candidate_ready.exists():
+                framed_path = candidate
+                audio_framed_live = True
+        except Exception:
+            pass
     if framed_path is not None and not framed_path.is_absolute():
         framed_path = _dir() / framed_path
     if framed_path is not None and not framed_path.exists():
@@ -6465,8 +6507,10 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         return {'ok': False, 'error': f'manifest_create: {type(exc).__name__}: {exc}'}
     try:
         client, prep = _libobs_start_client(
-            out, client_pid=int(client_pid), audio_raw=audio_raw,
+            out, client_pid=int(client_pid),
+            audio_raw=(audio_raw if framed_path is None else None),
             audio_framed=framed_path,
+            audio_framed_live=bool(audio_framed_live),
             max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
             max_size_mb=_size_cap_mb(max_segment_gb),
             overlay_path=overlay_path)
@@ -6488,6 +6532,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     config = {'fps': int(fps), 'height': int(height), 'crf': int(crf),
               'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
               'client_pid': int(client_pid), 'audio_raw': str(audio_raw),
+              'audio_framed': str(framed_path) if framed_path else '',
+              'audio_framed_live': bool(audio_framed_live),
               'max_time_sec': int(rollover_seconds) if rollover_seconds else 900,
               'max_size_mb': _size_cap_mb(max_segment_gb),
               'max_segment_gb': float(max_segment_gb),
@@ -6616,7 +6662,7 @@ def _probe_native_media(path: Path) -> dict:
     try:
         proc = subprocess.run(
             [ffprobe, '-v', 'error', '-show_entries',
-             'format=duration,size:stream=codec_type,codec_name,width,height,avg_frame_rate',
+             'format=duration,size:stream=codec_type,codec_name,width,height,avg_frame_rate,duration,start_time',
              '-of', 'json', str(path)],
             capture_output=True, text=True, timeout=20)
     except Exception as exc:  # noqa: BLE001
@@ -6642,6 +6688,8 @@ def _probe_native_media(path: Path) -> dict:
             'audio_codec': (audio or {}).get('codec_name'),
             'width': (video or {}).get('width'), 'height': (video or {}).get('height'),
             'fps': (video or {}).get('avg_frame_rate'), 'duration_s': duration,
+            'video_duration_s': float((video or {}).get('duration') or 0),
+            'audio_duration_s': float((audio or {}).get('duration') or 0),
             'bytes': size, 'error': None}
 
 
@@ -6797,7 +6845,7 @@ def _recording_stop_libobs() -> dict:
             sha = _sha256_file(path)
             item['sha256'] = sha
             item['audio'] = {'codec': probe.get('audio_codec'),
-                             'duration_s': probe.get('duration_s')}
+                             'duration_s': probe.get('audio_duration_s')}
             item['continuity'] = {'native_checks_ok': True}
             m.transition_segment(seg_id, 'validated', path=str(path), bytes=size, sha256=sha,
                                  validation=probe,
@@ -6821,32 +6869,50 @@ def _recording_stop_libobs() -> dict:
         d = _resolve_file(item, base_dir)
         return d
 
-    all_files = []
-    seen = set()
+    # Merge by path, with the newest/current validation taking precedence over
+    # an earlier unvalidated watchdog snapshot.
+    merged = {}
     for run in runs:
         base = Path(run.get('dir') or out)
         for item in run.get('files') or []:
-            norm = _norm_file(item, base)
+            norm = dict(_norm_file(item, base))
             key = norm.get('path') or norm.get('name')
-            if key and key not in seen:
-                seen.add(key)
-                all_files.append(norm)
+            if not key:
+                continue
+            norm.setdefault('state', 'unvalidated')
+            norm['run_dir'] = str(base)
+            norm['run_state'] = run.get('manifest_state')
+            merged[key] = norm
     for item in current_files:
-        key = item.get('path') or item.get('name')
-        if key and key not in seen:
-            seen.add(key)
-            all_files.append(item)
+        norm = dict(item)
+        key = norm.get('path') or norm.get('name')
+        if not key:
+            continue
+        norm.setdefault('state', 'unvalidated')
+        norm['run_dir'] = str(out)
+        norm['run_state'] = 'current'
+        merged[key] = norm
+    all_files = list(merged.values())
     runs.append({'dir': str(out), 'manifest': str(manifest_path),
                  'manifest_state': manifest_summary.get('state'),
                  'recording_run_id': manifest_summary.get('recording_run_id'),
                  'checks_ok': stop.get('checks_ok'), 'files': current_files})
     partial_runs = [r for r in runs
                     if r.get('manifest_state') in ('failed', 'partial', 'manifest_error')]
+    # A recorder death that was already recovered by the watchdog intentionally
+    # leaves the old run failed.  It is superseded evidence, not a failure of the
+    # current run.
+    superseded_failed_runs = [
+        r for r in partial_runs
+        if int(rec.get('restart_count') or 0) > 0
+        and Path(r.get('dir') or '') != Path(out)
+    ]
+    effective_partial_runs = [r for r in partial_runs if r not in superseded_failed_runs]
     all_oversized = [f for f in all_files if cap_bytes and int(f.get('bytes') or 0) > cap_bytes]
     audio_muxed = bool(current_files) and all(
         bool((f.get('validation') or {}).get('has_audio')) for f in current_files)
     checks_ok = (bool(stop.get('checks_ok')) and manifest_complete and
-                 not validation_errors and not all_oversized and not partial_runs)
+                 not validation_errors and not all_oversized and not effective_partial_runs)
     result = {'ok': checks_ok, 'backend': 'libobs',
               'dir': str(out), 'checks_ok': checks_ok,
               'native_checks_ok': stop.get('checks_ok'),
@@ -6854,6 +6920,7 @@ def _recording_stop_libobs() -> dict:
               'selftest': stop.get('selftest'),
               'manifest': stop.get('manifest'), 'status': status, 'native': stop,
               'segments': all_files, 'runs': runs, 'partial_runs': partial_runs,
+              'superseded_failed_runs': superseded_failed_runs,
               'audio_muxed': audio_muxed, 'recovered': False,
               'validation_errors': validation_errors,
               'segment_states': segment_states,
@@ -6910,7 +6977,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
                     backend: str = 'legacy',
                     max_segment_gb: float = 1.5,
-                    audio_framed: str = "") -> dict:
+                    audio_framed: str = "",
+                    audio_framed_live: bool = False) -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -6919,8 +6987,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     fps: target frame rate (default 60).  height: canvas height, 768 (1366x768) or
     1080 (1920x1080).  crf: x264 quality; 10 is visually near-lossless, 0 = lossless.
     Frames are streamed straight into the encoder - no intermediate files to clean up.
-    backend='legacy' uses the Python overlay recorder; backend='libobs' uses the native
-    libobs IPC experiment (auto-heros3-recorder.exe / obs-media-selftest.exe).
+    backend='legacy' is the default Python overlay recorder; backend='libobs' is the
+    native path and requires the private outputs module + live a3capture.
     """
     if backend not in ('legacy', 'libobs'):
         return {'ok': False, 'error': 'invalid_backend', 'backend': backend}
@@ -6931,7 +6999,7 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                 'hint': 'stop the existing recorder before starting another one'}
     if backend == 'libobs':
         return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds),
-                                           float(max_segment_gb), audio_framed)
+                                           float(max_segment_gb), audio_framed, audio_framed_live)
     if _RUNTIME.recorder.get('client') is not None:
         return {'ok': False, 'error': 'recording_active', 'backend': 'libobs'}
     import subprocess

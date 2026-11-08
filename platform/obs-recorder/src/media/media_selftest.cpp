@@ -259,10 +259,13 @@ struct Options {
     std::string audio_raw;            // empty => no raw audio source
     std::string audio_framed;         // A4 a3-audio/1 source (instead of raw)
     bool audio_framed_live = false;    // A4: follow a growing framed file
+    std::string outputs_module;          // private a3-obs-outputs.dll (test-only)
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
     bool fixed_audio = false;          // A4: obs_reset_audio2 fixed buffering
     bool mute_synthetic_audio = false; // A4 pulse test: keep synthetic video, mute its tone
     bool video_pulse = false;          // A4: white/black video pulse source
+    int av_origin_delay_ms = 0;        // test-only common future fence
+    bool allow_single_segment = false;  // A/V measurement: no rollover expected
 
     // S3a: persistent named-pipe IPC server (libobs stays initialized)
     bool serve = false;
@@ -372,6 +375,7 @@ struct State {
     // S2a raw-file audio source evidence
     bool audio_enabled = false;
     bool framed_audio_enabled = false;
+    uint64_t av_origin_ns = 0;
     obs_source_t* audio_source = nullptr;
     obs_source_t* panel_source = nullptr;
     std::string audio_applied_settings_json;
@@ -895,6 +899,15 @@ ModuleResult LoadOneModule(State& s, const char* file)
     ModuleResult mr;
     mr.file = file;
     mr.path = JoinPath(bin_dir, file);
+    if (strcmp(file, "obs-outputs.dll") == 0) {
+        const char* override = !s.opt.outputs_module.empty()
+                                   ? s.opt.outputs_module.c_str()
+                                   : std::getenv("AUTO_HEROS3_OUTPUTS_DLL");
+        if (override && *override) {
+            mr.path = override;
+            std::printf("MODULE %-20s override=%s\n", file, mr.path.c_str());
+        }
+    }
     // Module data directory convention: <data>/obs-plugins/<module-name>
     // (see libobs/obs-module.c make_data_directory()/make_data_dir()).
     std::string stem = file;
@@ -1185,8 +1198,13 @@ bool CreatePipeline(State& s, const std::string& first_file_path)
     a3::RegisterAvTestSource();
     AddStep(s, "register_test_source", true, "obs_register_source_s(a3_test_av_source)");
 
+    // Optional test-only common fence: sources must not advance before output is live.
+    s.av_origin_ns = os_gettime_ns() +
+                     static_cast<uint64_t>(std::max(0, s.opt.av_origin_delay_ms)) * 1000000ULL;
     obs_data_t* source_settings = obs_data_create();
     obs_data_set_bool(source_settings, "pulse_video", s.opt.video_pulse);
+    obs_data_set_int(source_settings, "replay_origin_ns",
+                     static_cast<long long>(s.av_origin_ns));
     s.source = obs_source_create("a3_test_av_source", "S1b In-Memory Test AV", source_settings, nullptr);
     obs_data_release(source_settings);
     AddStep(s, "create_test_source", s.source != nullptr, "async video (I420 1920x1080@60) + PCM audio");
@@ -1322,7 +1340,14 @@ bool CreateFramedAudioSource(State& s)
     obs_data_t* settings = obs_data_create();
     obs_data_set_string(settings, "path", s.opt.audio_framed.c_str());
     obs_data_set_bool(settings, "live", s.opt.audio_framed_live);
+    // There is no legal attach descriptor in this first batch: live must fail
+    // explicitly rather than seek/re-stamp at an arbitrary EOF.  Static replay
+    // starts at the capture origin.
     obs_data_set_bool(settings, "start_at_zero", true);
+    // The host owns the replay origin; the source core never samples wall time.
+    obs_data_set_int(settings, "replay_origin_ns",
+                     static_cast<long long>(s.av_origin_ns ? s.av_origin_ns
+                                                           : os_gettime_ns()));
     s.audio_source = obs_source_create("a3_framed_audio", "A4 Framed VCMI Audio", settings, nullptr);
     obs_data_release(settings);
     AddStep(s, "create_framed_audio_source", s.audio_source != nullptr,
@@ -1668,11 +1693,16 @@ bool StopOutput(State& s)
         if (s.framed_audio_enabled) {
             a3::StopFramedAudioSourceThread();
             s.framed_audio_stats = a3::GetFramedAudioStats();
-            AddStep(s, "framed_audio_after_stop", true,
-                    "packets=" + std::to_string(s.framed_audio_stats.packets) +
-                        " pushed=" + std::to_string(s.framed_audio_stats.pushed_packets) +
-                        " frames=" + std::to_string(s.framed_audio_stats.pushed_frames) +
+            AddStep(s, "framed_audio_after_stop",
+                    s.framed_audio_stats.validation_performed &&
+                        s.framed_audio_stats.stream_integrity_ok &&
+                        s.framed_audio_stats.error_code.empty(),
+                    "validated=" + std::to_string(s.framed_audio_stats.validated_packets) +
+                        " submitted=" + std::to_string(s.framed_audio_stats.submitted_packets) +
+                        " frames=" + std::to_string(s.framed_audio_stats.submitted_frames) +
                         " crc_errors=" + std::to_string(s.framed_audio_stats.crc_errors) +
+                        " error_code='" + s.framed_audio_stats.error_code + "'" +
+                        " error='" + s.framed_audio_stats.error + "'" +
                         " saw_last=" + std::to_string(s.framed_audio_stats.saw_last ? 1 : 0));
         }
         // Stop the raw-audio reader after the output drained (idempotent), then
@@ -1724,7 +1754,8 @@ bool StopOutput(State& s)
     }
 
     s.files = ListMp4Files(s.opt.out_dir);
-    AddStep(s, "split_files_ge_3", s.files.size() >= (s.opt.max_size_mb > 0 ? 1 : 3),
+    AddStep(s, "split_files_ge_3",
+            s.opt.allow_single_segment || s.files.size() >= (s.opt.max_size_mb > 0 ? 1 : 3),
             std::to_string(s.files.size()) + " mp4 file(s) in " + s.opt.out_dir);
     return true;
 }
@@ -1775,7 +1806,9 @@ void CollectFinalEvidence(State& s)
         const uint64_t expected_video_frames =
             static_cast<uint64_t>(s.opt.duration_ms) * 60ULL / 1000ULL;
         AddStep(s, "source_pushed_media",
-                stats.created && stats.video_frames_pushed >= expected_video_frames &&
+                stats.created &&
+                    (s.opt.allow_single_segment ||
+                     stats.video_frames_pushed >= expected_video_frames) &&
                     stats.audio_frames_pushed >= 40000,
                 "video_frames=" + std::to_string(stats.video_frames_pushed) +
                     " audio_chunks=" + std::to_string(stats.audio_chunks_pushed) +
@@ -1850,15 +1883,23 @@ void CollectFinalEvidence(State& s)
     if (s.framed_audio_enabled) {
         s.framed_audio_stats = a3::GetFramedAudioStats();
         AddStep(s, "framed_audio_consumed",
-                s.framed_audio_stats.opened && s.framed_audio_stats.pushed_frames > 0 &&
-                    s.framed_audio_stats.crc_errors == 0,
-                "packets=" + std::to_string(s.framed_audio_stats.packets) +
-                    " pushed_packets=" + std::to_string(s.framed_audio_stats.pushed_packets) +
-                    " pushed_frames=" + std::to_string(s.framed_audio_stats.pushed_frames) +
+                s.framed_audio_stats.opened && s.framed_audio_stats.submitted_frames > 0 &&
+                    s.framed_audio_stats.crc_errors == 0 &&
+                    s.framed_audio_stats.validation_performed &&
+                    s.framed_audio_stats.packet_integrity_ok &&
+                    s.framed_audio_stats.stream_integrity_ok &&
+                    s.framed_audio_stats.timeline_ok &&
+                    s.framed_audio_stats.error.empty() &&
+                    s.framed_audio_stats.submitted_gaps == 0,
+                "validated=" + std::to_string(s.framed_audio_stats.validated_packets) +
+                    " submitted=" + std::to_string(s.framed_audio_stats.submitted_packets) +
+                    " frames=" + std::to_string(s.framed_audio_stats.submitted_frames) +
                     " crc_errors=" + std::to_string(s.framed_audio_stats.crc_errors) +
                     " seq_gaps=" + std::to_string(s.framed_audio_stats.sequence_gaps) +
+                    " sample_gaps=" + std::to_string(s.framed_audio_stats.sample_gaps) +
                     " saw_first=" + std::to_string(s.framed_audio_stats.saw_first ? 1 : 0) +
                     " saw_last=" + std::to_string(s.framed_audio_stats.saw_last ? 1 : 0) +
+                    " error_code='" + s.framed_audio_stats.error_code + "'" +
                     " error='" + s.framed_audio_stats.error + "'");
         AddStep(s, "framed_audio_no_resampling", true,
                 "source reads packet sample_count and emits exactly that many frames");
@@ -2474,6 +2515,18 @@ bool GetStringArg(const IpcRequest& req, const char* key, std::string* out, bool
     return true;
 }
 
+bool GetBoolArg(const IpcRequest& req, const char* key, bool* out, bool* found,
+                std::string& err)
+{
+    bool f = false;
+    if (!json_extract_bool(req.raw, key, out, &f)) {
+        err = std::string("invalid \"") + key + "\" (boolean required)";
+        return false;
+    }
+    if (found) *found = f;
+    return true;
+}
+
 bool GetIntArg(const IpcRequest& req, const char* key, long long* out, bool* found,
                std::string& err)
 {
@@ -2547,6 +2600,43 @@ void WriteRawAudioStatsJson(JsonWriter& w, const a3::RawAudioStats& st, bool ena
     w.end_object();
 }
 
+void WriteFramedAudioStatsJson(JsonWriter& w, const a3::FramedAudioStats& st)
+{
+    w.begin_object();
+    w.key("mode"); w.value_string(st.mode);
+    w.key("path"); w.value_string(st.path);
+    w.key("opened"); w.value_bool(st.opened);
+    w.key("error_code"); w.value_string(st.error_code);
+    w.key("error"); w.value_string(st.error);
+    w.key("validation_performed"); w.value_bool(st.validation_performed);
+    w.key("packet_integrity_ok"); w.value_bool(st.packet_integrity_ok);
+    w.key("stream_integrity_ok"); w.value_bool(st.stream_integrity_ok);
+    w.key("timeline_ok"); w.value_bool(st.timeline_ok);
+    w.key("validated_packets"); w.value_uint(st.validated_packets);
+    w.key("validated_frames"); w.value_uint(st.validated_frames);
+    w.key("submitted_packets"); w.value_uint(st.submitted_packets);
+    w.key("submitted_frames"); w.value_uint(st.submitted_frames);
+    w.key("crc_errors"); w.value_uint(st.crc_errors);
+    w.key("sequence_gaps"); w.value_uint(st.sequence_gaps);
+    w.key("sample_gaps"); w.value_uint(st.sample_gaps);
+    w.key("sample_overlaps"); w.value_uint(st.sample_overlaps);
+    w.key("late_packets"); w.value_uint(st.late_packets);
+    w.key("max_packet_age_ns"); w.value_uint(st.max_packet_age_ns);
+    w.key("first_sample"); w.value_uint(st.first_sample);
+    w.key("validated_end_sample"); w.value_uint(st.validated_end_sample);
+    w.key("submitted_end_sample"); w.value_uint(st.submitted_end_sample);
+    w.key("pending_bytes"); w.value_uint(st.pending_bytes);
+    w.key("first_timestamp_ns"); w.value_uint(st.first_timestamp_ns);
+    w.key("last_timestamp_ns"); w.value_uint(st.last_timestamp_ns);
+    w.key("capture_id"); w.value_uint(st.capture_id);
+    w.key("generation"); w.value_uint(st.generation);
+    w.key("qpc_frequency"); w.value_uint(st.qpc_frequency);
+    w.key("capture_epoch_qpc"); w.value_uint(st.capture_epoch_qpc);
+    w.key("saw_first"); w.value_bool(st.saw_first);
+    w.key("saw_last"); w.value_bool(st.saw_last);
+    w.end_object();
+}
+
 void WriteSegmentsJson(JsonWriter& w, const std::vector<FileResult>& files)
 {
     w.begin_array();
@@ -2616,6 +2706,10 @@ void WriteManifest(State& s, ServeSession& sess)
     WriteWindowJson(w, s);
     w.key("raw_audio");
     WriteRawAudioStatsJson(w, s.audio_stats, s.audio_enabled);
+    if (s.framed_audio_enabled) {
+        w.key("framed_audio");
+        WriteFramedAudioStatsJson(w, s.framed_audio_stats);
+    }
     w.key("output");
     w.begin_object();
     w.key("total_bytes");
@@ -2805,6 +2899,21 @@ std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
         w.key("raw_audio");
         const a3::RawAudioStats stats = a3::GetRawAudioStats();
         WriteRawAudioStatsJson(w, stats, s.audio_enabled);
+        w.key("framed_audio");
+        w.begin_object();
+        const a3::FramedAudioStats framed = a3::GetFramedAudioStats();
+        w.key("enabled"); w.value_bool(s.framed_audio_enabled);
+        w.key("opened"); w.value_bool(framed.opened);
+        w.key("validated_packets"); w.value_uint(framed.validated_packets);
+        w.key("submitted_packets"); w.value_uint(framed.submitted_packets);
+        w.key("submitted_frames"); w.value_uint(framed.submitted_frames);
+        w.key("submitted_gaps"); w.value_uint(framed.submitted_gaps);
+        w.key("packet_integrity_ok"); w.value_bool(framed.packet_integrity_ok);
+        w.key("stream_integrity_ok"); w.value_bool(framed.stream_integrity_ok);
+        w.key("timeline_ok"); w.value_bool(framed.timeline_ok);
+        w.key("error_code"); w.value_string(framed.error_code);
+        w.key("error"); w.value_string(framed.error);
+        w.end_object();
         w.key("result");
         w.begin_object();
         w.key("available");
@@ -2851,6 +2960,9 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
         return ReplyError(sess, req, "invalid_args", err);
     std::string audio_framed;
     if (!GetStringArg(req, "audio_framed", &audio_framed, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    bool audio_framed_live = false;
+    if (!GetBoolArg(req, "audio_framed_live", &audio_framed_live, &found, err))
         return ReplyError(sess, req, "invalid_args", err);
     if (audio_raw.empty() && audio_framed.empty())
         return ReplyError(sess, req, "invalid_args",
@@ -2936,7 +3048,7 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     s.opt.out_dir = out_dir;
     s.opt.audio_raw = audio_raw;
     s.opt.audio_framed = audio_framed;
-    s.opt.audio_framed_live = !audio_framed.empty();
+    s.opt.audio_framed_live = audio_framed_live;
     s.opt.fixed_audio = !audio_framed.empty();
     s.opt.audio_start_zero = false; // live semantics: default EOF
     s.opt.window_title = title;
@@ -3468,10 +3580,13 @@ void PrintUsage()
                 "  --audio-raw PATH      also add native raw-file audio source (s16le/44100/2)\n"
 "  --audio-framed PATH   A4: add native a3-audio/1 framed timestamped source\n"
 "  --audio-framed-live   A4: follow growing framed file instead of one-shot\n"
+"  --outputs-module PATH private a3-obs-outputs.dll (test-only)\n"
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
 "  --fixed-audio         A4: obs_reset_audio2 fixed buffering (max 1000ms)\n"
 "  --mute-synthetic-audio  A4: keep synthetic video, mute synthetic tone\n"
 "  --video-pulse         A4: white/black video pulse aligned with audio pulse\n"
+"  --av-origin-delay-ms N test-only common future origin delay\n"
+"  --allow-single-segment  A/V measurement harness: no >=3 split assertion\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n  --max-size-mb N      size split threshold in MiB (0 disables; IPC allows 1..4096)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
@@ -3525,6 +3640,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.audio_framed = next("--audio-framed");
         } else if (a == "--audio-framed-live") {
             opt.audio_framed_live = true;
+        } else if (a == "--outputs-module") {
+            opt.outputs_module = next("--outputs-module");
         } else if (a == "--audio-start-zero") {
             opt.audio_start_zero = true;
         } else if (a == "--fixed-audio") {
@@ -3533,6 +3650,10 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.mute_synthetic_audio = true;
         } else if (a == "--video-pulse") {
             opt.video_pulse = true;
+        } else if (a == "--av-origin-delay-ms") {
+            opt.av_origin_delay_ms = std::atoi(next("--av-origin-delay-ms").c_str());
+        } else if (a == "--allow-single-segment") {
+            opt.allow_single_segment = true;
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
             opt.duration_explicit = true;
@@ -3612,7 +3733,7 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
         exit_code = 2;
         return false;
     }
-    if (opt.duration_ms < 1000 || opt.duration_ms > 120000) {
+    if (opt.duration_ms < 1000 || opt.duration_ms > 600000) {
         std::fprintf(stderr, "--duration-ms out of range\n");
         exit_code = 2;
         return false;

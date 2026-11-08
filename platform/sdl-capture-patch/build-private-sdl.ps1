@@ -185,6 +185,10 @@ $info = [ordered]@{
     generator = 'Ninja'
 }
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$lockJson.private_dll_sha256 = $hash
+$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
+$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
 Write-Host ('SDL2.dll -> {0} sha256={1}' -f (Join-Path $stage 'SDL2.dll'), $hash)
 
 # A2 smoke: explicitly load the private DLL, select a3capture, open one second
@@ -212,6 +216,10 @@ $info['framed_validation'] = if (Test-Path -LiteralPath $framedJson) { Get-Conte
 $info | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
 if ($smokeExit -ne 0 -or $framedExit -ne 0) {
     $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$lockJson.private_dll_sha256 = $hash
+$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
+$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
     throw "a3capture smoke failed (exit $smokeExit)"
 }
 
@@ -242,7 +250,7 @@ $env:A3CAPTURE_TEST_FAULT = '1'
 $env:A3CAPTURE_TEST_WORKER_DELAY_MS = '250'
 $faultRaw = Join-Path $stage 'a3capture-fault-queue.raw'
 $faultLog = Join-Path $stage 'a3capture-fault-queue.log'
-& $smoke (Join-Path $stage 'SDL2.dll') $faultRaw 3000 *> $faultLog
+& $smoke (Join-Path $stage 'SDL2.dll') $faultRaw 10000 *> $faultLog
 $queueExit = $LASTEXITCODE
 Remove-Item Env:A3CAPTURE_TEST_WORKER_DELAY_MS -ErrorAction SilentlyContinue
 $queueText = Get-Content -LiteralPath $faultLog -Raw
@@ -262,6 +270,10 @@ $info['short_fault_exit'] = $shortExit
 $info['short_fault_log'] = $shortLog
 $info['short_fault_counters'] = ($shortText -split "`r?`n" | Where-Object { $_ -match 'a3capture closing:' } | Select-Object -First 1)
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$lockJson.private_dll_sha256 = $hash
+$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
+$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
 
 if ($queueText -notmatch 'dropped=[1-9]' -or $queueText -notmatch 'failed=1' -or $queueExit -ne 0) {
     throw 'a3capture queue-overflow fault injection failed'
@@ -297,6 +309,10 @@ $closeText = Get-Content -LiteralPath $closeLog -Raw
 $info['close_timeout_fault_exit'] = $closeExit
 $info['close_timeout_fault_log'] = $closeLog
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
+$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+$lockJson.private_dll_sha256 = $hash
+$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
+$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
 if ($closeExit -ne 0 -or $closeText -notmatch 'close timeout') {
     throw 'a3capture close-timeout fault injection failed'
 }

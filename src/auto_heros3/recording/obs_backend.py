@@ -45,8 +45,10 @@ class ObsBackendError(RuntimeError):
 
 class ObsRecorder:
     def __init__(self, exe: Path, pipe_name: str | None = None,
-                 obs_dir: Path | None = None, log_path: Path | None = None):
+                 obs_dir: Path | None = None, log_path: Path | None = None,
+                 *, outputs_module: Path | None = None):
         self.exe = Path(exe)
+        self.outputs_module = Path(outputs_module) if outputs_module else None
         self.pipe_name = pipe_name or f'auto-heros3-obs-{os.getpid()}-{uuid.uuid4().hex[:8]}'
         self.obs_dir = Path(obs_dir) if obs_dir else Path(r'C:\Program Files\obs-studio')
         self.log_path = Path(log_path) if log_path else None
@@ -108,6 +110,8 @@ class ObsRecorder:
         log = self.log_path.open('w', encoding='utf-8') if self.log_path else subprocess.DEVNULL
         cmd = [str(self.exe), '--serve', '--pipe', self.pipe_name,
                '--obs-dir', str(self.obs_dir)]
+        if self.outputs_module:
+            cmd += ['--outputs-module', str(self.outputs_module)]
         base_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
         breakaway = getattr(subprocess, 'CREATE_BREAKAWAY_FROM_JOB', 0)
         # The MCP host may run inside a kill-on-close job (shell/service supervision).
@@ -238,6 +242,7 @@ class ObsRecorder:
                 window_title: str | None = None, window_class: str | None = None,
                 window_exe: str | None = None, audio_raw: Path | None = None,
                 audio_framed: Path | None = None,
+                audio_framed_live: bool = False,
                 max_time_sec: int = 900, max_size_mb: int = 0,
                 overlay_path: Path | None = None,
                 duration_ms: int = 0) -> dict:
@@ -258,6 +263,7 @@ class ObsRecorder:
             args['audio_raw'] = str(audio_raw)
         if audio_framed:
             args['audio_framed'] = str(audio_framed)
+            args['audio_framed_live'] = bool(audio_framed_live)
         return self.request('prepare', timeout=30.0, **args)
 
     def start_recording(self, timeout: float = 30.0) -> dict:

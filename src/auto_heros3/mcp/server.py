@@ -6546,6 +6546,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
                 'config': config, 'identity': identity, 'active': True,
                 'restart_count': 0, 'stop_requested': False,
                 'watchdog_stop': threading.Event(), 'restart_lock': threading.Lock(),
+              'stop_lock': threading.Lock(), 'last_stop_result': None,
                 'runs': [_libobs_run_snapshot(out, 'recording') |
                          {'recording_run_id': recording_run_id}]})
     _atomic_write_json(_recording_state_path(),
@@ -7123,6 +7124,23 @@ def recording_stop() -> dict:
     of failing, so a long recording is never orphaned.
     """
     if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
+        rec = _RUNTIME.recorder
+        lock = rec.get('stop_lock')
+        if lock is not None:
+            if not lock.acquire(blocking=False):
+                # A concurrent stop owns the teardown.  Wait for its result and
+                # return the same idempotent answer instead of touching a
+                # half-closed IPC client.
+                if lock.acquire(timeout=30.0):
+                    lock.release()
+                return rec.get('last_stop_result') or {
+                    'ok': False, 'backend': 'libobs', 'error': 'stop_in_progress'}
+            try:
+                result = _recording_stop_libobs()
+                rec['last_stop_result'] = result
+                return result
+            finally:
+                lock.release()
         return _recording_stop_libobs()
     record = _read_recording_state()
     if record.get('backend') == 'libobs':

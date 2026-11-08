@@ -1894,6 +1894,8 @@ void CollectFinalEvidence(State& s)
                 "validated=" + std::to_string(s.framed_audio_stats.validated_packets) +
                     " submitted=" + std::to_string(s.framed_audio_stats.submitted_packets) +
                     " frames=" + std::to_string(s.framed_audio_stats.submitted_frames) +
+                    " samples=" + std::to_string(s.framed_audio_stats.submitted_start_sample) +
+                    ".." + std::to_string(s.framed_audio_stats.submitted_end_sample) +
                     " crc_errors=" + std::to_string(s.framed_audio_stats.crc_errors) +
                     " seq_gaps=" + std::to_string(s.framed_audio_stats.sequence_gaps) +
                     " sample_gaps=" + std::to_string(s.framed_audio_stats.sample_gaps) +
@@ -2907,6 +2909,13 @@ std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
         w.key("validated_packets"); w.value_uint(framed.validated_packets);
         w.key("submitted_packets"); w.value_uint(framed.submitted_packets);
         w.key("submitted_frames"); w.value_uint(framed.submitted_frames);
+        w.key("submitted_start_sample"); w.value_uint(framed.submitted_start_sample);
+        w.key("submitted_end_sample"); w.value_uint(framed.submitted_end_sample);
+        w.key("first_sample"); w.value_uint(framed.first_sample);
+        w.key("validated_end_sample"); w.value_uint(framed.validated_end_sample);
+        w.key("late_packets"); w.value_uint(framed.late_packets);
+        w.key("max_packet_age_ns"); w.value_uint(framed.max_packet_age_ns);
+        w.key("preroll_skipped_packets"); w.value_uint(framed.preroll_skipped_packets);
         w.key("submitted_gaps"); w.value_uint(framed.submitted_gaps);
         w.key("packet_integrity_ok"); w.value_bool(framed.packet_integrity_ok);
         w.key("stream_integrity_ok"); w.value_bool(framed.stream_integrity_ok);

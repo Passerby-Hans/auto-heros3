@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include "audio_delivery_policy.hpp"
 
 namespace a3 {
 
@@ -14,7 +15,7 @@ struct FramedAudioConfig {
     bool live = false;
     bool start_at_zero = true;
     uint64_t replay_origin_ns = 0;
-    uint64_t late_budget_ns = 500000000ULL;
+    uint64_t late_budget_ns = audio::kDefaultLateBudgetNs;
 };
 
 struct FramedAudioStats {
@@ -43,6 +44,9 @@ struct FramedAudioStats {
     uint64_t max_packet_age_ns = 0;
     uint64_t first_timestamp_ns = 0;
     uint64_t last_timestamp_ns = 0;
+    // Half-open end of the last submitted packet, unlike last_timestamp_ns
+    // which is the packet's start.  Neither proves encoder/output completion.
+    uint64_t submitted_end_timestamp_ns = 0;
     uint64_t capture_id = 0;
     uint32_t generation = 0;
     uint64_t first_sample = 0;

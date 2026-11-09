@@ -3,11 +3,15 @@ param(
     [string]$RepoRoot = '',
     [string]$SdlDir = '',
     [string]$BuildDir = '',
-    [string]$ObsDir = ''
+    [string]$ObsDir = '',
+    [string]$ExpectedCommit = '',
+    [switch]$RequireClean,
+    [switch]$SkipSmoke
 )
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $scriptDir '..\..')).Path }
+. (Join-Path $RepoRoot 'platform/obs-recorder/scripts/build-provenance.ps1')
 if (-not $SdlDir) { $SdlDir = Join-Path $RepoRoot 'vendor\sdl-2.32.10' }
 if (-not $BuildDir) { $BuildDir = Join-Path $scriptDir 'build' }
 $SdlDir = (Resolve-Path $SdlDir).Path
@@ -37,7 +41,8 @@ $patchFiles = @(
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.c'),
     (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.h')
 )
-$patchConcat = ($patchFiles | ForEach-Object { (Get-Content -LiteralPath $_ -Raw) }) -join "`n---A3PATCH---`n"
+# Recipe hashes are independent of Git's Windows autocrlf checkout conversion.
+$patchConcat = ($patchFiles | ForEach-Object { (Get-Content -LiteralPath $_ -Raw).Replace("`r`n", "`n") }) -join "`n---A3PATCH---`n"
 $patchHash = [System.BitConverter]::ToString(
     [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($patchConcat))
 ).Replace('-', '').ToLowerInvariant()
@@ -145,9 +150,19 @@ $configure = @(
     '-DSDL_A3CAPTUREAUDIO=ON',
     '-DSDL_WERROR=OFF'
 )
+$cl = (Get-Command cl.exe -ErrorAction Stop | Select-Object -First 1).Source
+$inputPaths = @(Get-A3TrackedInputs $RepoRoot @('platform/sdl-capture-patch', 'platform/audio-protocol', 'platform/obs-recorder/src/audio', 'platform/obs-recorder/scripts/build-provenance.ps1')) + @(
+    $archive, (Join-Path $SdlDir 'src'), (Join-Path $SdlDir 'include'),
+    (Join-Path $SdlDir 'cmake'), (Join-Path $SdlDir 'CMakeLists.txt'))
+$provenance = Start-A3BuildProvenance -Root $RepoRoot -Component 'sdl-a3capture' `
+    -RecordDir (Join-Path $BuildDir 'provenance') -Inputs $inputPaths -Tools @($vcvars, $cl, $cmake, $ninja) `
+    -ExpectedCommit $ExpectedCommit -RequireClean:$RequireClean `
+    -Configuration @{ configure_args = $configure; source_tag = $lock.source_tag; source_archive_sha256 = $archiveHash; patch_sha256 = $patchHash; clean_first = [bool]$RequireClean }
 & $cmake @configure
 if ($LASTEXITCODE -ne 0) { throw 'SDL configure failed' }
-& $cmake --build $BuildDir --target SDL2 --config Release
+$buildArgs = @('--build', $BuildDir, '--target', 'SDL2', '--config', 'Release')
+if ($RequireClean) { $buildArgs += '--clean-first' }
+& $cmake @buildArgs
 if ($LASTEXITCODE -ne 0) { throw 'SDL build failed' }
 
 $dll = Get-ChildItem -Path $BuildDir -Filter 'SDL2.dll' -Recurse | Select-Object -First 1
@@ -158,21 +173,25 @@ Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $stage 'SDL2.dll') 
 $hash = (Get-FileHash -LiteralPath (Join-Path $stage 'SDL2.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $cl) { throw 'cl.exe not available for a3capture smoke' }
-$sourceCommit = ''
-$sourceDirty = $null
-try {
-    $sourceCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null | Out-String).Trim()
-    $sourceDirty = [bool]((& git -C $RepoRoot status --porcelain 2>$null | Out-String).Trim())
-} catch { }
+$smoke = Join-Path $stage 'a3capture-smoke.exe'
+& cl.exe /nologo /W3 /O2 /Fo:"$stage\a3capture_smoke.obj" /Fe:"$smoke" (Join-Path $scriptDir 'tests\a3capture_smoke.c')
+if ($LASTEXITCODE -ne 0) { throw 'a3capture smoke compile failed' }
+$completed = Complete-A3BuildProvenance $provenance @((Join-Path $stage 'SDL2.dll'), $smoke)
+$sourceCommit = $provenance.Record.source.commit
+$sourceDirty = $provenance.Record.source.dirty
 $info = [ordered]@{
     built_at_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     source_commit = $sourceCommit
     source_dirty = $sourceDirty
+    provenance = $completed.Path
+    provenance_sha256 = $completed.Sha256
+    smoke_status = 'not_run'
     source_dir = $SdlDir
     source_tag = 'release-2.32.10'
     source_sha256 = $archiveHash
     source_lock_verified = $true
     patch_sha256 = $patchHash
+    patch_hash_normalization = 'UTF-8 text; CRLF to LF per file; LF---A3PATCH---LF separator'
     patched_tree_sha256 = $patchedTreeHash
     output = (Join-Path $stage 'SDL2.dll')
     sha256 = $hash
@@ -185,19 +204,11 @@ $info = [ordered]@{
     generator = 'Ninja'
 }
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
-$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
-$lockJson.private_dll_sha256 = $hash
-$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
-$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
 Write-Host ('SDL2.dll -> {0} sha256={1}' -f (Join-Path $stage 'SDL2.dll'), $hash)
+if ($SkipSmoke) { return }
 
 # A2 smoke: explicitly load the private DLL, select a3capture, open one second
 # of s16/44100/stereo and verify the backend produced PCM without a device.
-$cl = (Get-Command cl.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-if (-not $cl) { throw 'cl.exe not available for a3capture smoke' }
-$smoke = Join-Path $stage 'a3capture-smoke.exe'
-& cl.exe /nologo /W3 /O2 /Fo:"$stage\a3capture_smoke.obj" /Fe:"$smoke" (Join-Path $scriptDir 'tests\a3capture_smoke.c')
-if ($LASTEXITCODE -ne 0) { throw 'a3capture smoke compile failed' }
 $raw = Join-Path $stage 'a3capture-smoke.raw'
 $smokeLog = Join-Path $stage 'a3capture-smoke.log'
 & $smoke (Join-Path $stage 'SDL2.dll') $raw *> $smokeLog
@@ -216,10 +227,6 @@ $info['framed_validation'] = if (Test-Path -LiteralPath $framedJson) { Get-Conte
 $info | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
 if ($smokeExit -ne 0 -or $framedExit -ne 0) {
     $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
-$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
-$lockJson.private_dll_sha256 = $hash
-$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
-$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
     throw "a3capture smoke failed (exit $smokeExit)"
 }
 
@@ -270,10 +277,6 @@ $info['short_fault_exit'] = $shortExit
 $info['short_fault_log'] = $shortLog
 $info['short_fault_counters'] = ($shortText -split "`r?`n" | Where-Object { $_ -match 'a3capture closing:' } | Select-Object -First 1)
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
-$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
-$lockJson.private_dll_sha256 = $hash
-$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
-$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
 
 if ($queueText -notmatch 'dropped=[1-9]' -or $queueText -notmatch 'failed=1' -or $queueExit -ne 0) {
     throw 'a3capture queue-overflow fault injection failed'
@@ -309,11 +312,9 @@ $closeText = Get-Content -LiteralPath $closeLog -Raw
 $info['close_timeout_fault_exit'] = $closeExit
 $info['close_timeout_fault_log'] = $closeLog
 $info | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8
-$lockJson = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
-$lockJson.private_dll_sha256 = $hash
-$lockJson.private_dll_bytes = (Get-Item -LiteralPath (Join-Path $stage 'SDL2.dll')).Length
-$lockJson | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $lockPath -Encoding UTF8
 if ($closeExit -ne 0 -or $closeText -notmatch 'close timeout') {
     throw 'a3capture close-timeout fault injection failed'
 }
 Write-Host 'A2.1 fault injection PASS (queue overflow + short write + no-thread + close timeout)'
+$info['smoke_status'] = 'passed'
+$info | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stage 'build.json') -Encoding UTF8

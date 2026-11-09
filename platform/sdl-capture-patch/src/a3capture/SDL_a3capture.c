@@ -1,13 +1,12 @@
 /*
  * a3capture: a private SDL2 audio backend for the auto-heros3 recorder.
  *
- * This is an experimental A2 spike, not the final A3 wire transport.
  * - no physical endpoint is opened;
  * - the SDL audio callback only copies into a bounded preallocated ring and
  *   signals a worker (no file/pipe/log/flush I/O in the callback);
  * - WaitDevice uses an absolute QPC deadline based on cumulative sample frames;
- * - the worker writes raw s16le/stereo PCM to A3CAPTURE_FILE for load/format
- *   verification.  Framed a3-audio/1 packets are the next step.
+ * - the worker writes a3-audio/1 framed s16le/stereo PCM to A3CAPTURE_FILE;
+ * - the ring is an archive buffer, not permission to submit stale live audio.
  */
 #include "../../SDL_internal.h"
 
@@ -88,12 +87,21 @@ struct SDL_PrivateAudioData
     Uint64 written_packets;
     Uint64 written_bytes;
     Uint64 queue_depth_max;
+    Uint64 slots_used_max;
     Uint64 write_latency_max_us;
     Uint64 write_latency_last_us;
+    Uint64 write_measurements;
+    Uint64 queue_wait_max_us;
+    Uint64 write_io_max_us;
+    Uint64 capture_to_write_max_us;
+    Uint64 latency_clock_errors;
     SDL_bool failed;
     SDL_bool closed;
     char write_error[128];
     Uint32 test_worker_delay_ms;
+    Uint32 test_worker_stall_once_ms;
+    Uint32 test_worker_stall_after_packets;
+    SDL_bool test_worker_stalled;
     Uint32 test_close_delay_ms;
     SDL_bool test_short_write;
     SDL_bool test_no_thread;
@@ -104,6 +112,49 @@ static int A3Deadline(const struct SDL_PrivateAudioData *h, Uint64 frame, Uint64
 {
     const a3_qpc_clock clock = {h->epoch_qpc, h->qpc_frequency, h->sample_rate};
     return a3_qpc_deadline(&clock, frame, out);
+}
+
+/* Worker observations only; callers hold h->lock.  Completion measures the
+ * header and entire payload write attempt, before reacquiring the mutex.
+ * Queue wait includes injected worker delay; write_io measures SDL_RWwrite
+ * itself.  A successful write means accepted by the OS, not durable fsync. */
+static void A3ObserveWriteLocked(struct SDL_PrivateAudioData *h, const A3Packet *packet,
+                                 Uint64 write_start, Uint64 write_end)
+{
+    Uint64 elapsed = 0, queue_wait = 0, write_io = 0, capture_age = 0;
+    if (!a3_qpc_elapsed_us(packet->enqueued_qpc, write_end, h->qpc_frequency, &elapsed) ||
+        !a3_qpc_elapsed_us(packet->enqueued_qpc, write_start, h->qpc_frequency, &queue_wait) ||
+        !a3_qpc_elapsed_us(write_start, write_end, h->qpc_frequency, &write_io) ||
+        !a3_qpc_elapsed_us(packet->header.planned_qpc, write_end, h->qpc_frequency, &capture_age)) {
+        ++h->latency_clock_errors;
+        return;
+    }
+    ++h->write_measurements;
+    h->write_latency_last_us = elapsed;
+    if (elapsed > h->write_latency_max_us) h->write_latency_max_us = elapsed;
+    if (queue_wait > h->queue_wait_max_us) h->queue_wait_max_us = queue_wait;
+    if (write_io > h->write_io_max_us) h->write_io_max_us = write_io;
+    if (capture_age > h->capture_to_write_max_us) h->capture_to_write_max_us = capture_age;
+}
+
+static void A3LogLatencyLocked(const struct SDL_PrivateAudioData *h, const char *phase)
+{
+    SDL_Log("a3capture latency: phase=%s measurements=%llu clock_errors=%llu "
+            "write_latency_last_us=%llu write_latency_max_us=%llu queue_wait_max_us=%llu "
+            "write_io_max_us=%llu capture_to_write_max_us=%llu queue_depth_max=%llu "
+            "slots_used_max=%llu queue_slots=%u capacity_frames=%llu capacity_us=%llu",
+            phase, (unsigned long long)h->write_measurements,
+            (unsigned long long)h->latency_clock_errors,
+            (unsigned long long)h->write_latency_last_us,
+            (unsigned long long)h->write_latency_max_us,
+            (unsigned long long)h->queue_wait_max_us,
+            (unsigned long long)h->write_io_max_us,
+            (unsigned long long)h->capture_to_write_max_us,
+            (unsigned long long)h->queue_depth_max,
+            (unsigned long long)h->slots_used_max, (unsigned)A3CAPTURE_QUEUE_SLOTS,
+            (unsigned long long)A3CAPTURE_QUEUE_SLOTS * h->samples_per_callback,
+            (unsigned long long)A3CAPTURE_QUEUE_SLOTS * h->samples_per_callback * 1000000ULL /
+                h->sample_rate);
 }
 
 /* Called with h->lock held.  The final header is written by the worker after
@@ -188,6 +239,7 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                             (unsigned long long)h->queue_depth_max,
                             (unsigned long long)h->write_latency_max_us,
                             h->failed ? 1 : 0);
+                    A3LogLatencyLocked(h, "final");
                 } else {
                     h->failed = SDL_TRUE;
                     SDL_snprintf(h->write_error, sizeof(h->write_error),
@@ -205,6 +257,11 @@ static DWORD WINAPI A3Worker(LPVOID arg)
         SDL_UnlockMutex(h->lock);
 
         if (packet) {
+            if (!h->test_worker_stalled && h->test_worker_stall_once_ms &&
+                h->written_packets >= h->test_worker_stall_after_packets) {
+                h->test_worker_stalled = SDL_TRUE;
+                SDL_Delay(h->test_worker_stall_once_ms);
+            }
             if (h->test_worker_delay_ms) {
                 SDL_Delay(h->test_worker_delay_ms);
             }
@@ -214,13 +271,16 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                 (h->test_short_write && payload > 1) ? payload - 1 : payload;
             size_t header_wrote = 0;
             size_t payload_wrote = 0;
+            const Uint64 write_start = SDL_GetPerformanceCounter();
             if (h->out) {
                 header_wrote = SDL_RWwrite(h->out, &packet->header, 1, header_len);
                 if (header_wrote == header_len && payload_write > 0) {
                     payload_wrote = SDL_RWwrite(h->out, packet->data, 1, payload_write);
                 }
             }
+            const Uint64 write_end = SDL_GetPerformanceCounter();
             SDL_LockMutex(h->lock);
+            A3ObserveWriteLocked(h, packet, write_start, write_end);
             if (header_wrote == header_len && payload_wrote == payload) {
                 ++h->written_packets;
                 h->written_bytes += header_len + payload;
@@ -301,6 +361,8 @@ static void A3CAPTURE_PlayDevice(_THIS)
     }
     if (h->free_count > 0) {
         packet = h->free_slots[--h->free_count];
+        const Uint64 slots_used = A3CAPTURE_QUEUE_SLOTS - h->free_count;
+        if (slots_used > h->slots_used_max) h->slots_used_max = slots_used;
     } else {
         ++h->overflow_events;
         if (h->pending_discontinuity_count == 0) {
@@ -406,6 +468,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
             (unsigned long long)h->queue_depth_max,
             (unsigned long long)h->write_latency_max_us,
             h->failed ? 1 : 0, h->write_error);
+    A3LogLatencyLocked(h, "closing");
     SDL_UnlockMutex(h->lock);
     if (h->worker) {
         const DWORD wait = WaitForSingleObject(h->worker, 5000);
@@ -437,6 +500,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
             (unsigned long long)h->queue_depth_max,
             (unsigned long long)h->write_latency_max_us,
             h->failed ? 1 : 0, h->write_error);
+    A3LogLatencyLocked(h, "closed");
     SDL_DestroyCond(h->cond);
     SDL_DestroyMutex(h->lock);
     SDL_free(h->mixbuf);
@@ -569,6 +633,10 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     }
     const char *test_delay = SDL_getenv("A3CAPTURE_TEST_WORKER_DELAY_MS");
     h->test_worker_delay_ms = test_delay ? (Uint32)SDL_atoi(test_delay) : 0;
+    const char *stall_once = SDL_getenv("A3CAPTURE_TEST_WORKER_STALL_ONCE_MS");
+    h->test_worker_stall_once_ms = stall_once ? (Uint32)SDL_atoi(stall_once) : 0;
+    const char *stall_after = SDL_getenv("A3CAPTURE_TEST_WORKER_STALL_AFTER_PACKETS");
+    h->test_worker_stall_after_packets = stall_after ? (Uint32)SDL_atoi(stall_after) : 1;
     const char *close_delay = SDL_getenv("A3CAPTURE_TEST_CLOSE_DELAY_MS");
     h->test_close_delay_ms = close_delay ? (Uint32)SDL_atoi(close_delay) : 0;
     h->test_short_write = SDL_getenv("A3CAPTURE_TEST_SHORT_WRITE") ? SDL_TRUE : SDL_FALSE;
@@ -665,7 +733,6 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     SDL_Log("a3capture opened: file='%s' format=s16le rate=%u ch=%u samples=%u qpc_freq=%llu",
             path, h->sample_rate, _this->spec.channels, h->samples_per_callback,
             (unsigned long long)h->qpc_frequency);
-    /* A2 does not yet emit framed a3-audio/1 packets. */
     return 0;
 }
 

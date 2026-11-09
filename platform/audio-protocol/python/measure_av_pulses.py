@@ -4,13 +4,14 @@
 For each clip:
   - read stream start_time with ffprobe (edit lists included);
   - decode video to grayscale 60fps and audio to 44.1k mono;
-  - detect the first white frame and first audible 10ms window;
-  - add each stream's presentation start_time before comparing.
+  - detect every white-frame run and audible pulse onset;
+  - use native video presentation PTS and the decoded audio sample grid.
 delta = video_onset - audio_onset (positive: video later).
 """
 from __future__ import annotations
 import argparse
 import json
+import math
 import subprocess
 import tempfile
 import wave
@@ -72,9 +73,12 @@ def measure(mp4: Path) -> dict:
         img = np.fromfile(gray, dtype=np.uint8)
         n = len(img) // (160 * 90)
         mean = img.reshape(n, 90, 160).mean(axis=(1, 2)) / 255
-        if len(video_pts) < n:
-            video_pts += [video_pts[-1] + 1.0 / 60.0] * (n - len(video_pts))
-        video_pts = video_pts[:n]
+        if len(video_pts) != n:
+            raise ValueError(f"presentation_pts_count_mismatch: pts={len(video_pts)} frames={n}")
+        if not all(math.isfinite(value) for value in video_pts):
+            raise ValueError("non_finite_video_presentation_pts")
+        if any(b <= a for a, b in zip(video_pts, video_pts[1:])):
+            raise ValueError("non_monotonic_video_presentation_pts")
         # Detect pulse runs on the native presentation PTS grid; the previous
         # fps=60 filter invented a new time grid and shifted later events.
         gray_on = mean > 0.5
@@ -89,7 +93,7 @@ def measure(mp4: Path) -> dict:
         if start_i is not None:
             runs.append(start_i)
         video_events = [video_pts[i] for i in runs]
-    video_events = [v + starts.get("video", 0.0) for v in video_events]
+    # ffprobe frame PTS already includes the stream presentation start.
     audio_events = [a + starts.get("audio", 0.0) for a in audio_events]
     pair_count = min(len(video_events), len(audio_events))
     event_deltas = [round((video_events[i] - audio_events[i]) * 1000, 3)
@@ -119,21 +123,12 @@ def main() -> int:
     if a.json:
         Path(a.json).write_text(json.dumps(results, indent=2), encoding="utf-8")
     bad = []
-    for i, r in enumerate(results):
-        both_none = r["video_event_count"] == 0 and r["audio_event_count"] == 0
-        tail_ok = i == len(results) - 1 and both_none
-        if both_none and not tail_ok:
+    for r in results:
+        # A pulse fixture has an explicit event contract.  Missing/mismatched
+        # events cannot be waived just because this happens to be the last file.
+        if (r["video_event_count"] != r["audio_event_count"] or
+                not r["pass_20ms"]):
             bad.append(r)
-        else:
-            count_mismatch = r["video_event_count"] != r["audio_event_count"]
-            tail_audio_extra = (
-                i == len(results) - 1 and
-                r["audio_event_count"] == r["video_event_count"] + 1)
-            if count_mismatch and not tail_audio_extra:
-                bad.append(r)
-            # Always check paired events, including the final segment.
-            if any(abs(v) > 20.0 for v in r["event_deltas"]):
-                bad.append(r)
     if not results:
         bad = [{"clip": "<empty>", "error": "no clips"}]
     return 0 if not bad else 1

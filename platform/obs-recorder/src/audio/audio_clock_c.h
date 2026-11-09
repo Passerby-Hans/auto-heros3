@@ -26,6 +26,12 @@ int a3_qpc_deadline(const a3_qpc_clock *clock, uint64_t frame, uint64_t *out_dea
 /* Signed remaining ticks; returns INT64_MIN on invalid/overflow. */
 int64_t a3_qpc_remaining(const a3_qpc_clock *clock, uint64_t now_qpc, uint64_t frame);
 
+/* Measured elapsed QPC ticks, rounded up to microseconds.  A nonzero measured
+ * interval never appears as an unobserved zero.  Reject backwards/invalid
+ * clocks and overflow rather than publishing a fabricated duration. */
+int a3_qpc_elapsed_us(uint64_t start_qpc, uint64_t end_qpc,
+                      uint64_t qpc_frequency, uint64_t *out_us);
+
 #ifdef __cplusplus
 }
 #endif

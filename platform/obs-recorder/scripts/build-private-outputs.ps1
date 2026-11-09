@@ -1,9 +1,11 @@
 # Build the private test-only a3 obs-outputs module.
 # Requires: OBS headers in vendor/obs-studio, platform/obs-recorder/build-media/sdk/obs.lib,
-# and the staged private SDL2 build.  The output is loaded only when
-# AUTO_HEROS3_OUTPUTS_DLL points at it.
+# The recorder resolves this private module; it never replaces installed OBS.
+[CmdletBinding()]
+param([string]$ExpectedCommit = '', [switch]$RequireClean)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+. (Join-Path $PSScriptRoot 'build-provenance.ps1')
 $src = Join-Path $root 'platform\obs-recorder\custom-output'
 $out = Join-Path $root 'platform\obs-recorder\bin'
 $work = Join-Path $root 'platform\obs-recorder\build-media\a3outputs'
@@ -16,6 +18,26 @@ if (-not (Test-Path -LiteralPath $vcvars)) {
   $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
   $vcvars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
 }
+# Drain the child before selecting its first line. Select-Object -First 1 in
+# the native pipeline can stop it early and leave LASTEXITCODE unset.
+$clOutput = @(& cmd.exe /d /c "call `"$vcvars`" >nul && where cl.exe" 2>&1)
+$clExit = $LASTEXITCODE
+$clPath = $clOutput | ForEach-Object { "$_".Trim() } |
+    Where-Object { $_ -match '[\\/]cl\.exe$' -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if ($clExit -ne 0 -or -not $clPath) { throw "Cannot identify cl.exe (exit=$clExit): $($clOutput -join ' ')" }
+$inputPaths = @(Get-A3TrackedInputs $root @('platform/obs-recorder', 'platform/audio-protocol')) + @(
+  $src, $obs, (Join-Path $root 'platform/obs-recorder/build-media/sdk/obsconfig.h'),
+  (Join-Path $root 'vendor/obs-studio/libobs'),
+  (Join-Path $root 'vendor/obs-studio/plugins/obs-outputs'),
+  (Join-Path $root 'vendor/obs-studio/shared/bpm'),
+  (Join-Path $root 'vendor/obs-studio/shared/opts-parser'),
+  (Join-Path $root 'vendor/obs-studio/deps/w32-pthreads'),
+  (Join-Path $root 'vendor/obs-studio/deps/libcaption'))
+$provenance = Start-A3BuildProvenance -Root $root -Component 'a3-obs-outputs' `
+  -RecordDir (Join-Path $out 'provenance') -Inputs $inputPaths `
+  -VendorRoots @((Join-Path $root 'vendor/obs-studio')) -Tools @($vcvars, $clPath) `
+  -ExpectedCommit $ExpectedCommit -RequireClean:$RequireClean `
+  -Configuration @{ compiler_flags = '/LD /MD /W3'; platform = 'x64'; obs_version = '32.1.0' }
 $def = Join-Path $work 'w32p.def'
 @"
 LIBRARY w32-pthreads.dll
@@ -60,17 +82,20 @@ if ($LASTEXITCODE -ne 0) { throw 'private outputs build failed' }
 Write-Host ('PASS ' + (Join-Path $out 'a3-obs-outputs.dll'))
 
 $dll = Join-Path $out 'a3-obs-outputs.dll'
+$completed = Complete-A3BuildProvenance $provenance @($dll)
 $manifest = [ordered]@{
-    built_at_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    built_at_utc = $completed.Record.finished_at_utc
     dll = $dll
     sha256 = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant()
     bytes = (Get-Item -LiteralPath $dll).Length
     obs_lib = $obs
     obs_lib_sha256 = (Get-FileHash -LiteralPath $obs -Algorithm SHA256).Hash.ToLowerInvariant()
-    compiler = $vcvars
+    compiler = $clPath
     sources = $sources
     source_root = $root
-    source_commit = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
-    source_dirty = [bool]((& git -C $root status --porcelain 2>$null | Out-String).Trim())
+    source_commit = $provenance.Record.source.commit
+    source_dirty = $provenance.Record.source.dirty
+    provenance = $completed.Path
+    provenance_sha256 = $completed.Sha256
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'a3-obs-outputs.build.json') -Encoding UTF8

@@ -6551,19 +6551,20 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
               'max_size_mb': _size_cap_mb(max_segment_gb),
               'max_segment_gb': float(max_segment_gb),
               'overlay_path': str(overlay_path)}
-    rec = _RUNTIME.recorder
-    rec.clear()
-    rec.update({'proc': client.proc, 'dir': out, 'started': time.time(),
+    # A run owns its dictionary and locks for its entire lifetime. Old stop
+    # waiters/watchdogs must never observe a later run through clear()/update().
+    rec = {'proc': client.proc, 'dir': out, 'started': time.time(),
                 'backend': 'libobs', 'client': client,
                 'manifest': manifest_dir / 'manifest.json',
                 'recording_run_id': recording_run_id,
                 'config': config, 'identity': identity, 'active': True,
                 'restart_count': 0, 'stop_requested': False,
                 'watchdog_stop': threading.Event(), 'restart_lock': threading.Lock(),
-              'stop_lock': threading.Lock(), 'last_stop_result': None,
+                'stop_lock': threading.Lock(), 'last_stop_result': None,
                 'last_stop_token': None, 'run_token': uuid.uuid4().hex,
                 'runs': [_libobs_run_snapshot(out, 'recording') |
-                         {'recording_run_id': recording_run_id}]})
+                          {'recording_run_id': recording_run_id}]}
+    _RUNTIME.recorder = rec
     _atomic_write_json(_recording_state_path(),
                        {'pid': client.pid, 'dir': str(out),
                         'started': time.time(), 'backend': 'libobs', 'identity': identity,
@@ -6708,8 +6709,8 @@ def _probe_native_media(path: Path) -> dict:
             'bytes': size, 'error': None}
 
 
-def _recording_stop_libobs() -> dict:
-    rec = _RUNTIME.recorder
+def _recording_stop_libobs(rec: dict | None = None) -> dict:
+    rec = _RUNTIME.recorder if rec is None else rec
     rec['stop_requested'] = True
     stop_event = rec.get('watchdog_stop')
     if stop_event is not None:
@@ -6724,7 +6725,8 @@ def _recording_stop_libobs() -> dict:
     if restart_lock is not None:
         if not restart_lock.acquire(timeout=5.0):
             return {'ok': False, 'backend': 'libobs', 'partial': True,
-                    'error': 'restart_lock_timeout', 'dir': str(rec.get('dir') or '')}
+                    'error': 'restart_lock_timeout', 'retryable': True,
+                    'dir': str(rec.get('dir') or '')}
     # The watchdog may have restarted while this stop was waiting; only now is the
     # current client/output pair stable.  Never operate on the pre-lock snapshot.
     client = rec.get('client')
@@ -6738,14 +6740,12 @@ def _recording_stop_libobs() -> dict:
             except RuntimeError:
                 pass
         return {'ok': False, 'backend': 'libobs', 'partial': True,
-                'error': 'recording_output_dir_missing'}
+                'error': 'recording_output_dir_missing', 'retryable': True}
     if client is None:
         if out:
             _libobs_mark_run_failed(Path(out), 'native_stop_without_client')
             runs.append(_libobs_run_snapshot(Path(out), 'failed') |
                         {'recording_run_id': rec.get('recording_run_id')})
-        _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
-                                  'active': False})
         try:
             _recording_state_path().unlink()
         except OSError:
@@ -6766,6 +6766,8 @@ def _recording_stop_libobs() -> dict:
                 _atomic_write_json(Path(out) / 'obs-result.json', result)
             except OSError:
                 pass
+        rec.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
+                    'active': False})
         return result
     try:
         status = client.status()
@@ -6786,13 +6788,13 @@ def _recording_stop_libobs() -> dict:
             _libobs_mark_run_failed(Path(out), f'native_stop_failed: {type(exc).__name__}: {exc}')
             runs.append(_libobs_run_snapshot(Path(out), 'failed') |
                         {'recording_run_id': rec.get('recording_run_id')})
-        _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
-                                  'active': False})
         try:
             _recording_state_path().unlink()
         except OSError:
             pass
         _release_recording_lock()
+        rec.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
+                    'active': False})
         return {'ok': False, 'backend': 'libobs', 'partial': True, 'dir': str(out),
                 'error': f'{type(exc).__name__}: {exc}', 'runs': runs,
                 'restart_count': int(rec.get('restart_count') or 0)}
@@ -6988,9 +6990,6 @@ def _recording_stop_libobs() -> dict:
     except (OSError, ValueError):
         result['tail'] = None
     result['segment'] = segment
-    _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
-                              'active': False, 'watchdog_stop': None,
-                              'watchdog': None, 'restart_lock': None, 'last_health': None})
     try:
         _recording_state_path().unlink()
     except OSError:
@@ -7000,6 +6999,11 @@ def _recording_stop_libobs() -> dict:
     except OSError:
         pass
     _release_recording_lock()
+    # Publish idle only after releasing this run's persistent state/lock, so a
+    # new start cannot have its files removed by this old stop's cleanup.
+    rec.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
+                'active': False, 'watchdog_stop': None,
+                'watchdog': None, 'restart_lock': None, 'last_health': None})
     return result
 
 
@@ -7099,7 +7103,7 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                             stdout=log, stderr=subprocess.STDOUT)
     started_at = time.time()
-    _RUNTIME.recorder.update({'proc': proc, 'dir': out, 'started': started_at})
+    _RUNTIME.recorder = {'proc': proc, 'dir': out, 'started': started_at}
     canvas_w = round(int(height) * 16 / 9)
     if canvas_w % 2:
         canvas_w += 1
@@ -7154,15 +7158,19 @@ def recording_stop() -> dict:
     state file exists, the recorder is stopped through its STOP file / process identity instead
     of failing, so a long recording is never orphaned.
     """
-    if _RUNTIME.recorder.get('client') is not None or _RUNTIME.recorder.get('backend') == 'libobs':
-        rec = _RUNTIME.recorder
+    rec = _RUNTIME.recorder
+    # The native run marker survives teardown until the next start. A caller
+    # arriving between cleanup and cache publication must still join stop_lock.
+    native_run = rec.get('run_token') is not None and rec.get('stop_lock') is not None
+    if rec.get('client') is not None or rec.get('backend') == 'libobs' or native_run:
         lock = rec.get('stop_lock')
         token = rec.get('run_token')
         if lock is not None:
             # Blocking serialization: the second request wakes only after the
             # first has stored its terminal result.
             if not lock.acquire(timeout=30.0):
-                return {'ok': False, 'backend': 'libobs', 'error': 'stop_in_progress'}
+                return {'ok': False, 'backend': 'libobs', 'error': 'stop_in_progress',
+                        'retryable': True}
             try:
                 # The first owner may already have completed while this request
                 # was waiting.  Never run teardown a second time on a closed client.
@@ -7171,13 +7179,16 @@ def recording_stop() -> dict:
                 if (rec.get('last_stop_token') == token and
                         rec.get('last_stop_result') is not None):
                     return rec['last_stop_result']
-                result = _recording_stop_libobs()
-                rec['last_stop_result'] = result
-                rec['last_stop_token'] = token
+                if _RUNTIME.recorder is not rec:
+                    return {'ok': False, 'backend': 'libobs', 'error': 'recording_run_changed'}
+                result = _recording_stop_libobs(rec)
+                if (not result.get('retryable') and rec.get('run_token') == token):
+                    rec['last_stop_result'] = result
+                    rec['last_stop_token'] = token
                 return result
             finally:
                 lock.release()
-        return _recording_stop_libobs()
+        return _recording_stop_libobs(rec)
     record = _read_recording_state()
     if record.get('backend') == 'libobs':
         return _libobs_recover_state(record)

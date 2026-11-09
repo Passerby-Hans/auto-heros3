@@ -18,7 +18,9 @@ param(
     [string]$RepoRoot = '',
     [string]$BuildDir = '',
     [string]$Config = 'Release',
-    [string]$ObsDir = 'C:\Program Files\obs-studio'
+    [string]$ObsDir = 'C:\Program Files\obs-studio',
+    [string]$ExpectedCommit = '',
+    [switch]$RequireClean
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,6 +87,7 @@ function Repair-NinjaShowIncludesPrefix([string]$Directory, [string]$Prefix) {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir 'build-provenance.ps1')
 $projectDir = (Resolve-Path (Join-Path $scriptDir '..')).Path
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $projectDir '..\..')).Path }
 if (-not $BuildDir) { $BuildDir = Join-Path $projectDir 'build-media' }
@@ -164,6 +167,19 @@ $sdkSummaryPath = Join-Path $sdkDir 'sdk_summary.json'
 if (-not (Test-Path -LiteralPath $sdkSummaryPath)) { Fail "SDK summary missing: $sdkSummaryPath" }
 $sdkSummary = Get-Content -LiteralPath $sdkSummaryPath -Raw | ConvertFrom-Json
 
+$inputPaths = @(Get-A3TrackedInputs $RepoRoot @('platform/obs-recorder', 'platform/audio-protocol')) + @(
+    (Join-Path $projectDir 'src'), (Join-Path $projectDir 'tests'),
+    $libobsHeaders, (Join-Path $sdkDir 'obs.lib'), (Join-Path $sdkDir 'obsconfig.h'),
+    (Join-Path $ObsDir 'obs-plugins/64bit/obs-ffmpeg.dll'),
+    (Join-Path $ObsDir 'obs-plugins/64bit/obs-x264.dll'),
+    (Join-Path $ObsDir 'obs-plugins/64bit/win-capture.dll')) +
+    @(Get-ChildItem -LiteralPath (Join-Path $ObsDir 'bin/64bit') -Filter '*.dll' | Select-Object -ExpandProperty FullName)
+$provenance = Start-A3BuildProvenance -Root $RepoRoot -Component 'native-recorder' `
+    -RecordDir (Join-Path $BuildDir 'provenance') -Inputs $inputPaths `
+    -VendorRoots @((Join-Path $RepoRoot 'vendor/obs-studio')) -Tools @($vcvars, $clPath, $cmake, $ninja) `
+    -ExpectedCommit $ExpectedCommit -RequireClean:$RequireClean `
+    -Configuration @{ config = $Config; generator = 'Ninja'; obs_version = '32.1.0'; clean_first = [bool]$RequireClean }
+
 # --- detect the localized /showIncludes prefix --------------------------------
 $probeSrc = Join-Path $BuildDir '_deps_probe.cpp'
 $probeObj = Join-Path $BuildDir '_deps_probe.obj'
@@ -225,7 +241,9 @@ if ($configureExit -eq 0) {
     $showIncludesPatched = Repair-NinjaShowIncludesPrefix $BuildDir $includePrefix
     Write-Host ("MSVC /showIncludes prefix patched in {0} Ninja file(s)" -f $showIncludesPatched)
     $buildArgs = @('--build', $BuildDir, '--target', 'obs-media-selftest',
-        'audio-core-tests', 'framed-core-tests', 'framed-source-smoke', '--config', $Config)
+        'audio-core-tests', 'framed-core-tests', 'framed-source-smoke',
+        'stop-policy-tests', '--config', $Config)
+    if ($RequireClean) { $buildArgs += '--clean-first' }
     $buildOutput = (& $cmake @buildArgs 2>&1 | Out-String)
     $buildExit = $LASTEXITCODE
     Write-Log (Join-Path $logsDir 'build.log') $buildOutput
@@ -234,20 +252,16 @@ if ($configureExit -eq 0) {
 
 $exePath = Join-Path (Join-Path $BuildDir 'bin') 'obs-media-selftest.exe'
 $exeExists = Test-Path -LiteralPath $exePath
-$sourceCommit = ''
-$sourceTree = ''
-$sourceDirty = $null
-try {
-    $sourceCommit = (& git -C $RepoRoot rev-parse HEAD 2>$null | Out-String).Trim()
-    $sourceTree = (& git -C $RepoRoot rev-parse 'HEAD^{tree}' 2>$null | Out-String).Trim()
-    $sourceDirty = [bool]((& git -C $RepoRoot status --porcelain 2>$null | Out-String).Trim())
-} catch { }
+$sourceCommit = $provenance.Record.source.commit
+$sourceTree = $provenance.Record.source.tree
+$sourceDirty = $provenance.Record.source.dirty
 $summary = [ordered]@{
     timestamp_utc        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     repo_root            = $RepoRoot
     source_commit        = $sourceCommit
     source_tree_hash     = $sourceTree
     source_dirty         = $sourceDirty
+    provenance_start     = $provenance.StartPath
     project_dir          = $projectDir
     build_dir            = $BuildDir
     obs_dir              = $ObsDir
@@ -291,4 +305,10 @@ Write-Host ("summary={0}" -f $summaryPath)
 if ($toolchainExit -ne 0 -or $sdkExit -ne 0 -or $configureExit -ne 0 -or $buildExit -ne 0 -or -not $exeExists) {
     exit 1
 }
+$artifacts = @(Get-ChildItem -LiteralPath (Join-Path $BuildDir 'bin') -File |
+    Where-Object { $_.Extension -in '.exe', '.dll' } | Select-Object -ExpandProperty FullName)
+$completed = Complete-A3BuildProvenance $provenance $artifacts
+$summary['provenance'] = $completed.Path
+$summary['provenance_sha256'] = $completed.Sha256
+$summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
 exit 0

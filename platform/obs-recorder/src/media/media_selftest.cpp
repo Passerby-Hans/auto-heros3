@@ -302,6 +302,26 @@ struct FileResult {
     uint64_t mtime_filetime = 0;
 };
 
+// The private output reports presentation coordinates after interleaving.  These
+// are deliberately separate from host/source monotonic-clock timestamps.
+struct OutputDrainState {
+    int64_t contract_version = 0;
+    int64_t stop_requested = 0;
+    int64_t fence_set = 0;
+    int64_t fence_usec = 0;
+    int64_t audio_end_usec = 0;
+    int64_t video_end_usec = 0;
+    int64_t complete = 0;
+    int64_t failed = 0;
+    int64_t audio_frame_size = 0;
+    int64_t audio_sample_rate = 0;
+    int64_t stop_error = 0;
+    int64_t stop_request_usec = 0;
+    int64_t keyframe_wait_usec = 0;
+    int64_t fence_capture_ns = 0;
+    int64_t fence_capture_valid = 0;
+};
+
 struct State {
     Options opt;
     std::vector<Step> steps;
@@ -386,6 +406,8 @@ struct State {
     float audio_source_volume = 0.0f;
     a3::RawAudioStats audio_stats;
     a3::FramedAudioStats framed_audio_stats;
+    a3::FramedAudioStats framed_audio_at_stop_request;
+    OutputDrainState output_drain;
 
     // exit code to use when a specific step fails (0 => stage default)
     int failure_exit_code = 0;
@@ -1095,7 +1117,7 @@ bool CreateEncodersAndOutput(State& s, const std::string& first_file_path)
     obs_data_set_int(vsettings, "keyint_sec", 1); // 1 s GOP => splits at keyframes
     obs_data_set_string(vsettings, "preset", "veryfast");
     obs_data_set_string(vsettings, "profile", "high");
-    obs_data_set_string(vsettings, "x264opts", "scenecut=0");
+    obs_data_set_string(vsettings, "x264opts", "scenecut=0 open-gop=0");
     s.video_encoder = obs_video_encoder_create("obs_x264", (prefix + " H264").c_str(), vsettings, nullptr);
     obs_data_release(vsettings);
     AddStep(s, "create_video_encoder", s.video_encoder != nullptr,
@@ -1649,8 +1671,7 @@ bool RecordForDuration(State& s)
     return true;
 }
 
-static bool QueryAudioOutputState(obs_output_t *output, int64_t *audio_end,
-                                 int64_t *video_target, int64_t *packets)
+static bool QueryOutputDrainState(obs_output_t *output, OutputDrainState& state)
 {
     if (!output) return false;
     proc_handler_t *ph = obs_output_get_proc_handler(output);
@@ -1659,10 +1680,25 @@ static bool QueryAudioOutputState(obs_output_t *output, int64_t *audio_end,
     if (!cd) return false;
     const bool called = proc_handler_call(ph, "get_a3_audio_state", cd);
     if (called) {
-        long long v = 0;
-        if (audio_end && calldata_get_int(cd, "audio_end_usec", &v)) *audio_end = v;
-        if (video_target && calldata_get_int(cd, "video_target_usec", &v)) *video_target = v;
-        if (packets && calldata_get_int(cd, "audio_packets", &v)) *packets = v;
+        auto read = [&](const char* name, int64_t& value) {
+            long long v = 0;
+            value = calldata_get_int(cd, name, &v) ? v : 0;
+        };
+        read("contract_version", state.contract_version);
+        read("stop_requested", state.stop_requested);
+        read("fence_set", state.fence_set);
+        read("fence_usec", state.fence_usec);
+        read("audio_end_usec", state.audio_end_usec);
+        read("video_end_usec", state.video_end_usec);
+        read("complete", state.complete);
+        read("failed", state.failed);
+        read("audio_frame_size", state.audio_frame_size);
+        read("audio_sample_rate", state.audio_sample_rate);
+        read("stop_error", state.stop_error);
+        read("stop_request_usec", state.stop_request_usec);
+        read("keyframe_wait_usec", state.keyframe_wait_usec);
+        read("fence_capture_ns", state.fence_capture_ns);
+        read("fence_capture_valid", state.fence_capture_valid);
     }
     calldata_destroy(cd);
     return called;
@@ -1674,48 +1710,14 @@ bool StopOutput(State& s)
         AddStep(s, "output_stop_request", false, "no output object");
         return false;
     }
-    s.total_frames_drawn_at_stop = obs_get_total_frames();
-    s.lagged_frames_at_stop = obs_get_lagged_frames();
-    s.output_total_bytes = obs_output_get_total_bytes(s.output);
-    s.output_total_frames = obs_output_get_total_frames(s.output);
-    s.output_frames_dropped = obs_output_get_frames_dropped(s.output);
-
-    // Let the framed source publish one more packet so the final AAC frame
-    // reaches the same stop target as the last video frame.  This is a
-    // source-driven drain, not a fixed sleep.
-    if (s.framed_audio_enabled) {
-        const uint64_t drain_deadline = os_gettime_ns() + 100000000ULL;
-        while (os_gettime_ns() < drain_deadline) {
-            const a3::FramedAudioStats st = a3::GetFramedAudioStats();
-            if (st.last_timestamp_ns > 0 &&
-                st.last_timestamp_ns + 5000000ULL >= os_gettime_ns())
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-    }
-    // Wait for the encoder-output audio packet, not merely the source
-    // timestamp.  The private output exposes its last submitted PTS through a
-    // proc handler so this is an observable readiness check.
-    int64_t audio_end = 0, video_target = 0, audio_packets = 0;
-    bool audio_ready = false;
-    const uint64_t audio_deadline = os_gettime_ns() + 200000000ULL;
-    while (os_gettime_ns() < audio_deadline) {
-        if (QueryAudioOutputState(s.output, &audio_end, &video_target, &audio_packets) &&
-            audio_end >= video_target) {
-            audio_ready = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    AddStep(s, "audio_encoder_output_ready", true,
-            std::string("ready=") + (audio_ready ? "1" : "0") +
-                " audio_end=" + std::to_string(audio_end) +
-                " video_target=" + std::to_string(video_target) +
-                " packets=" + std::to_string(audio_packets));
-    // ---- stop: mp4_output finalises the current segment on the next packet --
+    // Keep source, encoder and interleaver running until the output seals one
+    // immutable closed-GOP presentation fence.  Waiting on a growing video PTS
+    // before requesting stop cannot drain this pipeline.
     s.t_stop_request_ns = os_gettime_ns();
+    if (s.framed_audio_enabled)
+        s.framed_audio_at_stop_request = a3::GetFramedAudioStats();
     obs_output_stop(s.output);
-    AddStep(s, "output_stop_request", true, "obs_output_stop()");
+    AddStep(s, "output_stop_request", true, "obs_output_stop(): wait for closed-GOP/audio fence");
 
     const uint64_t stop_deadline = os_gettime_ns() + 10000000000ULL;
     while (os_gettime_ns() < stop_deadline) {
@@ -1730,10 +1732,28 @@ bool StopOutput(State& s)
         s.output_last_error = CurrentOutputLastError(s.output);
         AddStep(s, "output_stopped", false, "timeout waiting for output to stop");
         obs_output_force_stop(s.output);
+        QueryOutputDrainState(s.output, s.output_drain);
         return false;
     }
     AddStep(s, "output_stopped", true,
             "drain " + std::to_string((s.t_output_inactive_ns - s.t_stop_request_ns) / 1000000ULL) + " ms");
+    const bool drain_queried = QueryOutputDrainState(s.output, s.output_drain);
+    const auto& drain = s.output_drain;
+    AddStep(s, "output_presentation_fence",
+            drain_queried && drain.contract_version == 2 && drain.stop_requested &&
+                drain.fence_set && drain.complete && !drain.failed && !drain.stop_error &&
+                drain.audio_end_usec >= drain.fence_usec &&
+                std::llabs(drain.video_end_usec - drain.fence_usec) <= 1,
+            "fence_us=" + std::to_string(drain.fence_usec) +
+                " video_end_us=" + std::to_string(drain.video_end_usec) +
+                " audio_end_us=" + std::to_string(drain.audio_end_usec) +
+                " complete=" + std::to_string(drain.complete) +
+                " error=" + std::to_string(drain.stop_error));
+    s.total_frames_drawn_at_stop = obs_get_total_frames();
+    s.lagged_frames_at_stop = obs_get_lagged_frames();
+    s.output_total_bytes = obs_output_get_total_bytes(s.output);
+    s.output_total_frames = obs_output_get_total_frames(s.output);
+    s.output_frames_dropped = obs_output_get_frames_dropped(s.output);
 
     if (s.opt.mode == RunMode::InMemory) {
         // The MP4 files are finalized at this point.  Stop the synthetic media
@@ -1749,6 +1769,12 @@ bool StopOutput(State& s)
         if (s.framed_audio_enabled) {
             a3::StopFramedAudioSourceThread();
             s.framed_audio_stats = a3::GetFramedAudioStats();
+            AddStep(s, "source_covers_stop_fence",
+                    s.output_drain.fence_capture_valid && s.output_drain.fence_capture_ns > 0 &&
+                        s.framed_audio_stats.submitted_end_timestamp_ns >=
+                            static_cast<uint64_t>(s.output_drain.fence_capture_ns),
+                    "capture_fence_ns=" + std::to_string(s.output_drain.fence_capture_ns) +
+                        " source_end_ns=" + std::to_string(s.framed_audio_stats.submitted_end_timestamp_ns));
             AddStep(s, "framed_audio_after_stop",
                     s.framed_audio_stats.validation_performed &&
                         s.framed_audio_stats.stream_integrity_ok &&
@@ -1811,7 +1837,8 @@ bool StopOutput(State& s)
 
     s.files = ListMp4Files(s.opt.out_dir);
     AddStep(s, "split_files_ge_3",
-            s.opt.allow_single_segment || s.files.size() >= (s.opt.max_size_mb > 0 ? 1 : 3),
+            !s.files.empty() && (s.opt.allow_single_segment ||
+                s.files.size() >= (s.opt.max_size_mb > 0 ? 1 : 3)),
             std::to_string(s.files.size()) + " mp4 file(s) in " + s.opt.out_dir);
     return true;
 }
@@ -1967,6 +1994,46 @@ void CollectFinalEvidence(State& s)
 // ---------------------------------------------------------------------------
 // report
 // ---------------------------------------------------------------------------
+
+void WriteTailJson(a3::JsonWriter& w, const State& s)
+{
+    const auto& d = s.output_drain;
+    const auto& before = s.framed_audio_at_stop_request;
+    const auto& after = s.framed_audio_stats;
+    w.begin_object();
+    w.key("contract"); w.value_string("closed_gop_audio_fence_v2");
+    w.key("observation_point"); w.value_string("output_after_interleaver");
+    w.key("contract_version"); w.value_int(d.contract_version);
+    w.key("stop_request_ns"); w.value_uint(s.t_stop_request_ns);
+    w.key("output_inactive_ns"); w.value_uint(s.t_output_inactive_ns);
+    w.key("stop_requested"); w.value_bool(d.stop_requested != 0);
+    w.key("fence_set"); w.value_bool(d.fence_set != 0);
+    w.key("fence_pts_usec"); w.value_int(d.fence_usec);
+    w.key("video_end_pts_usec"); w.value_int(d.video_end_usec);
+    w.key("audio_end_pts_usec"); w.value_int(d.audio_end_usec);
+    w.key("audio_frame_samples"); w.value_int(d.audio_frame_size);
+    w.key("audio_sample_rate"); w.value_int(d.audio_sample_rate);
+    w.key("complete"); w.value_bool(d.complete != 0);
+    w.key("failed"); w.value_bool(d.failed != 0);
+    w.key("stop_error"); w.value_int(d.stop_error);
+    w.key("keyframe_wait_usec"); w.value_int(d.keyframe_wait_usec);
+    w.key("fence_capture_ns"); w.value_int(d.fence_capture_ns);
+    w.key("fence_capture_valid"); w.value_bool(d.fence_capture_valid != 0);
+    w.key("source_at_request"); w.begin_object();
+    w.key("submitted_start_sample"); w.value_uint(before.submitted_start_sample);
+    w.key("submitted_end_sample"); w.value_uint(before.submitted_end_sample);
+    w.key("submitted_end_timestamp_ns"); w.value_uint(before.submitted_end_timestamp_ns);
+    w.end_object();
+    w.key("source_after_drain"); w.begin_object();
+    w.key("submitted_start_sample"); w.value_uint(after.submitted_start_sample);
+    w.key("submitted_end_sample"); w.value_uint(after.submitted_end_sample);
+    w.key("submitted_end_timestamp_ns"); w.value_uint(after.submitted_end_timestamp_ns);
+    w.key("submitted_gaps"); w.value_uint(after.submitted_gaps);
+    w.key("integrity_ok"); w.value_bool(after.stream_integrity_ok && after.timeline_ok &&
+        after.packet_integrity_ok && after.error_code.empty());
+    w.end_object();
+    w.end_object();
+}
 
 void WriteReport(State& s, int exit_code)
 {
@@ -2337,24 +2404,7 @@ void WriteReport(State& s, int exit_code)
     w.end_object();
     if (s.framed_audio_enabled) {
         w.key("tail");
-        w.begin_object();
-        const uint64_t stop_ns = s.t_stop_request_ns;
-        const uint64_t last_audio_ns = s.framed_audio_stats.last_timestamp_ns;
-        const uint64_t tail_ns = stop_ns > last_audio_ns ? stop_ns - last_audio_ns : 0;
-        w.key("stop_request_ns"); w.value_uint(stop_ns);
-        w.key("last_audio_timestamp_ns"); w.value_uint(last_audio_ns);
-        w.key("tail_target_ns"); w.value_uint(tail_ns);
-        w.key("tail_target_samples");
-        w.value_uint(static_cast<uint64_t>(tail_ns * 44100ULL / 1000000000ULL));
-        w.key("tail_target_ms");
-        w.value_double(static_cast<double>(tail_ns) / 1000000.0, 3);
-        w.key("audio_submitted_start_sample");
-        w.value_uint(s.framed_audio_stats.submitted_start_sample);
-        w.key("audio_submitted_end_sample");
-        w.value_uint(s.framed_audio_stats.submitted_end_sample);
-        w.key("video_total_frames"); w.value_int(s.output_total_frames);
-        w.key("video_end_ns"); w.value_uint(s.t_output_inactive_ns);
-        w.end_object();
+        WriteTailJson(w, s);
     }
     w.key("files");
     w.begin_array();
@@ -2789,22 +2839,7 @@ void WriteManifest(State& s, ServeSession& sess)
         w.key("framed_audio");
         WriteFramedAudioStatsJson(w, s.framed_audio_stats);
         w.key("tail");
-        w.begin_object();
-        const uint64_t stop_ns = s.t_stop_request_ns;
-        const uint64_t last_audio_ns = s.framed_audio_stats.last_timestamp_ns;
-        const uint64_t tail_ns = stop_ns > last_audio_ns ? stop_ns - last_audio_ns : 0;
-        w.key("stop_request_ns"); w.value_uint(stop_ns);
-        w.key("last_audio_timestamp_ns"); w.value_uint(last_audio_ns);
-        w.key("tail_target_ns"); w.value_uint(tail_ns);
-        w.key("tail_target_samples");
-        w.value_uint(static_cast<uint64_t>(tail_ns * 44100ULL / 1000000000ULL));
-        w.key("tail_target_ms");
-        w.value_double(static_cast<double>(tail_ns) / 1000000.0, 3);
-        w.key("audio_submitted_start_sample"); w.value_uint(s.framed_audio_stats.submitted_start_sample);
-        w.key("audio_submitted_end_sample"); w.value_uint(s.framed_audio_stats.submitted_end_sample);
-        w.key("video_total_frames"); w.value_int(s.output_total_frames);
-        w.key("video_end_ns"); w.value_uint(s.t_output_inactive_ns);
-        w.end_object();
+        WriteTailJson(w, s);
     }
     w.key("output");
     w.begin_object();

@@ -51,6 +51,7 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_protocol_mock.py",
     "test_recording_health.py",
     "test_recording_manifest.py",
+    "test_native_stop.py",
     "test_recording_segment.py",
     "test_short_game_tools.py",
     "test_t35_spellcasting.py",
@@ -74,11 +75,14 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_wgc_source.py",
     "test_p5_placement.py",
     "test_audio_mux.py",
+    "test_native_media_contract.py",
 )
 
-# LIVE suites: listed for transparency only; they start the real client / write real save
-# state and must be selected explicitly, one at a time, in an isolated directory.
+# LIVE suites: listed for transparency only; they run native capture/recording or
+# the real client and must be selected explicitly in an isolated directory.
 LIVE_SUITES: tuple[str, ...] = (
+    "test_native_audio_delivery.py",
+    "test_native_recording_e2e.py",
     "test_n1_live_restore.py",
     "test_p6_live_hero_fields.py",
     "test_session_memory.py",

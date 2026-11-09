@@ -97,6 +97,13 @@ set_target_properties(framed-core-tests PROPERTIES
   OUTPUT_NAME "framed-core-tests"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# Private output stop-fence policy: no libobs, codecs, clock or device access.
+add_executable(stop-policy-tests custom-output/tests/test-stop-policy.c)
+target_compile_options(stop-policy-tests PRIVATE /W4 /utf-8)
+set_target_properties(stop-policy-tests PROPERTIES
+  OUTPUT_NAME "stop-policy-tests"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # ---------------------------------------------------------------------------
 # S1b: libobs media self-test executable (obs-media-selftest.exe)
 #

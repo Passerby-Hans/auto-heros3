@@ -150,19 +150,19 @@ int main(int argc, char **argv)
 
     const int pipe_mode = getenv("A3CAPTURE_TEST_PIPE") != NULL;
     FILE *f = pipe_mode ? NULL : fopen(argv[2], "rb");
-    long bytes = 0;
+    int64_t bytes = 0;
     unsigned char header[128] = {0};
     size_t header_read = 0;
     if (f) {
-        fseek(f, 0, SEEK_END);
-        bytes = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        _fseeki64(f, 0, SEEK_END);
+        bytes = _ftelli64(f);
+        _fseeki64(f, 0, SEEK_SET);
         header_read = fread(header, 1, sizeof(header), f);
         fclose(f);
     }
     char detail[160];
-    const long expected = (long)run_ms * 44100L * 2L * 2L / 1000L;
-    snprintf(detail, sizeof(detail), "bytes=%ld expected~%ld", bytes, expected);
+    const int64_t expected = (int64_t)run_ms * 44100 * 4 / 1000;
+    snprintf(detail, sizeof(detail), "bytes=%lld expected~%lld", (long long)bytes, (long long)expected);
     if (header_read >= 128) {
         const unsigned char *b = header;
         check("framed_magic", b[0] == 'A' && b[1] == '3' && b[2] == 'A' && b[3] == 'P',

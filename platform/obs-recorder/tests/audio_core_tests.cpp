@@ -3,11 +3,15 @@
 #include "a3_audio_protocol.h"
 #include "a3_audio_protocol_c.h"
 #include "audio_clock.hpp"
+#include "audio_clock_c.h"
+#include "audio_delivery_policy.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" int a3_wire_c_layout_ok(void);
@@ -177,6 +181,65 @@ int main()
 
     FrameScheduler overflow_scheduler(clock, UINT64_MAX - 1);
     Check("scheduler_advance_overflow_rejected", !overflow_scheduler.advance(2));
+
+    // Deterministic delivery policy matrix, not a live source acceptance test.
+    // A large archive queue does not authorize silently rebasing late media.
+    using a3::audio::ClassifyLivePacket;
+    using a3::audio::LivePacketDisposition;
+    const auto submit = LivePacketDisposition::Submit;
+    const auto reject = LivePacketDisposition::RejectLate;
+    Check("delivery_300ms_continues",
+          ClassifyLivePacket(300000000, a3::audio::kDefaultLateBudgetNs, true) == submit);
+    Check("delivery_500ms_boundary_inclusive",
+          ClassifyLivePacket(500000000, a3::audio::kDefaultLateBudgetNs, true) == submit);
+    Check("delivery_500ms_plus_one_fails",
+          ClassifyLivePacket(500000001, a3::audio::kDefaultLateBudgetNs, true) == reject);
+    Check("delivery_1s_fails_without_rebasing",
+          ClassifyLivePacket(1000000000, a3::audio::kDefaultLateBudgetNs, true) == reject);
+    Check("delivery_6s_returning_packet_is_late",
+          ClassifyLivePacket(6000000000, a3::audio::kDefaultLateBudgetNs, true) == reject);
+    Check("delivery_history_skips_only_before_first_submission",
+          ClassifyLivePacket(1000000000, a3::audio::kDefaultLateBudgetNs, false) ==
+              LivePacketDisposition::SkipPreroll);
+    Check("delivery_custom_budget_is_honored",
+          ClassifyLivePacket(300000001, 300000000, true) == reject);
+    Check("delivery_1s_no_progress_is_not_stall", !a3::audio::CaptureStalled(1000000100, 100));
+    Check("delivery_5s_stall_boundary_inclusive", !a3::audio::CaptureStalled(5000000100, 100));
+    Check("delivery_6s_no_progress_is_stall", a3::audio::CaptureStalled(6000000100, 100));
+    Check("delivery_backward_clock_not_unsigned_stall", !a3::audio::CaptureStalled(99, 100));
+    // 256 slots include the in-flight worker packet; their duration is only
+    // an upper bound for initially empty archive storage, not a late budget.
+    const uint64_t queue_frames = 256ULL * 1024;
+    Check("archive_256_slots_are_between_5_and_6_seconds",
+          queue_frames > rate * 5ULL && queue_frames < rate * 6ULL);
+    Check("archive_capacity_does_not_relax_live_age",
+          ClassifyLivePacket(queue_frames * 1000000000ULL / rate,
+                             a3::audio::kDefaultLateBudgetNs, true) == reject);
+
+    uint64_t elapsed_us = 99;
+    Check("latency_zero_is_valid_measurement",
+          a3_qpc_elapsed_us(100, 100, freq, &elapsed_us) && elapsed_us == 0);
+    Check("latency_sub_microsecond_is_not_lost",
+          a3_qpc_elapsed_us(100, 101, freq, &elapsed_us) && elapsed_us == 1);
+    Check("latency_300ms_exact",
+          a3_qpc_elapsed_us(100, 3000100, freq, &elapsed_us) && elapsed_us == 300000);
+    Check("latency_1s_exact",
+          a3_qpc_elapsed_us(100, 10000100, freq, &elapsed_us) && elapsed_us == 1000000);
+    Check("latency_6s_exact",
+          a3_qpc_elapsed_us(100, 60000100, freq, &elapsed_us) && elapsed_us == 6000000);
+    Check("latency_invalid_clock_rejected", !a3_qpc_elapsed_us(100, 200, 0, &elapsed_us));
+    Check("latency_backward_clock_rejected", !a3_qpc_elapsed_us(200, 100, freq, &elapsed_us));
+    Check("latency_overflow_rejected", !a3_qpc_elapsed_us(0, UINT64_MAX, 1, &elapsed_us));
+    Check("latency_null_output_rejected", !a3_qpc_elapsed_us(100, 200, freq, nullptr));
+    const auto before_wait = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto measured_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - before_wait).count();
+    const bool measured_wait_ok = measured_ns > 0 &&
+        a3_qpc_elapsed_us(0, static_cast<uint64_t>(measured_ns), 1000000000ULL, &elapsed_us) &&
+        elapsed_us > 0;
+    Check("latency_real_wait_has_nonzero_measured_duration", measured_wait_ok,
+          std::to_string(elapsed_us) + "us (no timing threshold)");
 
     std::cout << (g_failures == 0 ? "ALL_PASS" : "FAILURES") << " checks=" << g_checks
               << " failures=" << g_failures << '\n';

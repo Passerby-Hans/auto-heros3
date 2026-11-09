@@ -46,3 +46,20 @@ int64_t a3_qpc_remaining(const a3_qpc_clock *clock, uint64_t now_qpc, uint64_t f
     }
     return -(int64_t)delta;
 }
+
+int a3_qpc_elapsed_us(uint64_t start_qpc, uint64_t end_qpc,
+                      uint64_t qpc_frequency, uint64_t *out_us)
+{
+    uint64_t ticks, seconds, remainder, fractional;
+    if (!out_us || qpc_frequency == 0 || end_qpc < start_qpc) return 0;
+    ticks = end_qpc - start_qpc;
+    seconds = ticks / qpc_frequency;
+    remainder = ticks % qpc_frequency;
+    if (seconds > UINT64_MAX / 1000000ULL ||
+        remainder > UINT64_MAX / 1000000ULL) return 0;
+    fractional = remainder * 1000000ULL / qpc_frequency;
+    if (remainder * 1000000ULL % qpc_frequency != 0) ++fractional;
+    if (fractional > UINT64_MAX - seconds * 1000000ULL) return 0;
+    *out_us = seconds * 1000000ULL + fractional;
+    return 1;
+}

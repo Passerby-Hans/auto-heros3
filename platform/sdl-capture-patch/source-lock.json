@@ -3,20 +3,24 @@
   "runtime_sha256": "76ec39741feed5bb949a8126735ec3aec7737b8de6dfc4f6333b9f0eba3dc10c",
   "runtime_version": "2.32.10.0",
   "schema_version": 1,
-  "backend_status": "framed_spike_a3",
+  "backend_status": "framed_capture",
   "note": "Private SDL2.dll must be built from pinned source and staged locally; do not replace Conan/system DLL.",
   "source_url": "https://github.com/libsdl-org/SDL/releases/tag/release-2.32.10",
   "backend_name": "a3capture",
   "source_tag": "release-2.32.10",
   "protocol": "a3-audio/1",
   "runtime_dll": "vendor/vcmi-src/build/bin/SDL2.dll",
-  "private_dll_sha256": "6a52d5637b302a2e31b5af977e836fb5a955ca3bacbfbaaf49e5d178382b4785",
-  "private_dll_bytes": 1807360,
-  "smoke": "PASS R2: explicit private DLL; driver=a3capture; 44.1k/s16/2ch/1024; 212992B in 1.2s; generated=queued=written=committed; rate bounds PASS; dependencies exclude MMDevAPI/audioses",
-  "a2_vcmi": "PASS R3: VCMI loaded a3capture, audio_ready=true, non-zero raw PCM; no accurate timing window, not a rate claim",
-  "patch_sha256": "1c299cfc3c67758573471e919a6f106bf97b5a281cd973ce5ca4eb05317c490a",
+  "patch_sha256": "79653c6bb33414ac49d34722bae84e2d376bfaaeb55ddb8abd52450f7baa208e",
   "source_lock_verified": true,
-  "fault_injection": "PASS: queue overflow, short write, no-thread cleanup, close timeout (bounded 5s/detached)",
-  "a3_framed": "PASS: 53 packets, 53248 frames, first=1,last=2, header/payload CRC and sample continuity validated",
-  "graceful_stop": "PASS: test marker -> LAST, drain, final counters (GRACEFUL_STOP_PASS)"
+  "historical_checkpoint": {
+    "private_dll_sha256": "6a52d5637b302a2e31b5af977e836fb5a955ca3bacbfbaaf49e5d178382b4785",
+    "private_dll_bytes": 1807360,
+    "smoke": "PASS R2: explicit private DLL; driver=a3capture; 44.1k/s16/2ch/1024; 212992B in 1.2s; generated=queued=written=committed; rate bounds PASS; dependencies exclude MMDevAPI/audioses",
+    "a2_vcmi": "PASS R3: VCMI loaded a3capture, audio_ready=true, non-zero raw PCM; no accurate timing window, not a rate claim",
+    "fault_injection": "PASS: queue overflow, short write, no-thread cleanup, close timeout (bounded 5s/detached)",
+    "a3_framed": "PASS: 53 packets, 53248 frames, first=1,last=2, header/payload CRC and sample continuity validated",
+    "graceful_stop": "PASS: test marker -> LAST, drain, final counters (GRACEFUL_STOP_PASS)"
+  },
+  "patch_hash_normalization": "UTF-8 text, CRLF normalized to LF, LF---A3PATCH---LF separator",
+  "artifact_manifest": "stage/build.json"
 }

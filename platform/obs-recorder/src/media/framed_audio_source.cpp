@@ -77,6 +77,8 @@ void ConvertAndPush(FramedAudioData* d, const audio::ParsedPacket& packet,
     stats->submitted_end_sample = packet.header.sample_start + frames;
     if (stats->first_timestamp_ns == 0) stats->first_timestamp_ns = timestamp_ns;
     stats->last_timestamp_ns = timestamp_ns;
+    stats->submitted_end_timestamp_ns = timestamp_ns +
+        static_cast<uint64_t>(frames) * 1000000000ULL / packet.header.sample_rate;
 }
 
 void ReaderThread(FramedAudioData* d)
@@ -92,6 +94,9 @@ void ReaderThread(FramedAudioData* d)
     bool first_submitted = false;
     bool fatal_error = false;
     bool replay_finished = false;
+    // Test state belongs to this source, never to a subsequent recording.
+    bool test_late_pending = false;
+    bool test_delayed = false;
     uint64_t last_progress_ns = os_gettime_ns();
     std::string err;
     std::vector<uint8_t> readbuf(65536);
@@ -206,7 +211,6 @@ void ReaderThread(FramedAudioData* d)
                     fail(err, err);
                     break;
                 }
-                static bool test_late_pending = false;
                 if (test_late_pending) {
                     stats.late_packets++;
                     fail("late_budget_exceeded", "injected after first submitted packet");
@@ -225,10 +229,12 @@ void ReaderThread(FramedAudioData* d)
                     }
                     const uint64_t now = os_gettime_ns();
                     const uint64_t age = now > ts ? now - ts : 0;
-                    if (age > d->cfg.late_budget_ns) {
+                    const auto delivery = audio::ClassifyLivePacket(
+                        age, d->cfg.late_budget_ns, first_submitted);
+                    if (delivery != audio::LivePacketDisposition::Submit) {
                         stats.max_packet_age_ns = std::max(stats.max_packet_age_ns, age);
                         stats.late_packets++;
-                        if (!first_submitted) {
+                        if (delivery == audio::LivePacketDisposition::SkipPreroll) {
                             /* live attach: skip pre-roll history, but keep the
                              * validated sample timeline unchanged. */
                             stats.preroll_skipped_packets++;
@@ -264,7 +270,6 @@ void ReaderThread(FramedAudioData* d)
                 if (packet.header.sample_count > 0) first_submitted = true;
                 // Test-only stall injection: the next packet is then observed
                 // as older than late_budget_ns.  Never enabled by default.
-                static bool test_delayed = false;
                 if (first_submitted && !test_delayed) {
                     const char* delay_text = std::getenv("A3_FRAMED_TEST_DELAY_AFTER_FIRST_MS");
                     if (delay_text && *delay_text) {
@@ -309,7 +314,7 @@ void ReaderThread(FramedAudioData* d)
                     fail("file_truncated", "live framed file shrank below read offset");
                     break;
                 }
-                if (os_gettime_ns() - last_progress_ns > 5000000000ULL) {
+                if (audio::CaptureStalled(os_gettime_ns(), last_progress_ns)) {
                     fail("capture_stalled", "live framed file made no progress for 5s");
                     break;
                 }
@@ -332,11 +337,15 @@ void ReaderThread(FramedAudioData* d)
         Publish(d, stats);
         return;
     }
-    if (!parser.finish(&err)) {
+    const bool host_stopped = d->stopping.load(std::memory_order_acquire);
+    // A recording fence consumes a validated prefix of a continuing capture.
+    // Cancelling this reader is not EOF: its read-ahead buffer may legitimately
+    // contain the beginning of a packet after the retained media interval.
+    // CRC/stream errors discovered before cancellation remain latched below.
+    if (!host_stopped && !parser.finish(&err)) {
         fail("truncated", err);
     }
     bool complete = false;
-    const bool host_stopped = d->stopping.load(std::memory_order_acquire);
     if (!validator.Finish(!d->cfg.live && !host_stopped, &complete, &err)) {
         fail(err, err);
     } else {
@@ -378,7 +387,7 @@ void FramedGetDefaults(obs_data_t* defaults)
     obs_data_set_default_bool(defaults, "live", false);
     obs_data_set_default_bool(defaults, "start_at_zero", true);
     obs_data_set_default_int(defaults, "replay_origin_ns", 0);
-    obs_data_set_default_int(defaults, "late_budget_ns", 500000000);
+    obs_data_set_default_int(defaults, "late_budget_ns", audio::kDefaultLateBudgetNs);
 }
 
 void* FramedCreate(obs_data_t* settings, obs_source_t* source)

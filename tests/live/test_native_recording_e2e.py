@@ -272,6 +272,9 @@ def framed_identity(out: Path) -> dict:
 CONTROL_READ_TOOLS = frozenset({"game_status", "game_observe", "game_events", "game_brief",
     "game_action_status", "game_reconcile", "battle_actions", "battle_assess", "town_info",
     "game_screenshot"})
+CONTROL_LEASE_TOOLS = frozenset({"lease_acquire", "lease_release"})
+CONTROL_LOCAL_TOOLS = frozenset({"control_ack_observed"})
+CONTROL_OBSERVATIONS = frozenset({"game_observe", "battle_assess", "battle_actions"})
 CONTROL_ACTIONS = frozenset({"move", "move_hero", "build", "recruit", "recruit_hero",
     "open_hero", "transfer", "merge", "swap_stacks", "split", "upgrade", "market_trade",
     "answer", "end_turn", "cast_spell", "battle_cast_spell", "battle_attack",
@@ -290,6 +293,7 @@ class ControlMailbox:
         self.seen = set()
         self.action_requests = set()
         self.fence = None
+        self.observations = {}
         self.recording_index = None
         self.publish("waiting_for_recording")
 
@@ -297,7 +301,8 @@ class ControlMailbox:
         write_json(self.out / "control-state.json", {"state": state, "at": time.time(),
             "recording_index": self.recording_index, "fence": self.fence,
             "request_file": str(self.path), "result_file": str(self.results),
-            "tools": sorted(CONTROL_READ_TOOLS | {"game_act", "game_note"})})
+            "tools": sorted(CONTROL_READ_TOOLS | CONTROL_LEASE_TOOLS | CONTROL_LOCAL_TOOLS |
+                            {"game_act", "game_note"})})
 
     def append(self, row: dict) -> None:
         with self.results.open("a", encoding="utf-8") as handle:
@@ -327,11 +332,15 @@ class ControlMailbox:
         if rid in self.seen:
             raise ValueError("duplicate control id; request will not be dispatched again")
         self.seen.add(rid)
-        if tool not in CONTROL_READ_TOOLS | {"game_act", "game_note"}:
+        if tool not in CONTROL_READ_TOOLS | CONTROL_LEASE_TOOLS | CONTROL_LOCAL_TOOLS | {"game_act", "game_note"}:
             raise ValueError("tool is outside the controller allowlist")
         if not isinstance(arguments, dict):
             raise ValueError("arguments must be an object")
         arguments = dict(arguments)
+        if tool == "lease_acquire":
+            if arguments.get("force", False) is not False:
+                raise ValueError("controller takeover is outside this mailbox; force must be false")
+            arguments["force"] = False
         if tool == "game_act":
             action_id = arguments.get("request_id")
             if self.fence:
@@ -351,7 +360,12 @@ class ControlMailbox:
         return rid, tool, arguments
 
     def apply_result(self, tool: str, arguments: dict, result: dict) -> None:
-        if tool == "game_act" and result.get("status") not in ("completed", "rejected"):
+        known_unsent = (result.get("sent") is False and result.get("accepted") is not True and
+                        result.get("seq") in (None, 0) and
+                        result.get("bridge_status") in (None, "", "NOT_SENT") and
+                        result.get("status") not in ("submitted", "completed"))
+        if tool == "game_act" and not known_unsent and result.get("status") not in ("completed", "rejected"):
+            self.observations.clear()
             self.fence = {"request_id": arguments["request_id"], "action_id": result.get("action_id"),
                           "status": result.get("status", "unknown")}
         if not self.fence:
@@ -365,6 +379,41 @@ class ControlMailbox:
                 resolved = result.get("action")
         if isinstance(resolved, dict) and resolved.get("status") in ("completed", "rejected"):
             self.fence = None
+            self.observations.clear()
+
+    async def acknowledge_observed(self, arguments: dict, call) -> dict:
+        """Clear only this controller's fence; never promote the server's action status."""
+        if not self.fence:
+            raise ValueError("no pending controller action")
+        request_id, action_id = arguments.get("request_id"), arguments.get("action_id")
+        if (request_id != self.fence["request_id"] or not action_id or
+                action_id != self.fence.get("action_id")):
+            raise ValueError("acknowledgement must match the fenced request_id and action_id")
+        observed = arguments.get("observed")
+        if (not isinstance(observed, str) or not observed.strip() or len(observed) > 500 or
+                any(ord(char) < 32 for char in observed)):
+            raise ValueError("observed must describe the inspected state in one line, at most 500 characters")
+        observation_id = arguments.get("observation_id")
+        observation = self.observations.get(observation_id) if isinstance(observation_id, str) else None
+        if not observation or time.monotonic() - observation["monotonic"] > 120:
+            raise ValueError("reference a successful observation made after this fence within 120 seconds")
+        reconciled = await call("game_reconcile", {"request_id": request_id}, timeout=30)
+        original = reconciled.get("result")
+        if (reconciled.get("ok") is not True or reconciled.get("resolved") is not True or
+                not isinstance(original, dict) or original.get("request_id") != request_id or
+                original.get("action_id") != action_id or original.get("status") != "submitted" or
+                original.get("bridge_status") != "COMPLETED" or original.get("accepted") is not True or
+                original.get("sent") is not True):
+            raise ValueError("fresh reconciliation must identify the same accepted submitted action with bridge COMPLETED")
+        result = {"ok": True, "fence_cleared": True, "action_status": "submitted",
+                  "confirmation": "controller_observed_state", "request_id": request_id,
+                  "action_id": action_id, "observation_id": observation_id, "observed": observed.strip()}
+        # Persist the decision and original evidence before allowing any new mutation.
+        self.append({"at": time.time(), "state": "acknowledged_after_observation", "result": result,
+                     "original_result": original, "observation": observation})
+        self.fence = None
+        self.observations.clear()
+        return result
 
     async def dispatch_one(self, call) -> None:
         request = None
@@ -379,9 +428,37 @@ class ControlMailbox:
         self.append({"at": time.time(), "id": rid, "state": "dispatching",
                      "tool": tool, "arguments": arguments, "recording_index": self.recording_index})
         try:
-            result = await call(tool, arguments, timeout=90)
+            if tool == "control_ack_observed":
+                result = await self.acknowledge_observed(arguments, call)
+            elif tool == "game_act":
+                # Lease denial/failure happens before the mutation call, so it is known unsent.
+                try:
+                    lease = await call("lease_acquire", {"force": False}, timeout=30)
+                except Exception as exc:
+                    lease = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                self.append({"at": time.time(), "id": rid, "state": "lease_checked",
+                             "ok": lease.get("ok") is True, "error": lease.get("error"),
+                             "expires_at": (lease.get("lease") or {}).get("expires_at")})
+                result = (await call(tool, arguments, timeout=90) if lease.get("ok") is True else
+                          {"ok": False, "sent": False, "error": "controller_lease_unavailable",
+                           "detail": lease.get("error")})
+            else:
+                result = await call(tool, arguments, timeout=90)
             self.apply_result(tool, arguments, result)
+            if (self.fence and tool in CONTROL_OBSERVATIONS and isinstance(result, dict) and result and
+                    result.get("ok") is not False and not result.get("error")):
+                self.observations[rid] = {"tool": tool, "at": time.time(), "monotonic": time.monotonic(),
+                                          "result": result}
+                while len(self.observations) > 16:
+                    self.observations.pop(next(iter(self.observations)))
             self.append({"at": time.time(), "id": rid, "state": "returned", "result": result})
+        except ValueError as exc:
+            if tool != "control_ack_observed":
+                if tool == "game_act":
+                    self.fence = {"request_id": arguments["request_id"], "action_id": None, "status": "unknown"}
+                self.append({"at": time.time(), "id": rid, "state": "unknown", "error": str(exc)})
+            else:
+                self.append({"at": time.time(), "id": rid, "state": "rejected", "error": str(exc)})
         except Exception as exc:
             if tool == "game_act":
                 self.fence = {"request_id": arguments["request_id"], "action_id": None, "status": "unknown"}

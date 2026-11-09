@@ -137,13 +137,153 @@ class HarnessTests(unittest.TestCase):
         calls = []
         async def call(*a, **kw):
             calls.append(a)
+            if a[0] == "lease_acquire":
+                return {"ok": True}
             raise TimeoutError("lost response")
         asyncio.run(box.dispatch_one(call))
         asyncio.run(box.dispatch_one(call))
-        self.assertEqual(len(calls), 1)
+        self.assertEqual([row[0] for row in calls], ["lease_acquire", "game_act"])
         self.assertEqual(box.fence["status"], "unknown")
         rows = [json.loads(line) for line in box.results.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([row["state"] for row in rows], ["dispatching", "unknown"])
+        self.assertEqual([row["state"] for row in rows], ["dispatching", "lease_checked", "unknown"])
+
+    def dispatch(self, box, request, call):
+        with box.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(request) + "\n")
+        asyncio.run(box.dispatch_one(call))
+
+    def ack_fixture(self):
+        box = self.box()
+        original = {"request_id": "move", "action_id": "ledger-move", "status": "submitted",
+                    "bridge_status": "COMPLETED", "accepted": True, "sent": True}
+        box.apply_result("game_act", {"request_id": "move"}, original)
+        async def call(name, args, **kwargs):
+            if name == "battle_assess":
+                return {"ok": True, "active_stack": 3, "ours": {"units": 50}}
+            if name == "game_reconcile":
+                self.assertEqual(args, {"request_id": "move"})
+                return {"ok": True, "resolved": True, "result": original}
+            raise AssertionError("unexpected call: " + name)
+        self.dispatch(box, {"id": "fresh-battle", "tool": "battle_assess", "arguments": {}}, call)
+        args = {"request_id": "move", "action_id": "ledger-move", "observation_id": "fresh-battle",
+                "observed": "Movement opened battle; active stack 3 and 50 friendly units observed."}
+        return box, original, args, call
+
+    def test_known_unsent_does_not_fence(self):
+        box = self.box()
+        box.apply_result("game_act", {"request_id": "a"},
+                         {"ok": False, "sent": False, "error": "no lease"})
+        self.assertIsNone(box.fence)
+        box.validate(self.request("next", request_id="b", action="end_turn"))
+
+    def test_contradictory_unsent_still_fences(self):
+        box = self.box()
+        for extra in ({"accepted": True}, {"seq": 14}, {"bridge_status": "COMPLETED"},
+                      {"status": "submitted"}):
+            box.apply_result("game_act", {"request_id": "a"}, {"sent": False, **extra})
+            self.assertIsNotNone(box.fence)
+
+    def test_lease_denied_never_dispatches_mutation(self):
+        box = self.box()
+        calls = []
+        async def call(name, args, **kwargs):
+            calls.append((name, args))
+            return {"ok": False, "error": "lease_held"}
+        self.dispatch(box, self.request(), call)
+        self.assertEqual(calls, [("lease_acquire", {"force": False})])
+        self.assertIsNone(box.fence)
+        result = json.loads(box.results.read_text(encoding="utf-8").splitlines()[-1])["result"]
+        self.assertIs(result["sent"], False)
+
+    def test_lease_timeout_is_known_unsent(self):
+        box = self.box()
+        async def call(name, args, **kwargs):
+            self.assertEqual(name, "lease_acquire")
+            raise TimeoutError("lease response lost; game_act was not called")
+        self.dispatch(box, self.request(), call)
+        self.assertIsNone(box.fence)
+
+    def test_lease_success_precedes_action(self):
+        box = self.box()
+        calls = []
+        async def call(name, args, **kwargs):
+            calls.append(name)
+            return {"ok": True, "status": "completed"}
+        self.dispatch(box, self.request(), call)
+        self.assertEqual(calls, ["lease_acquire", "game_act"])
+
+    def test_controller_cannot_force_lease_takeover(self):
+        box = self.box()
+        with self.assertRaises(ValueError):
+            box.validate(self.request(tool="lease_acquire", force=True))
+        self.assertEqual(box.validate(self.request("lease", tool="lease_acquire", force=False))[2],
+                         {"force": False})
+
+    def test_observed_ack_preserves_submitted_and_records_evidence(self):
+        box, original, args, call = self.ack_fixture()
+        self.assertIsNotNone(box.fence)
+        self.dispatch(box, self.request("ack", tool="control_ack_observed", **args), call)
+        self.assertIsNone(box.fence)
+        self.assertEqual(original["status"], "submitted")
+        rows = [json.loads(row) for row in box.results.read_text(encoding="utf-8").splitlines()]
+        ack = next(row for row in rows if row["state"] == "acknowledged_after_observation")
+        self.assertEqual(ack["original_result"], original)
+        self.assertEqual(ack["observation"]["result"]["active_stack"], 3)
+        self.assertEqual(ack["result"]["action_status"], "submitted")
+
+    def test_ack_mismatched_identity_rejected_before_reconcile(self):
+        box, _, args, _ = self.ack_fixture()
+        async def forbidden(*args, **kwargs):
+            raise AssertionError("mismatched ack must not query")
+        for field in ("request_id", "action_id"):
+            with self.assertRaises(ValueError):
+                asyncio.run(box.acknowledge_observed({**args, field: "wrong"}, forbidden))
+            self.assertIsNotNone(box.fence)
+
+    def test_ack_requires_fresh_observation_and_explicit_description(self):
+        box, _, args, call = self.ack_fixture()
+        for field, value in (("observation_id", "missing"), ("observed", ""), ("observed", "two\nlines")):
+            with self.assertRaises(ValueError):
+                asyncio.run(box.acknowledge_observed({**args, field: value}, call))
+        box.observations["fresh-battle"]["monotonic"] -= 121
+        with self.assertRaises(ValueError):
+            asyncio.run(box.acknowledge_observed(args, call))
+        self.assertIsNotNone(box.fence)
+
+    def test_ack_rejects_unknown_or_unmatched_reconciliation(self):
+        box, original, args, _ = self.ack_fixture()
+        for extra in ({"status": "unknown"}, {"bridge_status": "UNKNOWN"}, {"sent": False},
+                      {"accepted": False}, {"action_id": "wrong"}, {"request_id": "wrong"}):
+            async def call(*pos, **kw):
+                return {"ok": True, "resolved": True, "result": {**original, **extra}}
+            with self.assertRaises(ValueError):
+                asyncio.run(box.acknowledge_observed(args, call))
+            self.assertIsNotNone(box.fence)
+
+    def test_ack_failed_durable_write_preserves_fence(self):
+        box, _, args, call = self.ack_fixture()
+        with patch.object(box, "append", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                asyncio.run(box.acknowledge_observed(args, call))
+        self.assertIsNotNone(box.fence)
+
+    def test_ack_reconcile_timeout_preserves_fence(self):
+        box, _, args, _ = self.ack_fixture()
+        async def call(*pos, **kw):
+            raise TimeoutError("reconcile unavailable")
+        self.dispatch(box, self.request("ack", tool="control_ack_observed", **args), call)
+        self.assertIsNotNone(box.fence)
+
+    def test_observation_before_fence_cannot_ack(self):
+        box = self.box()
+        async def call(*args, **kwargs):
+            return {"ok": True, "active_stack": 3}
+        self.dispatch(box, {"id": "before", "tool": "battle_assess", "arguments": {}}, call)
+        self.assertFalse(box.observations)
+        box.apply_result("game_act", {"request_id": "move"}, {"status": "submitted", "action_id": "a"})
+        with self.assertRaises(ValueError):
+            asyncio.run(box.acknowledge_observed({"request_id": "move", "action_id": "a",
+                "observation_id": "before", "observed": "Old battle observation."}, call))
 
     def test_size_reason_not_inferred_from_clip_count(self):
         with self.assertRaises(RuntimeError):

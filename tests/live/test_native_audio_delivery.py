@@ -73,6 +73,76 @@ def producer_metrics(text: str) -> dict:
     return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", rows[0])}
 
 
+def producer_diagnostics(text: str, stall_ms: int) -> dict:
+    """Validate emitted worker telemetry, not only the final recording gate.
+
+    A category-filtered or malformed diagnostic stream must fail acceptance.
+    The one-shot fixture stalls the worker after 100 completed packets, so
+    sequence 100 is the exact sample interval that must carry the observation.
+    """
+    marker = "a3capture_write_diag "
+    lines = [(number, line.split(marker, 1)[1].strip())
+             for number, line in enumerate(text.splitlines(), 1) if marker in line]
+    rows, errors = [], []
+    required_ints = {
+        "capture_id", "generation", "sequence", "sample_start", "sample_end", "qpc_frequency",
+        "planned_qpc", "actual_start_qpc", "actual_end_qpc", "enqueue_qpc", "write_start_qpc",
+        "write_end_qpc", "clock_valid", "write_ok", "failed", "write_latency_us", "queue_wait_us",
+        "write_io_us", "capture_to_write_us", "write_latency_max_us", "queue_wait_max_us",
+        "write_io_max_us", "capture_to_write_max_us", "measurements", "clock_errors",
+        "queue_depth_waiting", "slots_used_including_writer", "queue_depth_max", "slots_used_max",
+        "generated_frames", "written_frames", "dropped_frames",
+    }
+    valid_schema = valid_timing = True
+    for line_number, payload in lines:
+        try:
+            row = json.loads(payload)
+        except (ValueError, TypeError) as exc:
+            errors.append({"line": line_number, "error": f"invalid_json: {exc}"})
+            continue
+        rows.append(row)
+        schema_ok = (isinstance(row, dict) and row.get("schema") == "a3-worker-diag/1" and
+                     isinstance(row.get("event"), str) and
+                     row["event"] in {"health", "slow_write", "clock_error", "write_error"} and
+                     all(type(row.get(k)) is int and row[k] >= 0 for k in required_ints))
+        if not schema_ok:
+            valid_schema = False
+            errors.append({"line": line_number, "error": "invalid_schema"})
+            continue
+        frequency = row["qpc_frequency"]
+        timing_ok = (frequency > 0 and row["clock_valid"] == 1 and row["write_ok"] == 1 and
+                     row["sample_end"] - row["sample_start"] == 1024 and
+                     row["actual_start_qpc"] <= row["actual_end_qpc"] and
+                     row["enqueue_qpc"] <= row["write_start_qpc"] <= row["write_end_qpc"] and
+                     row["planned_qpc"] <= row["write_end_qpc"] and row["clock_errors"] == 0)
+        for field, begin, end in (
+            ("write_latency_us", "enqueue_qpc", "write_end_qpc"),
+            ("queue_wait_us", "enqueue_qpc", "write_start_qpc"),
+            ("write_io_us", "write_start_qpc", "write_end_qpc"),
+            ("capture_to_write_us", "planned_qpc", "write_end_qpc"),
+        ):
+            if frequency <= 0 or row[end] < row[begin]:
+                timing_ok = False
+            else:
+                expected = ((row[end] - row[begin]) * 1000000 + frequency - 1) // frequency
+                timing_ok = timing_ok and row[field] == expected
+        if not timing_ok:
+            valid_timing = False
+            errors.append({"line": line_number, "error": "qpc_latency_mismatch"})
+    typed_rows = [row for row in rows if isinstance(row, dict)]
+    initial = any(row.get("event") == "health" and row.get("sequence") == 0 for row in typed_rows)
+    stall_rows = [row for row in typed_rows if row.get("event") == "slow_write" and
+                  row.get("sequence") == 100 and row.get("sample_start") == 100 * 1024 and
+                  type(row.get("write_latency_us")) is int and
+                  row["write_latency_us"] >= stall_ms * 1000 and
+                  type(row.get("queue_wait_us")) is int and row["queue_wait_us"] >= stall_ms * 1000]
+    checks = {"present": bool(lines), "valid_json": len(rows) == len(lines),
+              "valid_schema": valid_schema, "qpc_latency_consistent": valid_timing,
+              "initial_health_sequence_zero": initial,
+              "stall_sequence_100": stall_ms == 0 or len(stall_rows) == 1}
+    return {"ok": all(checks.values()), "checks": checks, "errors": errors, "rows": rows}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("out", type=Path)
@@ -185,8 +255,11 @@ def main() -> int:
             producer_text = (out / "producer.log").read_text(encoding="utf-8", errors="replace")
             metrics = producer_metrics(producer_text)
             evidence["producer_metrics"] = metrics
+            diagnostics = producer_diagnostics(producer_text, args.stall_ms)
+            evidence["producer_diagnostics"] = diagnostics
             ok = (ok and metrics.get("write_latency_max_us", 0) >= max(1, args.stall_ms * 1000) and
                   metrics.get("clock_errors", -1) == 0 and metrics.get("measurements", 0) > 0 and
+                  diagnostics["ok"] and
                   evidence.get("producer_exit") == 0)
         evidence["artifacts_after"] = {name: sha(ROOT / name) for name in artifacts}
         evidence["ok"] = bool(ok and evidence["artifacts_after"] == artifacts)

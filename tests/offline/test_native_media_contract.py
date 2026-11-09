@@ -310,6 +310,56 @@ def main():
             "write_latency_max_us=1000001 measurements=10 clock_errors=0\n") ==
             {"write_latency_max_us": 1000001, "measurements": 10, "clock_errors": 0})
 
+        def worker_diag(sequence, delay_ms=0):
+            freq = 10000000
+            planned = 100000000 + sequence * 1024 * freq // 44100
+            enqueue = planned + 140
+            write_start = enqueue + delay_ms * 10000
+            write_end = write_start + 100
+            return {"schema": "a3-worker-diag/1", "event": "slow_write" if delay_ms else "health",
+                    "capture_id": 12345, "generation": 1, "sequence": sequence,
+                    "sample_start": sequence * 1024, "sample_end": (sequence + 1) * 1024,
+                    "qpc_frequency": freq, "planned_qpc": planned,
+                    "actual_start_qpc": planned + 100, "actual_end_qpc": planned + 120,
+                    "enqueue_qpc": enqueue, "write_start_qpc": write_start, "write_end_qpc": write_end,
+                    "clock_valid": 1, "write_ok": 1, "failed": 0,
+                    "write_latency_us": delay_ms * 1000 + 10, "queue_wait_us": delay_ms * 1000,
+                    "write_io_us": 10, "capture_to_write_us": delay_ms * 1000 + 24,
+                    "write_latency_max_us": delay_ms * 1000 + 10, "queue_wait_max_us": delay_ms * 1000,
+                    "write_io_max_us": 10, "capture_to_write_max_us": delay_ms * 1000 + 24,
+                    "measurements": sequence + 1, "clock_errors": 0, "queue_depth_waiting": 0,
+                    "slots_used_including_writer": 1, "queue_depth_max": 1, "slots_used_max": 1,
+                    "generated_frames": (sequence + 1) * 1024, "written_frames": (sequence + 1) * 1024,
+                    "dropped_frames": 0}
+
+        def diagnostic_text(*rows):
+            return "".join("INFO: a3capture_write_diag " + json.dumps(row) + "\n" for row in rows)
+
+        heartbeat, stalled = worker_diag(0), worker_diag(100, 1000)
+        check("worker_diagnostic_baseline_present", delivery.producer_diagnostics(
+            diagnostic_text(heartbeat), 0)["ok"])
+        check("worker_diagnostic_exact_stall100_pass", delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled), 1000)["ok"])
+        check("worker_diagnostic_missing_rejected", not delivery.producer_diagnostics("", 0)["ok"])
+        check("worker_diagnostic_bad_json_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled) + "INFO: a3capture_write_diag {bad}\n", 1000)["ok"])
+        check("worker_diagnostic_valid_json_wrong_shape_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled, []), 1000)["ok"])
+        check("worker_diagnostic_wrong_sequence_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, worker_diag(101, 1000)), 1000)["ok"])
+        check("worker_diagnostic_zero_frequency_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled | {"qpc_frequency": 0}), 1000)["ok"])
+        check("worker_diagnostic_invalid_clock_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled | {"clock_valid": 0}), 1000)["ok"])
+        check("worker_diagnostic_qpc_backwards_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled | {"write_end_qpc": stalled["enqueue_qpc"] - 1}), 1000)["ok"])
+        check("worker_diagnostic_latency_mismatch_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, stalled | {"write_latency_us": 1}), 1000)["ok"])
+        check("worker_diagnostic_insufficient_injected_delay_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(heartbeat, worker_diag(100, 300)), 1000)["ok"])
+        check("worker_diagnostic_initial_health_missing_rejected", not delivery.producer_diagnostics(
+            diagnostic_text(stalled), 1000)["ok"])
+
         endpoint_good = {"ok": True, "owned_physical_sessions": []}
         endpoint_changed = {"ok": False, "owned_physical_sessions": [],
                             "endpoint_controls_unchanged": False}

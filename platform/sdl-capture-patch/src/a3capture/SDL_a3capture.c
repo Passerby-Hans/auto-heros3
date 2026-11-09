@@ -187,7 +187,10 @@ static void A3LogWriteObservation(const A3WriteObservation *o, const char *event
      * SDL invokes VCMI's existing logger, whose file sink flushes each line.
      * This is not a power-loss/fsync guarantee, and a permanently blocked
      * write cannot emit its completion record. */
-    SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+    /* SDL's AUDIO category defaults to ERROR, which filters WARN. Use the
+     * existing APPLICATION/INFO path used by open/close diagnostics, without
+     * changing any category's priority or adding callback logging. */
+    SDL_Log(
         "a3capture_write_diag {\"schema\":\"a3-worker-diag/1\",\"event\":\"%s\","
         "\"capture_id\":%llu,\"generation\":%u,\"sequence\":%u,"
         "\"sample_start\":%llu,\"sample_end\":%llu,\"qpc_frequency\":%llu,"

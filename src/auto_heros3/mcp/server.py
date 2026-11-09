@@ -6951,6 +6951,7 @@ def _recording_stop_libobs() -> dict:
               'max_segment_gb': cap_gb, 'max_size_mb': (rec.get('config') or {}).get('max_size_mb'),
               'size_cap_bytes': cap_bytes, 'size_cap_exceeded': all_oversized,
               'recording_run_id': manifest_summary.get('recording_run_id'),
+              'tail': None,
               'python_manifest': str(manifest_path) if manifest_path.exists() else None,
               'manifest_state': manifest_summary.get('state'),
               'manifest_summary': manifest_summary}
@@ -6979,6 +6980,13 @@ def _recording_stop_libobs() -> dict:
             handle.write(json.dumps(segment, ensure_ascii=False) + '\n')
     except OSError:
         pass
+    try:
+        st_path = stop.get('selftest')
+        if st_path and Path(st_path).exists():
+            st_doc = json.loads(Path(st_path).read_text(encoding='utf-8'))
+            result['tail'] = (st_doc.get('media') or {}).get('tail')
+    except (OSError, ValueError):
+        result['tail'] = None
     result['segment'] = segment
     _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
                               'active': False, 'watchdog_stop': None,

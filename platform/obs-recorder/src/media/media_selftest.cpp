@@ -259,6 +259,7 @@ struct Options {
     std::string audio_raw;            // empty => no raw audio source
     std::string audio_framed;         // A4 a3-audio/1 source (instead of raw)
     bool audio_framed_live = false;    // A4: follow a growing framed file
+    int late_budget_ms = 500;          // packet freshness tolerance after first submit
     std::string outputs_module;          // private a3-obs-outputs.dll (test-only)
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
     bool fixed_audio = false;          // A4: obs_reset_audio2 fixed buffering
@@ -1340,6 +1341,8 @@ bool CreateFramedAudioSource(State& s)
     obs_data_t* settings = obs_data_create();
     obs_data_set_string(settings, "path", s.opt.audio_framed.c_str());
     obs_data_set_bool(settings, "live", s.opt.audio_framed_live);
+    obs_data_set_int(settings, "late_budget_ns",
+                     static_cast<long long>(s.opt.late_budget_ms) * 1000000LL);
     // There is no legal attach descriptor in this first batch: live must fail
     // explicitly rather than seek/re-stamp at an arbitrary EOF.  Static replay
     // starts at the capture origin.
@@ -2279,6 +2282,27 @@ void WriteReport(State& s, int exit_code)
         w.value_uint(stats.audio_frames_pushed);
     }
     w.end_object();
+    if (s.framed_audio_enabled) {
+        w.key("tail");
+        w.begin_object();
+        const uint64_t stop_ns = s.t_stop_request_ns;
+        const uint64_t last_audio_ns = s.framed_audio_stats.last_timestamp_ns;
+        const uint64_t tail_ns = stop_ns > last_audio_ns ? stop_ns - last_audio_ns : 0;
+        w.key("stop_request_ns"); w.value_uint(stop_ns);
+        w.key("last_audio_timestamp_ns"); w.value_uint(last_audio_ns);
+        w.key("tail_target_ns"); w.value_uint(tail_ns);
+        w.key("tail_target_samples");
+        w.value_uint(static_cast<uint64_t>(tail_ns * 44100ULL / 1000000000ULL));
+        w.key("tail_target_ms");
+        w.value_double(static_cast<double>(tail_ns) / 1000000.0, 3);
+        w.key("audio_submitted_start_sample");
+        w.value_uint(s.framed_audio_stats.submitted_start_sample);
+        w.key("audio_submitted_end_sample");
+        w.value_uint(s.framed_audio_stats.submitted_end_sample);
+        w.key("video_total_frames"); w.value_int(s.output_total_frames);
+        w.key("video_end_ns"); w.value_uint(s.t_output_inactive_ns);
+        w.end_object();
+    }
     w.key("files");
     w.begin_array();
     for (const auto& f : s.files) {
@@ -2711,6 +2735,23 @@ void WriteManifest(State& s, ServeSession& sess)
     if (s.framed_audio_enabled) {
         w.key("framed_audio");
         WriteFramedAudioStatsJson(w, s.framed_audio_stats);
+        w.key("tail");
+        w.begin_object();
+        const uint64_t stop_ns = s.t_stop_request_ns;
+        const uint64_t last_audio_ns = s.framed_audio_stats.last_timestamp_ns;
+        const uint64_t tail_ns = stop_ns > last_audio_ns ? stop_ns - last_audio_ns : 0;
+        w.key("stop_request_ns"); w.value_uint(stop_ns);
+        w.key("last_audio_timestamp_ns"); w.value_uint(last_audio_ns);
+        w.key("tail_target_ns"); w.value_uint(tail_ns);
+        w.key("tail_target_samples");
+        w.value_uint(static_cast<uint64_t>(tail_ns * 44100ULL / 1000000000ULL));
+        w.key("tail_target_ms");
+        w.value_double(static_cast<double>(tail_ns) / 1000000.0, 3);
+        w.key("audio_submitted_start_sample"); w.value_uint(s.framed_audio_stats.submitted_start_sample);
+        w.key("audio_submitted_end_sample"); w.value_uint(s.framed_audio_stats.submitted_end_sample);
+        w.key("video_total_frames"); w.value_int(s.output_total_frames);
+        w.key("video_end_ns"); w.value_uint(s.t_output_inactive_ns);
+        w.end_object();
     }
     w.key("output");
     w.begin_object();
@@ -3649,6 +3690,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.audio_framed = next("--audio-framed");
         } else if (a == "--audio-framed-live") {
             opt.audio_framed_live = true;
+        } else if (a == "--late-budget-ms") {
+            opt.late_budget_ms = std::atoi(next("--late-budget-ms").c_str());
         } else if (a == "--outputs-module") {
             opt.outputs_module = next("--outputs-module");
         } else if (a == "--audio-start-zero") {

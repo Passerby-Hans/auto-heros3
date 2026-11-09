@@ -38,6 +38,7 @@ typedef struct A3Packet
 {
     A3AudioPacketHeader header;
     Uint8 *data;
+    Uint64 enqueued_qpc;
 } A3Packet;
 
 struct SDL_PrivateAudioData
@@ -86,6 +87,9 @@ struct SDL_PrivateAudioData
     Uint64 overflow_events;
     Uint64 written_packets;
     Uint64 written_bytes;
+    Uint64 queue_depth_max;
+    Uint64 write_latency_max_us;
+    Uint64 write_latency_last_us;
     SDL_bool failed;
     SDL_bool closed;
     char write_error[128];
@@ -175,12 +179,14 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                     ++h->written_packets;
                     h->written_bytes += sizeof(final_header);
                     SDL_Log("a3capture final written: generated=%llu queued=%llu "
-                            "written=%llu committed=%llu dropped=%llu failed=%d",
+                            "written=%llu committed=%llu dropped=%llu depth_max=%llu write_latency_max_us=%llu failed=%d",
                             (unsigned long long)h->generated_frames,
                             (unsigned long long)h->queued_frames,
                             (unsigned long long)h->written_frames,
                             (unsigned long long)h->committed_frames,
                             (unsigned long long)h->dropped_frames,
+                            (unsigned long long)h->queue_depth_max,
+                            (unsigned long long)h->write_latency_max_us,
                             h->failed ? 1 : 0);
                 } else {
                     h->failed = SDL_TRUE;
@@ -340,8 +346,11 @@ static void A3CAPTURE_PlayDevice(_THIS)
         memcpy(packet->data, h->mixbuf, h->payload_bytes);
         a3_audio_finalize_packet(&hh, packet->data, h->payload_bytes);
         packet->header = hh;
+        packet->enqueued_qpc = SDL_GetPerformanceCounter();
         h->queue[(h->queue_head + h->queue_count) % A3CAPTURE_QUEUE_SLOTS] = packet;
         ++h->queue_count;
+        if ((Uint64)h->queue_count > h->queue_depth_max)
+            h->queue_depth_max = (Uint64)h->queue_count;
         h->queued_frames += h->samples_per_callback;
         h->sent_any = SDL_TRUE;
         h->pending_discontinuity_start = 0;
@@ -386,7 +395,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
     A3MakeFinalLocked(h);
     SDL_CondSignal(h->cond);
     SDL_Log("a3capture closing: generated=%llu queued=%llu written=%llu committed=%llu "
-            "dropped=%llu late=%llu overflow=%llu failed=%d error='%s'",
+            "dropped=%llu late=%llu overflow=%llu depth_max=%llu write_latency_max_us=%llu failed=%d error='%s'",
             (unsigned long long)h->generated_frames,
             (unsigned long long)h->queued_frames,
             (unsigned long long)h->written_frames,
@@ -394,6 +403,8 @@ static void A3CAPTURE_CloseDevice(_THIS)
             (unsigned long long)h->dropped_frames,
             (unsigned long long)h->late_events,
             (unsigned long long)h->overflow_events,
+            (unsigned long long)h->queue_depth_max,
+            (unsigned long long)h->write_latency_max_us,
             h->failed ? 1 : 0, h->write_error);
     SDL_UnlockMutex(h->lock);
     if (h->worker) {
@@ -415,7 +426,7 @@ static void A3CAPTURE_CloseDevice(_THIS)
         DeleteFileA(h->ready_path);
     }
     SDL_Log("a3capture closed: generated=%llu queued=%llu written=%llu committed=%llu "
-            "dropped=%llu late=%llu overflow=%llu failed=%d error='%s'",
+            "dropped=%llu late=%llu overflow=%llu depth_max=%llu write_latency_max_us=%llu failed=%d error='%s'",
             (unsigned long long)h->generated_frames,
             (unsigned long long)h->queued_frames,
             (unsigned long long)h->written_frames,
@@ -423,6 +434,8 @@ static void A3CAPTURE_CloseDevice(_THIS)
             (unsigned long long)h->dropped_frames,
             (unsigned long long)h->late_events,
             (unsigned long long)h->overflow_events,
+            (unsigned long long)h->queue_depth_max,
+            (unsigned long long)h->write_latency_max_us,
             h->failed ? 1 : 0, h->write_error);
     SDL_DestroyCond(h->cond);
     SDL_DestroyMutex(h->lock);

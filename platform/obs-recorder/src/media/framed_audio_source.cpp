@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <mutex>
 #include <thread>
+#include <cstdlib>
 #include <vector>
 
 namespace a3 {
@@ -255,6 +256,17 @@ void ReaderThread(FramedAudioData* d)
                     stats.submitted_start_sample = packet.header.sample_start;
                 ConvertAndPush(d, packet, ts, &stats);
                 if (packet.header.sample_count > 0) first_submitted = true;
+                // Test-only stall injection: the next packet is then observed
+                // as older than late_budget_ns.  Never enabled by default.
+                static bool test_delayed = false;
+                if (first_submitted && !test_delayed) {
+                    const char* delay_text = std::getenv("A3_FRAMED_TEST_DELAY_AFTER_FIRST_MS");
+                    if (delay_text && *delay_text) {
+                        test_delayed = true;
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(std::atoi(delay_text)));
+                    }
+                }
             }
             stats.validated_packets = validator.stats().validated_packets;
             stats.validated_frames = validator.stats().validated_frames;

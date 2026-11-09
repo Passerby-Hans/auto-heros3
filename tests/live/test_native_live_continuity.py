@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -88,18 +89,40 @@ def main() -> int:
                 result["native_exit"] = consumer.wait(timeout=args.seconds + 40)
             result["producer_exit"] = producer.wait(timeout=25)
         _, reference = load_reference(source)
-        expected = pcm[:reference["frames"]].tobytes()
         result["reference"] = reference
-        result["archive_equals_input_prefix"] = (
-            0 < reference["frames"] <= len(pcm) and
-            hashlib.sha256(expected).hexdigest() == reference["pcm_sha256"])
+        producer_text = (out / "producer.log").read_text("utf-8", errors="replace")
+        consumption = re.findall(r"PASS pcm_fixture_complete  consumed_bytes=(\d+) available_bytes=(\d+) exhausted=0",
+                                 producer_text)
+        if len(consumption) != 1:
+            raise RuntimeError("missing_unique_callback_consumption_record")
+        consumed_bytes, available_bytes = map(int, consumption[0])
+        if consumed_bytes % 4 or available_bytes != pcm.nbytes or not 0 < consumed_bytes <= available_bytes:
+            raise RuntimeError("invalid_callback_consumption_record")
+        consumed_frames = consumed_bytes // 4
+        # SDL_audio.c writes silence while its newly opened device is paused,
+        # and may do so once during CloseDevice. These are explicit bounded
+        # device intervals, not inferred AAC priming or compensated PCM gaps.
+        # Require the complete non-silent interval to be byte-identical to the
+        # callback input; do not locate and discard arbitrary bad interior data.
+        candidates = []
+        for head in (0, 1024):
+            tail = reference["frames"] - consumed_frames - head
+            if tail not in (0, 1024):
+                continue
+            expected = bytes(head * 4) + pcm[:consumed_frames].tobytes() + bytes(tail * 4)
+            if hashlib.sha256(expected).hexdigest() == reference["pcm_sha256"]:
+                candidates.append({"head_silent_frames": head, "tail_silent_frames": tail,
+                                   "callback_frames": consumed_frames})
+        result["device_pause_intervals"] = candidates
+        result["archive_equals_input_prefix"] = len(candidates) == 1
         if not result["archive_equals_input_prefix"]:
             raise RuntimeError("capture_archive_does_not_equal_preloaded_nonperiodic_fixture")
         fixture = dict(reference, schema="a3-pn-fixture/1", pattern="continuous_bandlimited_pn",
                        channels=2, seed=670887, generator="numpy.PCG64",
                        filter="129-tap Hamming bandpass 700..5000 Hz",
                        original_input_pcm_sha256=digest(pcm_path),
-                       verification="complete captured PCM equals preloaded input prefix")
+                       device_pause_intervals=candidates[0],
+                       verification="complete captured PCM equals callback input prefix plus bounded SDL paused blocks")
         source.with_suffix(source.suffix + ".fixture.json").write_text(json.dumps(fixture, indent=2), "utf-8")
         native = json.loads((out / "selftest.json").read_text("utf-8-sig"))
         result["native_status"] = native.get("status")

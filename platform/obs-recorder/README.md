@@ -44,6 +44,12 @@ and verifies that controller's process handle, accepts only its pipe connection,
 and exits if the owner dies or no first connection arrives within 30 seconds.
 Historical hand-written media-host `--serve` commands below must include these
 identity arguments; the separate S0 `obs-recorder` probe is unchanged.
+After a complete `shutdown` response, `ObsRecorder` sends a one-way
+`shutdown_ack` with the response's `seq` in `shutdown_seq`. The host waits at most one
+second for this receipt (or owner/pipe loss) before disconnecting; older clients
+without receipt support still exit within that deadline. Repeated adapter
+shutdown/close calls reuse the received response instead of issuing another
+shutdown command.
 
 ## Verified capability summary (actual observations)
 

@@ -1,4 +1,4 @@
-# Artifact / license notice — native recording experimental path
+# Artifact / license notice — local native recording
 
 Date: 2026-11-09
 
@@ -93,3 +93,18 @@ A successful native install may remain beside VCMI; explicit disk startup
 restores the canonical DLL using the managed deployment record. Unknown DLLs
 are not overwritten. No automatic mid-run fallback or public distribution
 bundle is implied by selecting this local default.
+
+## Failure behavior
+
+The controller owns each host before IPC preparation finishes. Native serve
+mode verifies the controller's PID and creation identity and bounds the first
+connection wait. Missing artifacts, incomplete audio, oversized final segments,
+and an unconfirmed stop remain failed or partial; video bytes alone do not
+make a successful recording.
+
+After a ten-second output deactivation timeout, the host writes failure evidence
+and avoids further libobs teardown calls. It exits with code 5 after shutdown,
+or within five seconds of publishing that failure if the controller does not
+finish shutdown. This contains a teardown failure; it does not claim that all
+causes of an OBS deactivation timeout have been eliminated. Completed shutdown
+responses use a bounded receipt handshake before the pipe is disconnected.

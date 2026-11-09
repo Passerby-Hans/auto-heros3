@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 import sys
+import threading
+from types import ModuleType
 import unittest
 from unittest.mock import patch
 
@@ -256,6 +259,100 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'native_cleanup_unconfirmed')
         self.assertEqual(recorder.pid, native.pid)
         self.assertIsNotNone(recorder.native_identity)
+
+    def test_shutdown_receipt_follows_full_response_and_is_cached(self):
+        recorder = self.recorder()
+        recorder._handle = object()
+        events = []
+        response = {'ok': True, 'cmd': 'shutdown', 'seq': 7, 'shutting_down': True}
+        def request(*args, **kwargs):
+            events.append('response_read')
+            return response
+        api = ModuleType('win32file')
+        def write(handle, payload):
+            events.append(json.loads(payload))
+            return 0, len(payload)
+        api.WriteFile = write
+        with patch.object(recorder, 'request', side_effect=request) as call, patch.dict(sys.modules, {'win32file': api}):
+            self.assertEqual(recorder.shutdown(), response)
+            self.assertEqual(recorder.shutdown(), response)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(events, ['response_read', {'cmd': 'shutdown_ack', 'shutdown_seq': 7}])
+        self.assertTrue(recorder.shutdown_ack_sent)
+
+    def test_close_after_shutdown_does_not_send_second_command(self):
+        recorder = self.recorder()
+        recorder._handle = object()
+        api = ModuleType('win32file')
+        writes, closes = [], []
+        api.WriteFile = lambda handle, payload: writes.append(payload)
+        api.CloseHandle = lambda handle: closes.append(handle)
+        with patch.dict(sys.modules, {'win32file': api}), \
+                patch.object(recorder, 'request', return_value={'ok': True, 'seq': 5}) as call:
+            recorder.shutdown()
+            recorder.close()
+            recorder.close()
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(closes), 1)
+
+    def test_ack_write_failure_does_not_erase_received_response(self):
+        recorder = self.recorder()
+        recorder._handle = object()
+        api = ModuleType('win32file')
+        def fail(*args):
+            raise OSError('peer exited')
+        api.WriteFile = fail
+        response = {'ok': True, 'seq': 5}
+        with patch.dict(sys.modules, {'win32file': api}), \
+                patch.object(recorder, 'request', return_value=response) as call:
+            self.assertEqual(recorder.shutdown(), response)
+            self.assertEqual(recorder.shutdown(), response)
+        self.assertFalse(recorder.shutdown_ack_sent)
+        self.assertIn('receipt write failed', recorder.last_error)
+        self.assertEqual(call.call_count, 1)
+
+    def test_unknown_shutdown_has_no_receipt(self):
+        recorder = self.recorder()
+        recorder._handle = object()
+        with patch.object(recorder, 'request', side_effect=ObsBackendError('no complete response')):
+            self.assertEqual(recorder.shutdown(), {})
+        self.assertFalse(recorder.shutdown_ack_sent)
+        self.assertIsNone(recorder._shutdown_response)
+
+    def test_old_server_response_without_seq_is_cached_without_invalid_receipt(self):
+        recorder = self.recorder()
+        with patch.object(recorder, 'request', return_value={'ok': True}) as call:
+            self.assertEqual(recorder.shutdown(), {'ok': True})
+            self.assertEqual(recorder.shutdown(), {'ok': True})
+        self.assertEqual(call.call_count, 1)
+        self.assertFalse(recorder.shutdown_ack_sent)
+
+    def test_concurrent_shutdowns_share_one_response_and_receipt(self):
+        recorder = self.recorder()
+        recorder._handle = object()
+        entered, release = threading.Event(), threading.Event()
+        def request(*args, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError('test barrier timed out')
+            return {'ok': True, 'seq': 11}
+        api = ModuleType('win32file')
+        receipts, results = [], []
+        api.WriteFile = lambda handle, payload: receipts.append(json.loads(payload))
+        with patch.dict(sys.modules, {'win32file': api}), patch.object(recorder, 'request', side_effect=request) as call:
+            a = threading.Thread(target=lambda: results.append(recorder.shutdown()))
+            b = threading.Thread(target=lambda: results.append(recorder.shutdown()))
+            a.start()
+            self.assertTrue(entered.wait(2))
+            b.start()
+            release.set()
+            a.join(2)
+            b.join(2)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(results, [{'ok': True, 'seq': 11}] * 2)
+        self.assertEqual(receipts, [{'cmd': 'shutdown_ack', 'shutdown_seq': 11}])
 
 
 if __name__ == '__main__':

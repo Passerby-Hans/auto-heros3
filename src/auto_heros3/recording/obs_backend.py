@@ -83,6 +83,9 @@ class ObsRecorder:
         self._events: list[dict] = []
         self._lock = threading.Lock()
         self._request_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_response: dict | None = None
+        self.shutdown_ack_sent = False
         self.last_error: str | None = None
         self._on_spawn = on_spawn
 
@@ -358,10 +361,34 @@ class ObsRecorder:
         return self.request('stop', timeout=timeout)
 
     def shutdown(self, timeout: float = 30.0) -> dict:
-        try:
-            return self.request('shutdown', timeout=timeout)
-        except ObsBackendError:
-            return {}
+        with self._shutdown_lock:
+            if self._shutdown_response is not None:
+                return dict(self._shutdown_response)
+            try:
+                response = self.request('shutdown', timeout=timeout)
+            except ObsBackendError:
+                return {}
+            if response.get('ok') is True:
+                # Receipt is sent only after parsing the complete response.
+                # Cache first: a broken ACK write must not repeat shutdown.
+                self._shutdown_response = dict(response)
+                seq = response.get('seq')
+                if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+                    ack = {'cmd': 'shutdown_ack', 'shutdown_seq': seq}
+                    with self._request_lock:
+                        try:
+                            import win32file
+                            if self._handle is None:
+                                raise ObsBackendError('recorder IPC not connected for shutdown receipt')
+                            win32file.WriteFile(self._handle,
+                                (json.dumps(ack) + '\n').encode('utf-8'))
+                            self.shutdown_ack_sent = True
+                        except Exception as exc:
+                            # The native host has its own <=1s receipt deadline.
+                            # A received response remains known even if it exits
+                            # before receiving this final, one-way receipt.
+                            self.last_error = f'shutdown receipt write failed: {exc}'
+            return response
 
     def _close_process(self, force: bool) -> None:
         """Clear an owner only after exit; retain it on uncertain cleanup."""

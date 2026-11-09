@@ -2646,6 +2646,7 @@ struct ServeSession {
 struct IpcReply {
     std::string line;
     bool shutdown = false;
+    int shutdown_seq = 0;
 };
 
 void WriteRequestId(JsonWriter& w, const IpcRequest& req)
@@ -3617,6 +3618,7 @@ IpcReply HandleIpcLine(ServeSession& sess, State& s, const std::string& line)
     } else if (req.cmd == "shutdown") {
         reply.line = ServeShutdown(sess, s, req);
         reply.shutdown = true;
+        reply.shutdown_seq = sess.seq;
     } else {
         reply.line = ReplyError(sess, req, "unsupported_command",
                                 "unknown command '" + req.cmd +
@@ -3634,6 +3636,71 @@ bool PipeWrite(HANDLE pipe, const std::string& text)
     DWORD written = 0;
     return WriteFile(pipe, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) &&
            written == payload.size();
+}
+
+void AwaitShutdownReceipt(HANDLE pipe, HANDLE owner, std::string& rx, int shutdown_seq)
+{
+    // DisconnectNamedPipe can discard an unread terminal response. Wait for
+    // explicit receipt, never an unbounded FlushFileBuffers or guessed delay.
+    const uint64_t started_ms = GetTickCount64();
+    if (rx.size() > 8192) {
+        std::printf("SERVE_SHUTDOWN_RECEIPT seq=%d result=oversized_pending_input\n", shutdown_seq);
+        std::fflush(stdout);
+        return;
+    }
+    bool connected = true;
+    while (true) {
+        bool acknowledged = false;
+        std::size_t newline = 0;
+        while ((newline = rx.find('\n')) != std::string::npos) {
+            const std::string line = rx.substr(0, newline);
+            rx.erase(0, newline + 1);
+            std::string cmd;
+            long long seq = 0;
+            bool found_cmd = false, found_seq = false;
+            if (json_extract_string(line, "cmd", &cmd, &found_cmd) && found_cmd &&
+                cmd == "shutdown_ack" &&
+                json_extract_int(line, "shutdown_seq", &seq, &found_seq) && found_seq &&
+                seq == shutdown_seq && shutdown_seq > 0) {
+                acknowledged = true;
+                break;
+            }
+            // No more commands are executed after shutdown, including a
+            // duplicate shutdown from an older client without receipt support.
+        }
+        const uint64_t elapsed_ms = GetTickCount64() - started_ms;
+        const auto decision = a3::DecideShutdownReceipt(acknowledged,
+            WaitForSingleObject(owner, 0) == WAIT_TIMEOUT, connected, elapsed_ms);
+        if (decision != a3::ShutdownReceiptDecision::Wait) {
+            const char* reason = decision == a3::ShutdownReceiptDecision::Acknowledged ? "acknowledged" :
+                decision == a3::ShutdownReceiptDecision::OwnerUnavailable ? "owner_exited" :
+                decision == a3::ShutdownReceiptDecision::PipeClosed ? "pipe_closed" : "timeout";
+            std::printf("SERVE_SHUTDOWN_RECEIPT seq=%d result=%s elapsed_ms=%llu\n",
+                        shutdown_seq, reason, static_cast<unsigned long long>(elapsed_ms));
+            std::fflush(stdout);
+            return;
+        }
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+            connected = false;
+            continue;
+        }
+        if (available) {
+            char bytes[4096];
+            DWORD got = 0;
+            const DWORD wanted = std::min<DWORD>(available, sizeof(bytes));
+            if (!ReadFile(pipe, bytes, wanted, &got, nullptr) || got == 0) {
+                connected = false;
+                continue;
+            }
+            rx.append(bytes, got);
+            if (rx.size() > 8192) {
+                connected = false; // bounded terminal-only parser; no new work
+            }
+            continue;
+        }
+        WaitForSingleObject(owner, static_cast<DWORD>(std::min<uint64_t>(5, 1000 - elapsed_ms)));
+    }
 }
 
 std::string NormalizePipeName(const std::string& requested)
@@ -3840,6 +3907,7 @@ int RunServeMode(State& s, const std::string& requested_pipe)
                     }
                 }
                 if (reply.shutdown) {
+                    AwaitShutdownReceipt(pipe, owner.value, rx, reply.shutdown_seq);
                     stop_serving = true;
                     exit_rc = s.output_shutdown_unconfirmed ? 5 : 0;
                     break;

@@ -23,6 +23,21 @@ int main()
     }
     // A replacement PID cannot be accepted merely because a peer connected.
     CHECK(DecideOwnerConnection(false, 400, true, 123, 123) == Decision::OwnerUnavailable);
+    using a3::DecideShutdownReceipt;
+    using Receipt = a3::ShutdownReceiptDecision;
+    CHECK(DecideShutdownReceipt(false, true, true, 0) == Receipt::Wait);
+    CHECK(DecideShutdownReceipt(false, true, true, 999) == Receipt::Wait);
+    CHECK(DecideShutdownReceipt(false, true, true, 1000) == Receipt::Timeout);
+    CHECK(DecideShutdownReceipt(false, true, true, 10000) == Receipt::Timeout);
+    CHECK(DecideShutdownReceipt(true, true, true, 1) == Receipt::Acknowledged);
+    CHECK(DecideShutdownReceipt(false, false, true, 1) == Receipt::OwnerUnavailable);
+    CHECK(DecideShutdownReceipt(false, true, false, 1) == Receipt::PipeClosed);
+    // Delayed receipt is accepted only after the controller actually read the
+    // response; until then the state remains bounded and explicitly pending.
+    for (uint64_t elapsed = 0; elapsed <= 500; elapsed += 5) {
+        CHECK(DecideShutdownReceipt(elapsed >= 500, true, true, elapsed) ==
+              (elapsed < 500 ? Receipt::Wait : Receipt::Acknowledged));
+    }
     std::printf("%u/%u checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }

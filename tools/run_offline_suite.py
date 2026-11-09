@@ -76,6 +76,9 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_p5_placement.py",
     "test_audio_mux.py",
     "test_native_media_contract.py",
+    "test_native_promotion.py",
+    "test_sdl_deployment.py",
+    "test_native_live_harness.py",
 )
 
 # LIVE suites: listed for transparency only; they run native capture/recording or

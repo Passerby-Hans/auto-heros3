@@ -6210,10 +6210,7 @@ def _obs_recorder_exe() -> Path:
     if env:
         return Path(env)
     base = ROOT / 'platform' / 'obs-recorder' / 'build-media' / 'bin'
-    product = base / 'auto-heros3-recorder.exe'
-    if product.exists():
-        return product
-    return base / 'obs-media-selftest.exe'
+    return base / 'auto-heros3-recorder.exe'
 
 
 def _size_cap_mb(max_segment_gb: float) -> int:
@@ -6226,20 +6223,28 @@ def _size_cap_mb(max_segment_gb: float) -> int:
 def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                          audio_framed: Path | None = None,
                          audio_framed_live: bool = False,
+                         audio_sdl_sha256: str = '',
                          max_time_sec: int, max_size_mb: int = 0,
                          overlay_path: Path | None = None) -> tuple[object, dict]:
     """Create/connect/prepare/start one native recorder process for a run."""
     from auto_heros3.recording.obs_backend import ObsRecorder
-    private_outputs_candidates = [
-        Path(__file__).resolve().parents[3] / 'platform' / 'obs-recorder' / 'bin' / 'a3-obs-outputs.dll',
-        Path(__file__).resolve().parents[3] / 'platform' / 'obs-recorder' / 'build-media' / 'a3outputs' / 'a3-obs-outputs.dll',
-    ]
-    private_outputs = next((p for p in private_outputs_candidates if p.exists()), None)
-    if private_outputs is None and os.environ.get('AUTO_HEROS3_ALLOW_SYSTEM_OUTPUTS') != '1':
-        raise RuntimeError('private_outputs_missing: platform/obs-recorder/bin/a3-obs-outputs.dll')
-    outputs_module = private_outputs
-    client = ObsRecorder(_obs_recorder_exe(), obs_dir=Path(r'C:\Program Files\obs-studio'),
-                         outputs_module=outputs_module,
+    from auto_heros3.recording.native_artifacts import NativeArtifactsError, load_native_artifacts
+    artifacts = load_native_artifacts(ROOT)
+    if _obs_recorder_exe().resolve() != artifacts['recorder_exe']:
+        raise NativeArtifactsError('native_recorder_override_mismatch', str(_obs_recorder_exe()))
+    if audio_sdl_sha256 and audio_sdl_sha256 != artifacts['private_sdl_sha256']:
+        raise NativeArtifactsError('native_session_sdl_mismatch',
+                                   'session uses a different SDL checkpoint; restart the session')
+    # Persist exactly which verified bytes this run was about to launch. These
+    # hashes describe build identity, not a successful media acceptance result.
+    _atomic_write_json(Path(out) / 'native-artifacts.json', {
+        'source_commit': artifacts['source_commit'],
+        'checkpoint_path': str(artifacts['checkpoint_path']),
+        'checkpoint_sha256': artifacts['checkpoint_sha256'],
+        'artifacts': artifacts['artifacts'],
+    })
+    client = ObsRecorder(artifacts['recorder_exe'], obs_dir=artifacts['obs_dir'],
+                         outputs_module=artifacts['outputs_module'],
                          log_path=Path(out) / 'server.log')
     try:
         client.connect()
@@ -6392,6 +6397,7 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
                 audio_raw=Path(cfg['audio_raw']) if cfg.get('audio_raw') and not cfg.get('audio_framed') else None,
                 audio_framed=Path(cfg['audio_framed']) if cfg.get('audio_framed') else None,
                 audio_framed_live=bool(cfg.get('audio_framed_live')),
+                audio_sdl_sha256=cfg.get('audio_sdl_sha256', ''),
                 max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0),
                 overlay_path=Path(cfg['overlay_path']) if cfg.get('overlay_path') else None)
             m.transition_run('recording')
@@ -6455,6 +6461,57 @@ def _active_recording_info() -> dict | None:
     return None
 
 
+def _select_native_audio_source(audio_framed: str = '', audio_framed_live: bool = False,
+                                *, identity: dict | None = None) -> dict:
+    """Select from the running session, never from leftover files or current env."""
+    from auto_heros3.recording.native_artifacts import NativeArtifactsError
+    if audio_framed:
+        # Explicit replay/live fixture diagnostics are a conscious source
+        # override, not an automatic fallback for a broken session source.
+        path = Path(audio_framed)
+        if not path.is_absolute():
+            path = _dir() / path
+        if not path.is_file():
+            raise NativeArtifactsError('audio_framed_missing', str(path))
+        return {'audio_raw': None, 'audio_framed': path,
+                'audio_framed_live': bool(audio_framed_live),
+                'audio_route': 'explicit_framed', 'audio_sdl_sha256': ''}
+    try:
+        agent = _agent()
+        session = agent.session or agent._load_session()
+    except Exception as exc:
+        raise NativeArtifactsError('native_audio_session_unavailable',
+                                   f'{type(exc).__name__}: {exc}') from exc
+    if session is None:
+        raise NativeArtifactsError('native_audio_session_missing', 'start a new session')
+    if identity and (session.client_pid != identity.get('client_pid')
+                     or session.session_id != identity.get('session_id')):
+        raise NativeArtifactsError('native_audio_session_mismatch',
+                                   'audio session and owned client identity differ')
+    driver = getattr(session, 'audio_driver', '')
+    explicit = getattr(session, 'audio_driver_explicit', False)
+    if driver != 'a3capture' and not (driver == 'disk' and explicit is True):
+        raise NativeArtifactsError('native_audio_driver_mismatch',
+                                   f'current session driver={driver!r}; restart with a3capture; '
+                                   'raw compatibility requires explicitly selected disk')
+    capture_file = getattr(session, 'audio_capture_file', '')
+    if not capture_file:
+        raise NativeArtifactsError('native_session_audio_path_missing', 'restart the session')
+    path = Path(capture_file)
+    if not path.is_absolute() or not path.is_file():
+        raise NativeArtifactsError('native_session_audio_missing', str(path))
+    if driver == 'a3capture':
+        if not Path(str(path) + '.ready').is_file():
+            raise NativeArtifactsError('native_audio_not_ready', str(path) + '.ready')
+        sdl_sha = getattr(session, 'audio_sdl_sha256', '')
+        if not re.fullmatch(r'[0-9a-f]{64}', sdl_sha):
+            raise NativeArtifactsError('native_session_audio_identity_missing', 'restart the session')
+        return {'audio_raw': None, 'audio_framed': path, 'audio_framed_live': True,
+                'audio_route': 'session_a3capture', 'audio_sdl_sha256': sdl_sha}
+    return {'audio_raw': path, 'audio_framed': None, 'audio_framed_live': False,
+            'audio_route': 'explicit_session_disk', 'audio_sdl_sha256': ''}
+
+
 def _recording_start_libobs(fps: int, height: int, crf: int,
                             rollover_seconds: float, max_segment_gb: float = 1.5,
                             audio_framed: str = "", audio_framed_live: bool = False) -> dict:
@@ -6470,26 +6527,13 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     client_pid = identity.get('client_pid')
     if not client_pid:
         return {'ok': False, 'error': 'no_owned_client', 'identity': identity}
-    audio_raw = _dir() / 'game-audio.raw'
-    framed_path = Path(audio_framed) if audio_framed else None
-    if framed_path is None:
-        # Default native path: use this session's a3capture file, never an
-        # arbitrary old file in the bridge directory.
-        try:
-            agent = _agent()
-            candidate = Path(agent.a3capture_file)
-            candidate_ready = Path(str(candidate) + '.ready')
-            if agent.audio_driver == 'a3capture' and candidate.exists() and candidate_ready.exists():
-                framed_path = candidate
-                audio_framed_live = True
-        except Exception:
-            pass
-    if framed_path is not None and not framed_path.is_absolute():
-        framed_path = _dir() / framed_path
-    if framed_path is not None and not framed_path.exists():
-        return {'ok': False, 'error': 'audio_framed_missing', 'path': str(framed_path)}
-    if framed_path is None and not audio_raw.exists():
-        return {'ok': False, 'error': 'game_audio_raw_missing', 'path': str(audio_raw)}
+    from auto_heros3.recording.native_artifacts import NativeArtifactsError
+    try:
+        audio = _select_native_audio_source(audio_framed, audio_framed_live, identity=identity)
+    except NativeArtifactsError as exc:
+        return {'ok': False, 'error': exc.code, 'detail': exc.detail, 'identity': identity}
+    audio_raw, framed_path = audio['audio_raw'], audio['audio_framed']
+    audio_framed_live = audio['audio_framed_live']
     lock = _acquire_recording_lock(identity)
     if not lock.get('ok'):
         return {'ok': False, 'error': lock.get('error'), 'owner': lock.get('lock_owner')}
@@ -6524,6 +6568,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
             audio_raw=(audio_raw if framed_path is None else None),
             audio_framed=framed_path,
             audio_framed_live=bool(audio_framed_live),
+            audio_sdl_sha256=audio['audio_sdl_sha256'],
             max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
             max_size_mb=_size_cap_mb(max_segment_gb),
             overlay_path=overlay_path)
@@ -6544,9 +6589,10 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     _atomic_write_json(out / 'identity.json', identity)
     config = {'fps': int(fps), 'height': int(height), 'crf': int(crf),
               'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
-              'client_pid': int(client_pid), 'audio_raw': str(audio_raw),
+              'client_pid': int(client_pid), 'audio_raw': str(audio_raw) if audio_raw else '',
               'audio_framed': str(framed_path) if framed_path else '',
               'audio_framed_live': bool(audio_framed_live),
+              'audio_route': audio['audio_route'], 'audio_sdl_sha256': audio['audio_sdl_sha256'],
               'max_time_sec': int(rollover_seconds) if rollover_seconds else 900,
               'max_size_mb': _size_cap_mb(max_segment_gb),
               'max_segment_gb': float(max_segment_gb),
@@ -6580,7 +6626,9 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     return {'ok': True, 'backend': 'libobs', 'dir': str(out),
             'pid': client.pid,
             'client_pid': client_pid, 'session_id': prep.get('session_id'),
-            'window': prep.get('window'), 'audio_raw': str(audio_raw),
+            'window': prep.get('window'), 'audio_raw': str(audio_raw) if audio_raw else '',
+            'audio_framed': str(framed_path) if framed_path else '',
+            'audio_framed_live': bool(audio_framed_live), 'audio_route': audio['audio_route'],
             'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
             'max_segment_gb': float(max_segment_gb),
             'max_size_mb': _size_cap_mb(max_segment_gb),
@@ -7010,7 +7058,7 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
 @mcp.tool()
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
-                    backend: str = 'legacy',
+                    backend: str = 'libobs',
                     max_segment_gb: float = 1.5,
                     audio_framed: str = "",
                     audio_framed_live: bool = False) -> dict:
@@ -7022,8 +7070,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     fps: target frame rate (default 60).  height: canvas height, 768 (1366x768) or
     1080 (1920x1080).  crf: x264 quality; 10 is visually near-lossless, 0 = lossless.
     Frames are streamed straight into the encoder - no intermediate files to clean up.
-    backend='legacy' is the current default; backend='libobs' is the explicit
-    native path.  Manual fallback: set AUTO_HEROS3_AUDIO_DRIVER=disk and restart
+    backend='libobs' is the default native path. Manual fallback: set
+    AUTO_HEROS3_AUDIO_DRIVER=disk and restart
     the session before using backend='legacy'.
     """
     if backend not in ('legacy', 'libobs'):
@@ -7036,6 +7084,16 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     if backend == 'libobs':
         return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds),
                                            float(max_segment_gb), audio_framed, audio_framed_live)
+    # Selecting the old video backend cannot change a running SDL driver. An
+    # old raw file is not evidence that this a3capture session produces disk PCM.
+    try:
+        session_audio = json.loads((_dir() / 'session.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        session_audio = {}
+    if isinstance(session_audio, dict) and session_audio.get('audio_driver') == 'a3capture':
+        return {'ok': False, 'error': 'legacy_audio_driver_mismatch',
+                'hint': 'set AUTO_HEROS3_AUDIO_DRIVER=disk and restart the session '
+                        'before using backend=legacy'}
     if _RUNTIME.recorder.get('client') is not None:
         return {'ok': False, 'error': 'recording_active', 'backend': 'libobs'}
     import subprocess

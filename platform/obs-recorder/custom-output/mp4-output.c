@@ -17,6 +17,7 @@
 
 #include "mp4-mux.h"
 #include "a3-stop-policy.h"
+#include "a3-split-policy.h"
 
 #include <inttypes.h>
 
@@ -80,6 +81,8 @@ struct mp4_output {
 	size_t max_size;
 
 	int64_t start_time;
+	int64_t start_pts_usec;
+	enum a3_split_reason split_reason;
 	int64_t max_time;
 	int64_t global_audio_delay_usec;
 	int64_t segment_audio_delay_usec;
@@ -315,7 +318,7 @@ static void *mp4_output_create_internal(obs_data_t *settings, obs_output_t *outp
 	pthread_mutex_init(&out->mutex, NULL);
 
 	signal_handler_t *sh = obs_output_get_signal_handler(output);
-	signal_handler_add(sh, "void file_changed(string next_file)");
+	signal_handler_add(sh, "void file_changed(string next_file, string split_reason, int boundary_pts_usec, int start_pts_usec, int closed_bytes)");
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	proc_handler_add(ph, "void split_file(out bool split_file_enabled)", split_file_proc, out);
@@ -430,6 +433,8 @@ static bool mp4_output_start(void *data)
 	out->cur_size = 0;
 	out->total_bytes = 0;
 	out->start_time = 0;
+	out->start_pts_usec = 0;
+	out->split_reason = A3_SPLIT_NONE;
 	out->global_audio_delay_usec = 0;
 	out->segment_audio_delay_usec = 0;
 	out->audio_ring_pos = 0;
@@ -526,18 +531,10 @@ static inline bool should_split(struct mp4_output *out, struct encoder_packet *p
 	if (!packet->keyframe)
 		return false;
 
-	if (os_atomic_load_bool(&out->manual_split))
-		return true;
-
-	/* reached maximum file size */
-	if (out->max_size > 0 && out->cur_size + (int64_t)packet->size >= out->max_size)
-		return true;
-
-	/* reached maximum duration */
-	if (out->max_time > 0 && packet->dts_usec - out->start_time >= out->max_time)
-		return true;
-
-	return false;
+	out->split_reason = a3_split_decide(os_atomic_load_bool(&out->manual_split),
+		out->cur_size, packet->size, out->max_size, packet_pts_usec(packet),
+		out->start_pts_usec, out->max_time);
+	return out->split_reason != A3_SPLIT_NONE;
 }
 
 static void find_best_filename(struct dstr *path, bool space)
@@ -608,6 +605,7 @@ static bool change_file(struct mp4_output *out, struct encoder_packet *pkt)
 	}
 
 	info("Waiting for file writer to finish...");
+	const int64_t closed_bytes = serializer_get_pos(&out->serializer);
 
 	/* flush/close file and destroy old muxer */
 	buffered_file_serializer_free(&out->serializer);
@@ -632,11 +630,20 @@ static bool change_file(struct mp4_output *out, struct encoder_packet *pkt)
 	calldata_t cd = {0};
 	signal_handler_t *sh = obs_output_get_signal_handler(out->output);
 	calldata_set_string(&cd, "next_file", out->path.array);
+	calldata_set_string(&cd, "split_reason", a3_split_name(out->split_reason));
+	calldata_set_int(&cd, "boundary_pts_usec", packet_pts_usec(pkt));
+	calldata_set_int(&cd, "start_pts_usec", out->start_pts_usec);
+	calldata_set_int(&cd, "closed_bytes", closed_bytes);
+	info("a3 rollover reason=%s start_pts_usec=%" PRId64 " boundary_pts_usec=%" PRId64
+	     " closed_bytes=%" PRId64 " size_trigger=%zu duration_trigger_usec=%" PRId64,
+	     a3_split_name(out->split_reason), out->start_pts_usec, packet_pts_usec(pkt),
+	     closed_bytes, out->max_size, out->max_time);
 	signal_handler_signal(sh, "file_changed", &cd);
 	calldata_free(&cd);
 
 	out->cur_size = 0;
 	out->start_time = pkt->dts_usec;
+	out->start_pts_usec = packet_pts_usec(pkt);
 
 	return true;
 }

@@ -478,6 +478,11 @@ void OnOutputFileChanged(void*, calldata_t* cd)
 {
     const char* next = calldata_string(cd, "next_file");
     RecordEvent("output_file_changed", next ? next : "<null>");
+    const char* reason = calldata_string(cd, "split_reason");
+    RecordEvent("output_rollover", std::string("reason=") + (reason ? reason : "UNKNOWN") +
+        "; start_pts_usec=" + std::to_string(calldata_int(cd, "start_pts_usec")) +
+        "; boundary_pts_usec=" + std::to_string(calldata_int(cd, "boundary_pts_usec")) +
+        "; closed_bytes=" + std::to_string(calldata_int(cd, "closed_bytes")));
 }
 
 // Source signal callbacks for the win-capture "window_capture" source
@@ -1172,7 +1177,7 @@ bool CreateEncodersAndOutput(State& s, const std::string& first_file_path)
     // The Hybrid MP4 muxer emits a "file_changed" signal on split; declare it
     // locally so the callback can record the exact split file names.
     s.output_signals = obs_output_get_signal_handler(s.output);
-    signal_handler_add(s.output_signals, "void file_changed(ptr output, string next_file)");
+    signal_handler_add(s.output_signals, "void file_changed(string next_file, string split_reason, int boundary_pts_usec, int start_pts_usec, int closed_bytes)");
     signal_handler_connect(s.output_signals, "starting", OnOutputStarting, nullptr);
     signal_handler_connect(s.output_signals, "start", OnOutputStart, nullptr);
     signal_handler_connect(s.output_signals, "stopping", OnOutputStopping, nullptr);

@@ -1,8 +1,9 @@
 """Explicit LIVE MCP stdio recording acceptance; never part of offline runs.
 
 Requires --execute and a new output directory. Refuses existing VCMI processes.
-Uses the existing display index 2; does not configure displays or audio endpoints.
-No game_act, cheats, audio playback, automatic backend fallback, or default changes.
+Uses existing display index 2 by default; does not configure displays or audio endpoints.
+An optional JSONL mailbox accepts individual controller requests; it never chooses
+game actions. No cheats, playback, automatic backend fallback, or default changes.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import shutil
 import sys
 import time
 import traceback
+import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = ROOT / "tools/mcp_server_v2.py"
@@ -162,7 +164,10 @@ def final_verdict(evidence: dict) -> dict:
         row.get("checks_ok") is True and row.get("native_checks_ok") is True for row in stops))
     if evidence.get("double_stop"):
         formal_stop_ok = formal_stop_ok and len(stops) == 2 and stops[0] == stops[1]
-    media_ok = bool(evidence.get("run_session_completed") is True and formal_stop_ok and
+    repeated_ok = ("recordings" not in evidence or
+        len(evidence["recordings"]) == evidence.get("requested_recordings", 1) and
+        all(row.get("checks_ok") is True for row in evidence["recordings"]))
+    media_ok = bool(evidence.get("run_session_completed") is True and formal_stop_ok and repeated_ok and
         evidence.get("tail_verifier", {}).get("v2_ok") is True and
         evidence.get("artifact_hashes_unchanged") is True and
         evidence.get("settings_restored_by_product") is True and
@@ -179,16 +184,209 @@ def final_verdict(evidence: dict) -> dict:
             "exit_code": 0 if ok else 2 if media_ok else 1}
 
 
-def isolated_env(out: Path) -> dict[str, str]:
+def isolated_env(out: Path, default_path: bool = False) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("AUTO_HEROS3_", "A3_", "A3CAPTURE_", "SDL_AUDIO"))}
-    env.update({"PYTHONIOENCODING": "utf8", "AUTO_HEROS3_AUDIO_DRIVER": "a3capture",
+           if not key.startswith(("AUTO_HEROS3_", "A3_", "A3CAPTURE_", "SDL_AUDIO", "SDL_DISKAUDIO"))}
+    env.update({"PYTHONIOENCODING": "utf8",
                 "AUTO_HEROS3_STATE_DIR": str(out / "state"),
                 "AUTO_HEROS3_SAVES_DIR": str(out / "saves"),
                 "AUTO_HEROS3_SAVE_SUBDIR": "native_e2e",
                 "AUTO_HEROS3_RECORDINGS_DIR": str(out / "recordings"),
                 "AUTO_HEROS3_MEMORY_ROOT": str(out / "player")})
+    if not default_path:
+        env["AUTO_HEROS3_AUDIO_DRIVER"] = "a3capture"
     return env
+
+
+def recording_arguments(args) -> dict:
+    """Default acceptance must omit defaults, rather than pass their expected values."""
+    result = {} if args.default_path else {"backend": "libobs"}
+    if args.rollover_seconds is not None:
+        result["rollover_seconds"] = args.rollover_seconds
+    elif not args.default_path:
+        result["rollover_seconds"] = 10
+    if args.max_segment_gb is not None:
+        result["max_segment_gb"] = args.max_segment_gb
+    return result
+
+
+def session_arguments(target: str, display_index: str) -> dict:
+    result = {"map_name": target}
+    if display_index != "default":
+        result["display_index"] = int(display_index)
+    return result
+
+
+def rollover_events(report: dict, required_reason: str | None = None) -> list[dict]:
+    events = []
+    for entry in report.get("output_events", []):
+        if entry.get("name") != "output_rollover":
+            continue
+        fields = dict(part.strip().split("=", 1) for part in entry.get("detail", "").split(";")
+                      if "=" in part)
+        event = {"at_ns": entry.get("t_ns"), "reason": fields.get("reason")}
+        for key in ("start_pts_usec", "boundary_pts_usec", "closed_bytes"):
+            event[key] = int(fields[key])
+        if event["boundary_pts_usec"] <= event["start_pts_usec"] or event["closed_bytes"] <= 0:
+            raise ValueError("invalid native rollover event")
+        events.append(event)
+    if required_reason and not any(row["reason"] == required_reason for row in events):
+        raise RuntimeError(f"required {required_reason} rollover was not observed")
+    return events
+
+
+def framed_identity(out: Path) -> dict:
+    """Read the actual current source; never infer it from requested backend alone."""
+    from dataclasses import asdict
+    from a3_framed import parse_header
+    state = json.loads((out / "state/recording.json").read_text(encoding="utf-8"))
+    session = json.loads((out / "state/session.json").read_text(encoding="utf-8"))
+    config = state.get("config", {})
+    expected = (out / "state/a3capture.raw").resolve()
+    actual = Path(config.get("audio_framed") or "").resolve()
+    ready = Path(str(expected) + ".ready")
+    if (actual != expected or config.get("audio_framed_live") is not True or
+            not ready.is_file() or not any("audio_sink=a3capture " in note
+                                          for note in session.get("notes", []))):
+        raise RuntimeError("current session did not select the ready live a3capture source")
+    with actual.open("rb") as handle:
+        header = handle.read(128)
+        packet = parse_header(header, 0)
+        if packet.payload_bytes > 131072:
+            raise RuntimeError("unexpected framed first packet size")
+        payload = handle.read(packet.payload_bytes)
+    if (len(payload) != packet.payload_bytes or
+            zlib.crc32(payload) & 0xffffffff != packet.payload_crc32 or
+            not packet.first or packet.sequence != 0 or packet.sample_start != 0):
+        raise RuntimeError("invalid first packet identity/CRC")
+    details = asdict(packet)
+    details.pop("payload", None)
+    return {"path": str(actual), "bytes_at_observation": actual.stat().st_size,
+            "first_header_sha256": hashlib.sha256(header).hexdigest(),
+            "first_header": details, "ready_path": str(ready),
+            "ready_text": ready.read_text(encoding="utf-8", errors="replace"),
+            "ready_sha256": sha(ready), "session_notes": session.get("notes", []),
+            "recording_config": config}
+
+
+CONTROL_READ_TOOLS = frozenset({"game_status", "game_observe", "game_events", "game_brief",
+    "game_action_status", "game_reconcile", "battle_actions", "battle_assess", "town_info",
+    "game_screenshot"})
+CONTROL_ACTIONS = frozenset({"move", "move_hero", "build", "recruit", "recruit_hero",
+    "open_hero", "transfer", "merge", "swap_stacks", "split", "upgrade", "market_trade",
+    "answer", "end_turn", "cast_spell", "battle_cast_spell", "battle_attack",
+    "battle_approach", "battle_move", "battle_defend", "battle_wait", "battle_result_ok",
+    "confirm_deployment", "close_window", "center_hero", "click"})
+
+
+class ControlMailbox:
+    """One ordered controller, one transport, durable dispatch log, no automatic retry."""
+    def __init__(self, out: Path):
+        self.out = out
+        self.path = out / "control-requests.jsonl"
+        self.path.touch(exist_ok=False)
+        self.results = out / "control-results.jsonl"
+        self.offset = 0
+        self.seen = set()
+        self.action_requests = set()
+        self.fence = None
+        self.recording_index = None
+        self.publish("waiting_for_recording")
+
+    def publish(self, state: str) -> None:
+        write_json(self.out / "control-state.json", {"state": state, "at": time.time(),
+            "recording_index": self.recording_index, "fence": self.fence,
+            "request_file": str(self.path), "result_file": str(self.results),
+            "tools": sorted(CONTROL_READ_TOOLS | {"game_act", "game_note"})})
+
+    def append(self, row: dict) -> None:
+        with self.results.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def next_request(self):
+        with self.path.open("rb") as handle:
+            if handle.seek(0, 2) < self.offset:
+                raise RuntimeError("control mailbox was truncated")
+            handle.seek(self.offset)
+            line = handle.readline(131073)
+            if not line or not line.endswith(b"\n"):
+                if len(line) > 131072:
+                    raise RuntimeError("control request exceeds 128 KiB")
+                return None
+            self.offset = handle.tell()
+        return json.loads(line.decode("utf-8-sig"))
+
+    def validate(self, request: dict) -> tuple[str, str, dict]:
+        if not isinstance(request, dict):
+            raise ValueError("request must be an object")
+        rid, tool, arguments = request.get("id"), request.get("tool"), request.get("arguments", {})
+        if not isinstance(rid, str) or not rid.strip() or len(rid) > 160:
+            raise ValueError("nonempty id required, at most 160 characters")
+        if rid in self.seen:
+            raise ValueError("duplicate control id; request will not be dispatched again")
+        self.seen.add(rid)
+        if tool not in CONTROL_READ_TOOLS | {"game_act", "game_note"}:
+            raise ValueError("tool is outside the controller allowlist")
+        if not isinstance(arguments, dict):
+            raise ValueError("arguments must be an object")
+        arguments = dict(arguments)
+        if tool == "game_act":
+            action_id = arguments.get("request_id")
+            if self.fence:
+                raise ValueError("unresolved game action; read/reconcile before further mutations")
+            if (arguments.get("action") not in CONTROL_ACTIONS or
+                    not isinstance(action_id, str) or not action_id.strip()):
+                raise ValueError("whitelisted game action and nonempty request_id required")
+            if action_id in self.action_requests:
+                raise ValueError("duplicate game request_id; use status/reconcile instead")
+            self.action_requests.add(action_id)
+        if tool == "game_screenshot":
+            target = Path(arguments.get("path") or self.out / "shots" / f"{len(self.seen):04d}.png").resolve()
+            if not target.is_relative_to((self.out / "shots").resolve()):
+                raise ValueError("screenshots must stay below the run shots directory")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            arguments["path"] = str(target)
+        return rid, tool, arguments
+
+    def apply_result(self, tool: str, arguments: dict, result: dict) -> None:
+        if tool == "game_act" and result.get("status") not in ("completed", "rejected"):
+            self.fence = {"request_id": arguments["request_id"], "action_id": result.get("action_id"),
+                          "status": result.get("status", "unknown")}
+        if not self.fence:
+            return
+        resolved = None
+        if tool == "game_reconcile" and arguments.get("request_id") == self.fence["request_id"]:
+            if result.get("resolved") is True:
+                resolved = result.get("result")
+        elif tool == "game_action_status" and arguments.get("action_id") == self.fence.get("action_id"):
+            if self.fence.get("action_id") and result.get("ok") is True:
+                resolved = result.get("action")
+        if isinstance(resolved, dict) and resolved.get("status") in ("completed", "rejected"):
+            self.fence = None
+
+    async def dispatch_one(self, call) -> None:
+        request = None
+        try:
+            request = self.next_request()
+            if request is None:
+                return
+            rid, tool, arguments = self.validate(request)
+        except (ValueError, TypeError) as exc:
+            self.append({"at": time.time(), "state": "rejected", "request": request, "error": str(exc)})
+            return
+        self.append({"at": time.time(), "id": rid, "state": "dispatching",
+                     "tool": tool, "arguments": arguments, "recording_index": self.recording_index})
+        try:
+            result = await call(tool, arguments, timeout=90)
+            self.apply_result(tool, arguments, result)
+            self.append({"at": time.time(), "id": rid, "state": "returned", "result": result})
+        except Exception as exc:
+            if tool == "game_act":
+                self.fence = {"request_id": arguments["request_id"], "action_id": None, "status": "unknown"}
+            self.append({"at": time.time(), "id": rid, "state": "unknown", "error": str(exc)})
+        self.publish("recording")
 
 
 def select_map(out: Path, requested_save: Path | None) -> tuple[str, dict]:
@@ -236,7 +434,8 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
     sys.path.insert(0, str(ROOT / "platform/audio-protocol/python"))
     from verify_tail_contract import check_run
 
-    env = isolated_env(out)
+    env = isolated_env(out, args.default_path)
+    mailbox = ControlMailbox(out) if args.control_requests else None
     target, evidence["game_target"] = select_map(out, args.save)
     write_json(out / "environment.json", {key: value for key, value in env.items()
                                          if key.startswith("AUTO_HEROS3_")})
@@ -274,7 +473,16 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                             result.model_dump(mode="json"), started=started)
                         if getattr(result, "is_error", getattr(result, "isError", False)):
                             raise RuntimeError(f"MCP tool error: {name}")
-                        return tool_payload(result)
+                        try:
+                            return tool_payload(result)
+                        except ValueError:
+                            if name != "game_screenshot" or not Path(arguments["path"]).is_file():
+                                raise
+                            target = Path(arguments["path"])
+                            sidecar = Path(str(target) + ".json")
+                            return {"ok": True, "path": str(target), "sha256": sha(target),
+                                    "sidecar": json.loads(sidecar.read_text(encoding="utf-8"))
+                                    if sidecar.is_file() else None}
                     except BaseException as exc:
                         log("tools/call", {"name": name, "arguments": arguments},
                             error=f"{type(exc).__name__}: {exc}", started=started)
@@ -300,7 +508,9 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                     if vcmi_processes():
                         raise RuntimeError("VCMI appeared before launch; refusing to touch it")
                     session_attempted = True
-                    start = await call("session_start", {"map_name": target, "display_index": 2}, timeout=360)
+                    session_args = session_arguments(target, args.display_index)
+                    evidence["session_arguments"] = session_args
+                    start = await call("session_start", session_args, timeout=360)
                     evidence["session_start"] = start
                     if start.get("ok") is not True or not start.get("client_pid"):
                         raise RuntimeError("session_start failed")
@@ -311,130 +521,161 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                     if evidence["staged_sdl_during"] != evidence["artifacts_before"]["private_sdl"]["sha256"]:
                         raise RuntimeError("VCMI staged SDL does not match private artifact")
                     observe("session_started")
-                    recording_attempted = True
-                    recording = await call("recording_start", {"backend": "libobs", "rollover_seconds": 10})
-                    evidence["recording_start"] = recording
-                    if recording.get("ok") is not True or recording.get("backend") != "libobs":
-                        raise RuntimeError("explicit native recording_start failed")
-                    result_dir = Path(recording["dir"]).resolve()
-                    if not result_dir.is_relative_to(out / "recordings"):
-                        raise RuntimeError("recorder output escaped test directory")
-                    owned_recorder = process_identity(int(recording["pid"]), ARTIFACTS["recorder"])
-                    owned_pids.add(owned_recorder["pid"])
-                    evidence["owned_recorder"] = owned_recorder
-                    started = time.monotonic()
-                    killed_once = False
-                    while time.monotonic() - started < args.seconds:
-                        observe("recording")
-                        status = await call("recording_status", timeout=15)
-                        if not status.get("recording"):
-                            raise RuntimeError("recording_status became inactive")
-                        if args.kill_native_once and not killed_once and time.monotonic() - started >= args.seconds / 2:
-                            import psutil
-                            state_path = out / "state/recording.json"
-                            prior = json.loads(state_path.read_text(encoding="utf-8"))
-                            if (int(prior.get("pid") or 0) != owned_recorder["pid"] or
-                                    Path(prior.get("dir") or "").resolve() != result_dir or
-                                    int(status.get("pid") or 0) != owned_recorder["pid"] or
-                                    not identity_alive(owned_recorder)):
-                                raise RuntimeError("refusing kill: native owner/state identity changed")
-                            # Revalidate all three identity components immediately
-                            # before terminating exactly this recorder process.
-                            if process_identity(owned_recorder["pid"], ARTIFACTS["recorder"]) != owned_recorder:
-                                raise RuntimeError("refusing kill: native PID was reused")
-                            fault = {"kind": "kill_native_once", "requested_at": time.time(),
-                                     "elapsed_s": time.monotonic() - started,
-                                     "old_identity": dict(owned_recorder), "old_state": prior,
-                                     "old_status": status, "status_samples": [],
-                                     "lossless_continuity_claim": False}
-                            evidence["fault_injection"] = fault
-                            write_json(out / "fault-injection.json", fault)
-                            victim = psutil.Process(owned_recorder["pid"])
-                            if (victim.create_time() != owned_recorder["create_time"] or
-                                    Path(victim.exe()).resolve() != Path(owned_recorder["exe"])):
-                                raise RuntimeError("refusing kill: final native process identity mismatch")
-                            victim.terminate()
-                            victim.wait(timeout=5)
-                            fault["terminated_at"] = time.time()
-                            killed_once = True
-                            restart_deadline = time.monotonic() + 45
-                            while time.monotonic() < restart_deadline:
-                                recovered_status = await call("recording_status", timeout=15)
-                                try:
-                                    persisted = json.loads(state_path.read_text(encoding="utf-8"))
-                                except (OSError, ValueError):
-                                    persisted = {}
-                                fault["status_samples"].append({"at": time.time(),
-                                    "mcp_status": recovered_status, "persisted_state": persisted})
+                    for recording_index in range(2 if args.two_recordings else 1):
+                        recording_attempted = True
+                        stopped = False
+                        arguments = recording_arguments(args)
+                        evidence["recording_arguments"] = arguments
+                        recording = await call("recording_start", arguments)
+                        evidence["recording_start"] = recording
+                        if recording.get("ok") is not True or recording.get("backend") != "libobs":
+                            raise RuntimeError("native recording_start failed")
+                        result_dir = Path(recording["dir"]).resolve()
+                        if not result_dir.is_relative_to(out / "recordings"):
+                            raise RuntimeError("recorder output escaped test directory")
+                        if any(Path(row["dir"]) == result_dir for row in evidence.get("recordings", [])):
+                            raise RuntimeError("second recording reused the first recording directory")
+                        owned_recorder = process_identity(int(recording["pid"]), ARTIFACTS["recorder"])
+                        owned_pids.add(owned_recorder["pid"])
+                        evidence["owned_recorder"] = owned_recorder
+                        evidence["framed_identity"] = framed_identity(out)
+                        write_json(out / f"framed-identity-{recording_index:02d}.json", evidence["framed_identity"])
+                        if mailbox:
+                            mailbox.recording_index = recording_index
+                            mailbox.publish("recording")
+                        started = time.monotonic()
+                        killed_once = False
+                        next_observation = started
+                        while time.monotonic() - started < args.seconds:
+                            if mailbox:
+                                await mailbox.dispatch_one(call)
+                            if time.monotonic() < next_observation:
+                                await asyncio.sleep(.2)
+                                continue
+                            next_observation = time.monotonic() + 5
+                            observe("recording")
+                            status = await call("recording_status", timeout=15)
+                            if not status.get("recording"):
+                                raise RuntimeError("recording_status became inactive")
+                            if args.kill_native_once and not killed_once and time.monotonic() - started >= args.seconds / 2:
+                                import psutil
+                                state_path = out / "state/recording.json"
+                                prior = json.loads(state_path.read_text(encoding="utf-8"))
+                                if (int(prior.get("pid") or 0) != owned_recorder["pid"] or
+                                        Path(prior.get("dir") or "").resolve() != result_dir or
+                                        int(status.get("pid") or 0) != owned_recorder["pid"] or
+                                        not identity_alive(owned_recorder)):
+                                    raise RuntimeError("refusing kill: native owner/state identity changed")
+                                # Revalidate all three identity components immediately
+                                # before terminating exactly this recorder process.
+                                if process_identity(owned_recorder["pid"], ARTIFACTS["recorder"]) != owned_recorder:
+                                    raise RuntimeError("refusing kill: native PID was reused")
+                                fault = {"kind": "kill_native_once", "requested_at": time.time(),
+                                         "elapsed_s": time.monotonic() - started,
+                                         "old_identity": dict(owned_recorder), "old_state": prior,
+                                         "old_status": status, "status_samples": [],
+                                         "lossless_continuity_claim": False}
+                                evidence["fault_injection"] = fault
                                 write_json(out / "fault-injection.json", fault)
-                                # recording_status does not currently expose
-                                # restart_count. Its liveness/PID must agree with
-                                # this test's persisted, atomically written state.
-                                new_pid = int(persisted.get("pid") or 0)
-                                if (recovered_status.get("recording") is True and
-                                        int(persisted.get("restart_count") or 0) >= 1 and
-                                        new_pid != owned_recorder["pid"] and
-                                        int(recovered_status.get("pid") or 0) == new_pid and
-                                        persisted.get("dir") == recovered_status.get("dir")):
-                                    new_dir = Path(persisted["dir"]).resolve()
-                                    if not new_dir.is_relative_to(out / "recordings"):
-                                        raise RuntimeError("restarted output escaped isolated directory")
-                                    owned_recorder = process_identity(new_pid, ARTIFACTS["recorder"])
-                                    evidence["owned_recorder"] = owned_recorder
-                                    owned_pids.add(new_pid)
-                                    result_dir = new_dir
-                                    fault.update({"recovered_at": time.time(),
-                                                  "new_identity": dict(owned_recorder),
-                                                  "new_state": persisted, "new_status": recovered_status,
-                                                  "restart_count_source": "isolated state/recording.json"})
+                                victim = psutil.Process(owned_recorder["pid"])
+                                if (victim.create_time() != owned_recorder["create_time"] or
+                                        Path(victim.exe()).resolve() != Path(owned_recorder["exe"])):
+                                    raise RuntimeError("refusing kill: final native process identity mismatch")
+                                victim.terminate()
+                                victim.wait(timeout=5)
+                                fault["terminated_at"] = time.time()
+                                killed_once = True
+                                restart_deadline = time.monotonic() + 45
+                                while time.monotonic() < restart_deadline:
+                                    recovered_status = await call("recording_status", timeout=15)
+                                    try:
+                                        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                                    except (OSError, ValueError):
+                                        persisted = {}
+                                    fault["status_samples"].append({"at": time.time(),
+                                        "mcp_status": recovered_status, "persisted_state": persisted})
                                     write_json(out / "fault-injection.json", fault)
-                                    break
-                                await asyncio.sleep(.5)
-                            else:
-                                raise RuntimeError("watchdog did not recover within 45s after injected kill")
-                        await asyncio.sleep(min(5, max(0, args.seconds - (time.monotonic() - started))))
-                    evidence["recording_wall_seconds"] = time.monotonic() - started
-                    if args.double_stop:
-                        replies = await asyncio.gather(call("recording_stop"), call("recording_stop"))
-                    else:
-                        replies = [await call("recording_stop")]
-                    evidence["recording_stop"] = replies
-                    stopped = True
-                    if not all(row.get("ok") is True and row.get("checks_ok") is True and
-                               row.get("native_checks_ok") is True for row in replies):
-                        raise RuntimeError("recording_stop validation failed")
-                    if args.double_stop and replies[0] != replies[1]:
-                        raise RuntimeError("concurrent stop did not return the same run result")
-                    if args.kill_native_once:
-                        if not killed_once or int(replies[0].get("restart_count") or 0) < 1:
-                            raise RuntimeError("kill injection/restart missing from final stop result")
-                        old_dir = Path(evidence["fault_injection"]["old_state"]["dir"]).resolve()
-                        old_runs = [row for row in replies[0].get("runs", [])
-                                    if Path(row.get("dir") or "").resolve() == old_dir and
-                                    row.get("manifest_state") in ("failed", "partial")]
-                        old_files = [row for row in replies[0].get("files", [])
-                                     if Path(row.get("run_dir") or "").resolve() == old_dir]
-                        if not old_runs or any(row.get("state") == "complete" for row in old_files):
-                            raise RuntimeError("killed run was omitted or promoted to complete")
-                        old_manifest = json.loads((old_dir / "s4b/manifest.json").read_text(encoding="utf-8"))
-                        if old_manifest.get("state") not in ("failed", "partial"):
-                            raise RuntimeError("killed run manifest lost its failed/partial state")
-                        evidence["recovery_validation"] = {"restart_count": replies[0]["restart_count"],
-                            "old_runs": old_runs, "old_files": old_files,
-                            "old_manifest_state": old_manifest["state"],
-                            "current_run": str(result_dir), "current_checks_ok": True,
-                            "lossless_continuity_claim": False}
-                    evidence["tail_verifier"] = check_run(result_dir)
-                    report = json.loads((result_dir / "selftest.json").read_text(encoding="utf-8"))
-                    audio = report.get("media", {}).get("audio", {})
-                    none = audio.get("monitoring_type_none_value")
-                    evidence["monitoring"] = audio
-                    if (none != 0 or audio.get("source_monitoring_type") != none or
-                            audio.get("raw_audio_source_monitoring_type") != none):
-                        raise RuntimeError("monitoring NONE was not observed")
-                    if not evidence["tail_verifier"].get("v2_ok"):
-                        raise RuntimeError("v2 tail/interval contract failed")
-                    observe("recording_stopped")
+                                    # recording_status does not currently expose
+                                    # restart_count. Its liveness/PID must agree with
+                                    # this test's persisted, atomically written state.
+                                    new_pid = int(persisted.get("pid") or 0)
+                                    if (recovered_status.get("recording") is True and
+                                            int(persisted.get("restart_count") or 0) >= 1 and
+                                            new_pid != owned_recorder["pid"] and
+                                            int(recovered_status.get("pid") or 0) == new_pid and
+                                            persisted.get("dir") == recovered_status.get("dir")):
+                                        new_dir = Path(persisted["dir"]).resolve()
+                                        if not new_dir.is_relative_to(out / "recordings"):
+                                            raise RuntimeError("restarted output escaped isolated directory")
+                                        owned_recorder = process_identity(new_pid, ARTIFACTS["recorder"])
+                                        evidence["owned_recorder"] = owned_recorder
+                                        owned_pids.add(new_pid)
+                                        result_dir = new_dir
+                                        fault.update({"recovered_at": time.time(),
+                                                      "new_identity": dict(owned_recorder),
+                                                      "new_state": persisted, "new_status": recovered_status,
+                                                      "restart_count_source": "isolated state/recording.json"})
+                                        write_json(out / "fault-injection.json", fault)
+                                        break
+                                    await asyncio.sleep(.5)
+                                else:
+                                    raise RuntimeError("watchdog did not recover within 45s after injected kill")
+                            await asyncio.sleep(min(.2 if mailbox else 5,
+                                                    max(0, args.seconds - (time.monotonic() - started))))
+                        evidence["recording_wall_seconds"] = time.monotonic() - started
+                        if args.double_stop:
+                            replies = await asyncio.gather(call("recording_stop"), call("recording_stop"))
+                        else:
+                            replies = [await call("recording_stop")]
+                        evidence["recording_stop"] = replies
+                        stopped = True
+                        if not all(row.get("ok") is True and row.get("checks_ok") is True and
+                                   row.get("native_checks_ok") is True for row in replies):
+                            raise RuntimeError("recording_stop validation failed")
+                        if args.double_stop and replies[0] != replies[1]:
+                            raise RuntimeError("concurrent stop did not return the same run result")
+                        if args.kill_native_once:
+                            if not killed_once or int(replies[0].get("restart_count") or 0) < 1:
+                                raise RuntimeError("kill injection/restart missing from final stop result")
+                            old_dir = Path(evidence["fault_injection"]["old_state"]["dir"]).resolve()
+                            old_runs = [row for row in replies[0].get("runs", [])
+                                        if Path(row.get("dir") or "").resolve() == old_dir and
+                                        row.get("manifest_state") in ("failed", "partial")]
+                            old_files = [row for row in replies[0].get("files", [])
+                                         if Path(row.get("run_dir") or "").resolve() == old_dir]
+                            if not old_runs or any(row.get("state") == "complete" for row in old_files):
+                                raise RuntimeError("killed run was omitted or promoted to complete")
+                            old_manifest = json.loads((old_dir / "s4b/manifest.json").read_text(encoding="utf-8"))
+                            if old_manifest.get("state") not in ("failed", "partial"):
+                                raise RuntimeError("killed run manifest lost its failed/partial state")
+                            evidence["recovery_validation"] = {"restart_count": replies[0]["restart_count"],
+                                "old_runs": old_runs, "old_files": old_files,
+                                "old_manifest_state": old_manifest["state"],
+                                "current_run": str(result_dir), "current_checks_ok": True,
+                                "lossless_continuity_claim": False}
+                        evidence["tail_verifier"] = check_run(result_dir)
+                        report = json.loads((result_dir / "selftest.json").read_text(encoding="utf-8"))
+                        events = rollover_events(report, args.require_rollover_reason)
+                        evidence["rollover_events"] = events
+                        audio = report.get("media", {}).get("audio", {})
+                        none = audio.get("monitoring_type_none_value")
+                        evidence["monitoring"] = audio
+                        if (none != 0 or audio.get("source_monitoring_type") != none or
+                                audio.get("raw_audio_source_monitoring_type") != none):
+                            raise RuntimeError("monitoring NONE was not observed")
+                        if not evidence["tail_verifier"].get("v2_ok"):
+                            raise RuntimeError("v2 tail/interval contract failed")
+                        observe("recording_stopped")
+                        evidence.setdefault("recordings", []).append({"index": recording_index,
+                            "dir": str(result_dir), "game_identity": dict(owned_game),
+                            "recorder_identity": dict(owned_recorder), "arguments": arguments,
+                            "start": recording, "stop": replies, "tail_verifier": evidence["tail_verifier"],
+                            "framed_identity": evidence["framed_identity"], "monitoring": audio,
+                            "wall_seconds": evidence["recording_wall_seconds"],
+                            "rollover_events": events, "checks_ok": True})
+                        write_json(out / "recordings.json", evidence["recordings"])
+                        if mailbox:
+                            mailbox.publish("between_recordings")
                 finally:
                     # A timed-out session_start may have created our session
                     # before its response was lost. Recover only the fresh
@@ -471,13 +712,27 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                             evidence.setdefault("forced_cleanup_errors", {})[key] = str(exc)
                     evidence["owned_game_left_alive"] = identity_alive(owned_game)
                     evidence["owned_recorder_left_alive"] = identity_alive(owned_recorder)
+                    if mailbox:
+                        mailbox.publish("finished")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
     parser.add_argument("--execute", action="store_true", help="explicitly start the live game and recording")
-    parser.add_argument("--seconds", type=int, choices=(60, 600), default=60)
+    parser.add_argument("--seconds", type=int, default=60, help="duration per recording, 1..3600 seconds")
+    parser.add_argument("--default-path", action="store_true",
+                        help="remove audio overrides and omit recording_start backend/rollover defaults")
+    parser.add_argument("--rollover-seconds", type=float,
+                        help="explicit test threshold; omitted in default-path acceptance")
+    parser.add_argument("--max-segment-gb", type=float, help="explicit size test cap, e.g. 0.02")
+    parser.add_argument("--two-recordings", action="store_true", help="two recordings in the same game session")
+    parser.add_argument("--control-requests", action="store_true",
+                        help="accept explicit controller requests via out/control-requests.jsonl")
+    parser.add_argument("--display-index", default="2",
+                        help="existing display index, or 'default' to omit the session argument; never changes topology")
+    parser.add_argument("--require-rollover-reason", choices=("TIME", "SIZE"),
+                        help="require an actual native rollover reason, not just multiple clips")
     parser.add_argument("--double-stop", action="store_true")
     parser.add_argument("--kill-native-once", action="store_true",
                         help="terminate only the verified owned native PID halfway through; require watchdog recovery")
@@ -487,6 +742,14 @@ def main() -> int:
     args = parser.parse_args()
     if not args.execute:
         parser.error("LIVE test requires --execute; no game or recorder started")
+    if not 1 <= args.seconds <= 3600:
+        parser.error("--seconds must be between 1 and 3600")
+    if args.rollover_seconds is not None and not 0 < args.rollover_seconds <= 3600:
+        parser.error("--rollover-seconds must be positive and at most 3600")
+    if args.max_segment_gb is not None and not 0 < args.max_segment_gb <= 1.5:
+        parser.error("--max-segment-gb must be positive and at most 1.5")
+    if args.display_index != "default" and not args.display_index.isdecimal():
+        parser.error("--display-index must be a nonnegative integer or default")
     if vcmi_processes():
         parser.error("existing VCMI process detected; stop it separately before this test")
     out = args.out.resolve()
@@ -495,6 +758,12 @@ def main() -> int:
         parser.error("out must be a fresh directory below the repository var directory")
     out.mkdir(parents=True, exist_ok=False)
     evidence = {"requested_seconds": args.seconds, "double_stop": args.double_stop,
+                "requested_recordings": 2 if args.two_recordings else 1,
+                "default_path": args.default_path, "control_requests": args.control_requests,
+                "display_index_argument": args.display_index,
+                "required_rollover_reason": args.require_rollover_reason,
+                "rollover_seconds_argument": args.rollover_seconds,
+                "max_segment_gb_argument": args.max_segment_gb,
                 "kill_native_once": args.kill_native_once,
                  "observe_endpoint_changes": args.observe_endpoint_changes,
                 "default_backend_changed": False, "physical_playback_requested": False,
@@ -505,7 +774,7 @@ def main() -> int:
     if settings_before is not None:
         (out / "settings-before.bin").write_bytes(settings_before)
     runtime_sdl_before = {}
-    for name in ("SDL2.dll", "SDL2.dll.original"):
+    for name in ("SDL2.dll", "SDL2.dll.original", ".a3-sdl-deployment.json"):
         path = GAME.parent / name
         runtime_sdl_before[name] = path.read_bytes() if path.exists() else None
         if runtime_sdl_before[name] is not None:
@@ -536,6 +805,9 @@ def main() -> int:
                 evidence["settings_restored_by_harness"] = True
             evidence["settings_bytes_restored"] = (SETTINGS.read_bytes() if SETTINGS.exists() else None) == settings_before
             if not remaining:
+                evidence["runtime_sdl_bytes_restored_by_product"] = all(
+                    (GAME.parent / name).read_bytes() == data if data is not None else
+                    not (GAME.parent / name).exists() for name, data in runtime_sdl_before.items())
                 # session_start stages only this process-local DLL location.
                 # Restore precisely the files this test observed before launch.
                 for name, original in runtime_sdl_before.items():

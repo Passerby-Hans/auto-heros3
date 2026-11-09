@@ -136,6 +136,12 @@ class Session:
     exe: str = str(EXE)
     created_at: float = 0.0
     protocol: int = PROTOCOL_VERSION
+    # Bind recording to the configuration of this running client, not a new
+    # MCP process's environment. Empty values identify pre-binding sessions.
+    audio_driver: str = ''
+    audio_driver_explicit: bool = False
+    audio_capture_file: str = ''
+    audio_sdl_sha256: str = ''
     notes: list = field(default_factory=list)
 
     def alive(self) -> bool:
@@ -205,9 +211,12 @@ class VcmiAgent:
         self.audio_ready_path = self.dir / 'audio-relay.ready'
         self.audio_relay_proc: subprocess.Popen | None = None
         self.audio_pipe_name: str | None = None
-        # A2 spike hook.  Default remains the existing SDL disk sink.  The
-        # private backend is selected explicitly for staged-DLL experiments.
-        self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'disk').strip()
+        # Private capture is recording-only; explicit disk selects the legacy
+        # path. The actual driver is persisted in Session for recorder routing.
+        self.audio_driver = os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', 'a3capture').strip()
+        self.audio_driver_explicit = bool(os.environ.get('AUTO_HEROS3_AUDIO_DRIVER', '').strip())
+        self.sdl_deployment: dict = {}
+        self._sdl_stage_active = False
         a3path = os.environ.get('AUTO_HEROS3_A3CAPTURE_FILE',
                                 str(self.dir / 'a3capture.raw'))
         self.a3capture_file = Path(a3path)
@@ -371,34 +380,51 @@ class VcmiAgent:
         return stage / 'SDL2.dll', stage / 'SDL2-original.dll', EXE.parent / 'SDL2.dll'
 
     def _restore_private_sdl(self) -> None:
-        """Restore the pinned original SDL2.dll before a non-a3capture run."""
-        import hashlib
-        import shutil
-        private, original, dst = self._sdl_paths()
-        if not original.exists() or not dst.exists():
-            return
-        private_hash = hashlib.sha256(private.read_bytes()).hexdigest() if private.exists() else ''
-        dst_hash = hashlib.sha256(dst.read_bytes()).hexdigest()
-        if dst_hash == private_hash:
-            shutil.copy2(original, dst)
-            self._print(f'[agent] restored original SDL2.dll from {original}')
+        """Restore canonical SDL, including private versions from prior builds.
+
+        This intentionally has no dependency on native recorder/module health:
+        a missing native module must not prevent explicit legacy recovery.
+        """
+        from auto_heros3.recording.native_artifacts import load_original_sdl, NativeArtifactsError
+        from auto_heros3.runtime.sdl_deployment import deploy_sdl, SdlDeploymentError
+        try:
+            artifacts = load_original_sdl(ROOT)
+            self.sdl_deployment = deploy_sdl(self._sdl_paths()[2], artifacts, private=False)
+        except (NativeArtifactsError, SdlDeploymentError) as exc:
+            raise BridgeError(str(exc)) from exc
+        self._sdl_stage_active = False
+        self._print(f'[agent] canonical SDL2.dll verified sha256={self.sdl_deployment["sha256"][:12]}')
 
     def _ensure_private_sdl(self) -> None:
-        """Stage the pinned a3capture SDL2 build next to VCMI_client.exe."""
-        import hashlib
-        import shutil
-        src, original, dst = self._sdl_paths()
-        if not src.exists() or not original.exists():
-            raise BridgeError(f'a3capture private SDL2/original missing under {src.parent}')
-        src_hash = hashlib.sha256(src.read_bytes()).hexdigest()
-        dst_hash = hashlib.sha256(dst.read_bytes()).hexdigest() if dst.exists() else None
-        if dst_hash == src_hash:
+        """Install only checkpoint-verified a3capture, with durable ownership."""
+        from auto_heros3.recording.native_artifacts import load_native_artifacts, NativeArtifactsError
+        from auto_heros3.runtime.sdl_deployment import deploy_sdl, SdlDeploymentError
+        try:
+            artifacts = load_native_artifacts(ROOT)
+            # A failure after atomic replacement but before receipt publication
+            # must still trigger the launcher's canonical-original rollback.
+            self._sdl_stage_active = True
+            self.sdl_deployment = deploy_sdl(self._sdl_paths()[2], artifacts, private=True)
+        except (NativeArtifactsError, SdlDeploymentError) as exc:
+            raise BridgeError(str(exc)) from exc
+        self._print(f'[agent] managed private SDL2.dll verified '
+                    f'sha256={self.sdl_deployment["sha256"][:12]}')
+
+    def _rollback_failed_sdl_stage(self) -> None:
+        if not self._sdl_stage_active:
             return
-        # The canonical original is the staged build artifact, not whatever a
-        # previous experiment left in the app directory.
-        shutil.copy2(original, EXE.parent / 'SDL2.dll.original')
-        shutil.copy2(src, dst)
-        self._print(f'[agent] staged private SDL2.dll sha256={src_hash[:12]} -> {dst}')
+        # DLL replacement is only safe after all clients are gone. Do not
+        # terminate an unowned client merely to make rollback possible.
+        alive = []
+        for process in psutil.process_iter(['pid', 'name']):
+            try:
+                if (process.info['name'] or '').lower() == 'vcmi_client.exe':
+                    alive.append(process.info['pid'])
+            except psutil.Error:
+                continue
+        if alive:
+            raise BridgeError(f'sdl_rollback_deferred: VCMI clients still alive pids={alive}')
+        self._restore_private_sdl()
 
     def _start_audio_relay(self) -> None:
         """Create the SDL disk-audio pipe relay before the client starts.
@@ -458,6 +484,21 @@ class VcmiAgent:
             pass
 
     def start(self, timeout: float = 120.0) -> bool:
+        self._sdl_stage_active = False
+        try:
+            started = self._start_impl(timeout)
+            if not started and self._sdl_stage_active:
+                self._abort_start()
+            return started
+        except Exception as exc:
+            if self._sdl_stage_active:
+                try:
+                    self._abort_start()
+                except Exception as cleanup_exc:
+                    raise BridgeError(f'{exc}; startup_cleanup_failed: {cleanup_exc}') from exc
+            raise
+
+    def _start_impl(self, timeout: float = 120.0) -> bool:
         self.dir.mkdir(parents=True, exist_ok=True)
         # Host command safety: validate the map name *before* any process/file side effects.
         if self.map_name and not MAP_NAME_RE.match(self.map_name):
@@ -636,7 +677,11 @@ class VcmiAgent:
                     raise BridgeError('a3capture audio_ready=false')
         sess = Session(dir=str(self.dir), map_name=self.map_name, client_pid=client_pid,
                        client_create_time=create_time, launcher_pid=self.proc.pid,
-                       created_at=time.time())
+                       created_at=time.time(), audio_driver=self.audio_driver,
+                       audio_driver_explicit=self.audio_driver_explicit,
+                       audio_capture_file=str(self.a3capture_file if self.audio_driver == 'a3capture'
+                                              else self.audio_sink_path),
+                       audio_sdl_sha256=self.sdl_deployment.get('sha256', ''))
         rect = self._window_rect()
         sess.notes.append(f'window_rect={rect} offscreen={self.window_is_offscreen()}')
         if self.audio_driver == 'a3capture':
@@ -657,6 +702,9 @@ class VcmiAgent:
                 f"repo_head={self.contract.get('repo_head')} "
                 f"client_source_matches_head={self.contract.get('source_matches_head')}")
         self._save_session(sess)
+        # A successful managed install may remain for subsequent native starts.
+        # Only a failed launch rolls back automatically; disk starts restore it.
+        self._sdl_stage_active = False
         self._print(f'[agent] client pid={client_pid} (owned by session {sess.session_id or "?"})')
         return True
 
@@ -683,6 +731,7 @@ class VcmiAgent:
         self._stop_audio_relay()
         self._restore_video_settings()
         self.proc = None
+        self._rollback_failed_sdl_stage()
 
     def _patch_video_settings(self) -> None:
         """Temporarily set display/audio launch settings, preserving exact bytes.
@@ -776,13 +825,8 @@ class VcmiAgent:
             user32.SetWindowPos(self.hwnd, 0, 0, 0, 0, 0, 0x1 | 0x4 | 0x10)
         # display_index is not None: keep the first-created SDL window exactly where the
         # launcher placed it; no post-creation move means the first-placement contract holds.
-        try:
-            from agent.h3.audio import set_mute
-            for p in psutil.process_iter(['pid', 'name']):
-                if (p.info['name'] or '').lower().startswith('vcmi'):
-                    set_mute(p.info['pid'], True)
-        except Exception as exc:                      # pragma: no cover
-            self._print(f'[agent] mute skipped: {exc}')
+        # Both supported drivers capture to files/pipes without opening a
+        # playback endpoint. Do not modify any Windows audio session control.
 
     def _kill_owned(self, sess: Session, timeout: float = 12.0) -> bool:
         self._stop_watch.set()

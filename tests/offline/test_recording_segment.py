@@ -177,7 +177,7 @@ def test_recording_start_stop_identity(tmp_path: Path) -> None:
         subprocess.Popen = lambda *args, **kwargs: FakeProc()
         M._recorder.update({'proc': None, 'dir': None})
         try:
-            started = M.recording_start(fps=15, height=768)
+            started = M.recording_start(backend='legacy', fps=15, height=768)
             out = Path(started['dir'])
             identity = json.loads((out / 'identity.json').read_text(encoding='utf-8'))
             required = {'run_id', 'branch_id', 'epoch', 'segment_id', 'recording_started_at',

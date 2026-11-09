@@ -104,6 +104,12 @@ set_target_properties(stop-policy-tests PROPERTIES
   OUTPUT_NAME "stop-policy-tests"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+add_executable(split-policy-tests custom-output/tests/test-split-policy.c)
+target_compile_options(split-policy-tests PRIVATE /W4 /utf-8)
+set_target_properties(split-policy-tests PROPERTIES
+  OUTPUT_NAME "split-policy-tests"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # ---------------------------------------------------------------------------
 # S1b: libobs media self-test executable (obs-media-selftest.exe)
 #

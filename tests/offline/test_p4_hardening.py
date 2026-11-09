@@ -76,9 +76,9 @@ def main() -> int:
         (M.ROOT / 'tools').mkdir(parents=True, exist_ok=True)
         sp.Popen = lambda *a, **k: FakeProc(*a, **k)
         try:
-            first = M.recording_start(fps=5, height=768)
+            first = M.recording_start(backend='legacy', fps=5, height=768)
             check('P4-1 recording_start spawns once', first.get('ok') is True, str(first))
-            second = M.recording_start(fps=5, height=768)
+            second = M.recording_start(backend='legacy', fps=5, height=768)
             check('P4-1b second recording_start -> recording_active',
                   second.get('ok') is False and second.get('error') == 'recording_active',
                   str(second.get('error')))
@@ -88,7 +88,7 @@ def main() -> int:
                   str(state))
             # simulate MCP restart: drop the in-memory handle but keep the state file
             M._recorder.update({'proc': None, 'dir': None})
-            third = M.recording_start(fps=5, height=768)
+            third = M.recording_start(backend='legacy', fps=5, height=768)
             check('P4-2 restart sees live recorder -> recording_active',
                   third.get('error') == 'recording_active', str(third))
             status = M.recording_status()
@@ -120,7 +120,7 @@ def main() -> int:
             dead_dir.mkdir(parents=True, exist_ok=True)
             M._atomic_write_json(M._recording_state_path(),
                                  {'pid': 99999999, 'dir': str(dead_dir), 'started': 0})
-            fresh = M.recording_start(fps=5, height=768)
+            fresh = M.recording_start(backend='legacy', fps=5, height=768)
             check('P4-3 stale (dead) recording record does not block',
                   fresh.get('ok') is True, str(fresh))
             M.recording_stop()

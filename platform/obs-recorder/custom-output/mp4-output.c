@@ -91,6 +91,11 @@ struct mp4_output {
 	unsigned audio_ring_count;
 	bool has_last_audio;
 	bool has_prev_audio;
+	uint64_t audio_packets;
+	uint64_t video_packets;
+	int64_t last_video_pts_usec;
+	int64_t prev_video_pts_usec;
+	int64_t video_frame_usec;
 	struct encoder_packet last_audio;
 	struct encoder_packet prev_audio;
 
@@ -215,6 +220,22 @@ static void mp4_add_chapter_proc(void *data, calldata_t *cd)
 	pthread_mutex_unlock(&out->mutex);
 }
 
+
+static void a3_audio_state_proc(void *data, calldata_t *cd)
+{
+	struct mp4_output *out = data;
+	pthread_mutex_lock(&out->mutex);
+	const int64_t video_target = out->last_video_pts_usec +
+		(out->video_frame_usec > 0 ? out->video_frame_usec : 16667);
+	const int64_t audio_end = out->has_last_audio
+		? packet_pts_usec(&out->last_audio) + 23220 : 0;
+	calldata_set_int(cd, "audio_packets", (long long)out->audio_packets);
+	calldata_set_int(cd, "audio_end_usec", (long long)audio_end);
+	calldata_set_int(cd, "video_target_usec", (long long)video_target);
+	calldata_set_int(cd, "audio_ready", audio_end >= video_target ? 1 : 0);
+	pthread_mutex_unlock(&out->mutex);
+}
+
 static void split_file_proc(void *data, calldata_t *cd)
 {
 	struct mp4_output *out = data;
@@ -238,6 +259,7 @@ static void *mp4_output_create_internal(obs_data_t *settings, obs_output_t *outp
 
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	proc_handler_add(ph, "void split_file(out bool split_file_enabled)", split_file_proc, out);
+	proc_handler_add(ph, "void get_a3_audio_state(out int audio_packets, out int audio_end_usec, out int video_target_usec, out int audio_ready)", a3_audio_state_proc, out);
 	proc_handler_add(ph, "void add_chapter(string chapter_name)", mp4_add_chapter_proc, out);
 
 	UNUSED_PARAMETER(settings);
@@ -592,6 +614,15 @@ static void mp4_output_packet(void *data, struct encoder_packet *packet)
 		out->audio_ring[out->audio_ring_pos].bytes = packet->size;
 		out->audio_ring_pos = (out->audio_ring_pos + 1) % 8;
 		if (out->audio_ring_count < 8) out->audio_ring_count++;
+		out->audio_packets++;
+	} else if (packet->type == OBS_ENCODER_VIDEO) {
+		out->video_packets++;
+		out->prev_video_pts_usec = out->last_video_pts_usec;
+		out->last_video_pts_usec = packet_pts_usec(packet);
+		if (out->prev_video_pts_usec &&
+		    out->last_video_pts_usec > out->prev_video_pts_usec)
+			out->video_frame_usec =
+				out->last_video_pts_usec - out->prev_video_pts_usec;
 	}
 
 	if (out->split_file_enabled) {

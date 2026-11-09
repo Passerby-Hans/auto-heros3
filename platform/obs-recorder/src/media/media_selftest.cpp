@@ -40,6 +40,8 @@
 // the latter is not self-sufficient under `#pragma once` if entered first.
 #include <obs.h>
 #include <obs-source.h>
+#include <callback/proc.h>
+#include <callback/calldata.h>
 
 #include <util/platform.h>
 #include <util/windows/window-helpers.h>
@@ -1647,6 +1649,25 @@ bool RecordForDuration(State& s)
     return true;
 }
 
+static bool QueryAudioOutputState(obs_output_t *output, int64_t *audio_end,
+                                 int64_t *video_target, int64_t *packets)
+{
+    if (!output) return false;
+    proc_handler_t *ph = obs_output_get_proc_handler(output);
+    if (!ph) return false;
+    calldata_t *cd = calldata_create();
+    if (!cd) return false;
+    const bool called = proc_handler_call(ph, "get_a3_audio_state", cd);
+    if (called) {
+        long long v = 0;
+        if (audio_end && calldata_get_int(cd, "audio_end_usec", &v)) *audio_end = v;
+        if (video_target && calldata_get_int(cd, "video_target_usec", &v)) *video_target = v;
+        if (packets && calldata_get_int(cd, "audio_packets", &v)) *packets = v;
+    }
+    calldata_destroy(cd);
+    return called;
+}
+
 bool StopOutput(State& s)
 {
     if (!s.output) {
@@ -1672,6 +1693,25 @@ bool StopOutput(State& s)
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     }
+    // Wait for the encoder-output audio packet, not merely the source
+    // timestamp.  The private output exposes its last submitted PTS through a
+    // proc handler so this is an observable readiness check.
+    int64_t audio_end = 0, video_target = 0, audio_packets = 0;
+    bool audio_ready = false;
+    const uint64_t audio_deadline = os_gettime_ns() + 200000000ULL;
+    while (os_gettime_ns() < audio_deadline) {
+        if (QueryAudioOutputState(s.output, &audio_end, &video_target, &audio_packets) &&
+            audio_end >= video_target) {
+            audio_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    AddStep(s, "audio_encoder_output_ready", true,
+            std::string("ready=") + (audio_ready ? "1" : "0") +
+                " audio_end=" + std::to_string(audio_end) +
+                " video_target=" + std::to_string(video_target) +
+                " packets=" + std::to_string(audio_packets));
     // ---- stop: mp4_output finalises the current segment on the next packet --
     s.t_stop_request_ns = os_gettime_ns();
     obs_output_stop(s.output);

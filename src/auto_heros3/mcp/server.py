@@ -6384,6 +6384,65 @@ def _libobs_run_snapshot(out: Path, manifest_state: str | None = None) -> dict:
             'manifest_state': manifest_state, 'files': files}
 
 
+def _libobs_write_fault_snapshot(path: Path, data: dict) -> None:
+    """Durable fault evidence; unlike the compatibility writer, never swallow I/O failure."""
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        with tmp.open('xb') as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, sort_keys=True).encode('utf-8'))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _libobs_snapshot_watchdog_fault(rec: dict, reason, *, native_status: dict | None = None,
+                                   status_exception: dict | None = None) -> dict:
+    """Save observations BEFORE closing this host, without inventing a last-moment status."""
+    fault_id = uuid.uuid4().hex
+    out = Path(rec['dir'])
+    path = out / f'watchdog-fault-{fault_id}.json'
+    artifact_path = out / 'native-artifacts.json'
+    artifact_error = None
+    try:
+        artifacts = json.loads(artifact_path.read_text(encoding='utf-8'))
+        if not isinstance(artifacts, dict):
+            raise ValueError('native artifacts is not an object')
+    except (OSError, ValueError) as exc:
+        artifacts = None
+        artifact_error = f'{type(exc).__name__}: {exc}'
+    observed_at = time.time()
+    document = {
+        'schema': 'a3-watchdog-fault/1', 'fault_id': fault_id,
+        'recording_run_id': rec.get('recording_run_id'), 'dir': str(out),
+        'reason': reason, 'observed_at': observed_at, 'monotonic_ns': time.monotonic_ns(),
+        'observation_point': 'before_native_process_cleanup',
+        'identity': rec.get('identity'), 'native_pid': rec.get('native_pid'),
+        'native_identity': rec.get('native_identity'), 'config': rec.get('config'),
+        'native_status': native_status,
+        'last_status_observation': rec.get('last_native_status'),
+        'status_exception': status_exception, 'last_health': rec.get('last_health'),
+        'artifact_manifest': {'path': str(artifact_path), 'data': artifacts, 'error': artifact_error},
+    }
+    reference = {'fault_id': fault_id, 'path': str(path), 'saved': False,
+                 'recording_run_id': rec.get('recording_run_id'), 'reason': reason,
+                 'observed_at': observed_at, 'error': None}
+    try:
+        _libobs_write_fault_snapshot(path, document)
+        reference['saved'] = True
+    except Exception as exc:  # diagnostic failure must not prevent bounded owner cleanup
+        reference['error'] = f'{type(exc).__name__}: {exc}'
+        # Retain the observation in state/result if this output directory is
+        # unwritable. saved=false remains explicit even if another write works.
+        reference['unsaved_snapshot'] = document
+    rec.setdefault('watchdog_faults', []).append(reference)
+    return reference
+
+
 def _libobs_watchdog(rec: dict) -> None:
     stop_event = rec.get('watchdog_stop')
     if stop_event is None:
@@ -6414,8 +6473,12 @@ def _libobs_watchdog(rec: dict) -> None:
                 rec['last_health'] = {'ok': False, 'error': f'{type(exc).__name__}: {exc}',
                                       'at': time.time()}
                 if not rec.get('stop_requested'):
-                    _libobs_restart_after_death(rec, 'status_failed', force=True)
+                    _libobs_restart_after_death(rec, 'status_failed', force=True,
+                        status_exception={'type': type(exc).__name__, 'message': str(exc)})
                 continue
+            rec['last_native_status'] = {'recording_run_id': rec.get('recording_run_id'),
+                                         'observed_at': time.time(),
+                                         'monotonic_ns': time.monotonic_ns(), 'response': native}
             framed = native.get('framed_audio') or {}
             framed_bad = bool(framed.get('enabled')) and (
                 not framed.get('opened') or framed.get('error_code') or
@@ -6428,12 +6491,16 @@ def _libobs_watchdog(rec: dict) -> None:
                                   'framed_error': framed.get('error_code') if framed_bad else '',
                                   'at': time.time()}
             if not native.get('active') and not rec.get('stop_requested'):
-                _libobs_restart_after_death(rec, 'native_output_inactive', force=True)
+                _libobs_restart_after_death(rec, 'native_output_inactive', force=True,
+                                           native_status=native)
             elif framed_bad and not rec.get('stop_requested'):
-                _libobs_restart_after_death(rec, 'framed_audio_failed', force=True)
+                _libobs_restart_after_death(rec, 'framed_audio_failed', force=True,
+                                           native_status=native)
 
 
-def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -> None:
+def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False,
+                               native_status: dict | None = None,
+                               status_exception: dict | None = None) -> None:
     lock = rec.get('restart_lock')
     if lock is None:
         return
@@ -6452,6 +6519,8 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
             return
         old_out = Path(rec.get('dir') or '')
         old_run_id = rec.get('recording_run_id')
+        fault = _libobs_snapshot_watchdog_fault(rec, returncode, native_status=native_status,
+                                               status_exception=status_exception)
         try:
             old_client = rec.get('client')
             if old_client is not None:
@@ -6466,6 +6535,7 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
         _libobs_mark_run_failed(old_out, f'native_recorder_died rc={returncode}')
         old_snap = _libobs_run_snapshot(old_out, 'failed')
         old_snap['recording_run_id'] = old_run_id
+        old_snap['watchdog_fault'] = fault
         rec.setdefault('runs', []).append(old_snap)
         cfg = dict(rec.get('config') or {})
         # Deterministic race-injection hook for tests: pause after closing the
@@ -6539,7 +6609,12 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
                     'restart_count': n, 'active': True,
                     'config': cfg, 'last_restart': {
                         'from': old_run_id, 'to': new_run_id,
-                        'native_returncode': returncode, 'time': time.time()}})
+                        'native_returncode': returncode, 'time': time.time(),
+                        'fault_id': fault['fault_id'], 'fault_path': fault['path'],
+                        'fault_saved': fault['saved'], 'fault_error': fault['error']}})
+        # Old observations belong to the old host; its immutable fault record
+        # keeps them. Do not label them as the replacement's last status.
+        rec.pop('last_native_status', None)
         try:
             rec.setdefault('runs', []).append(_libobs_run_snapshot(
                 new_out, 'recording') | {'recording_run_id': new_run_id})
@@ -6684,6 +6759,8 @@ def _libobs_publish_state(rec: dict) -> None:
         'client_pid': rec['config']['client_pid'], 'run_id': rec['identity'].get('run_id'),
         'recording_run_id': rec['recording_run_id'], 'manifest': str(rec['manifest']),
         'config': rec['config'], 'restart_count': rec.get('restart_count', 0),
+        'last_restart': rec.get('last_restart'),
+        'watchdog_faults': list(rec.get('watchdog_faults') or []),
         'runs': rec.get('runs', []), 'start_cleanup_pending': bool(rec.get('start_cleanup_pending')),
         'recording_failed': rec.get('recording_failed'),
         'native_identity': rec.get('native_identity'),
@@ -6767,7 +6844,9 @@ def _libobs_abort_start(rec: dict, reason: str, *, restart_owned: bool = False,
               'detail': reason, 'retryable': not exited, 'cleanup_errors': errors,
               'pid': rec.get('native_pid') or getattr(proc, 'pid', None), 'process_exit_confirmed': exited,
               'recording_run_id': rec.get('recording_run_id'),
-              'runs': list(rec.get('runs') or []), 'restart_count': rec.get('restart_count', 0)}
+              'runs': list(rec.get('runs') or []), 'restart_count': rec.get('restart_count', 0),
+              'last_restart': rec.get('last_restart'),
+              'watchdog_faults': list(rec.get('watchdog_faults') or [])}
     if exited:
         try:
             state = _read_recording_state()
@@ -6989,6 +7068,9 @@ def _libobs_recover_state(record: dict) -> dict:
             'python_manifest': (python_manifest or {}).get('path'),
             'manifest_state': manifest_state,
             'python_manifest_summary': python_manifest,
+            'restart_count': record.get('restart_count', 0),
+            'last_restart': record.get('last_restart'),
+            'watchdog_faults': record.get('watchdog_faults') or [],
             'lock_cleaned': lock_cleaned,
             'error': 'native_recovery_requires_validation',
             'note': 'previous MCP lost the IPC client; files were not reattached or re-run'}
@@ -7095,7 +7177,9 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
                   'dir': str(out) if out else None,
                   'error': rec.get('recording_failed') or 'obs_client_missing',
                   'runs': runs,
-                  'restart_count': int(rec.get('restart_count') or 0)}
+                  'restart_count': int(rec.get('restart_count') or 0),
+                  'last_restart': rec.get('last_restart'),
+                  'watchdog_faults': list(rec.get('watchdog_faults') or [])}
         if out:
             try:
                 _atomic_write_json(Path(out) / 'obs-result.json', result)
@@ -7273,6 +7357,8 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
               'validation_errors': validation_errors,
               'segment_states': segment_states,
               'restart_count': int(rec.get('restart_count') or 0),
+              'last_restart': rec.get('last_restart'),
+              'watchdog_faults': list(rec.get('watchdog_faults') or []),
               'max_segment_gb': cap_gb, 'max_size_mb': (rec.get('config') or {}).get('max_size_mb'),
               'size_cap_bytes': cap_bytes, 'size_cap_exceeded': all_oversized,
               'recording_run_id': manifest_summary.get('recording_run_id'),
@@ -7697,6 +7783,9 @@ def recording_status() -> dict:
             and bound.get('branch_id') == current.get('branch_id'),
             'native_health': native_health,
             'last_health': _RUNTIME.recorder.get('last_health'),
+            'restart_count': int(_RUNTIME.recorder.get('restart_count') or record.get('restart_count') or 0),
+            'last_restart': _RUNTIME.recorder.get('last_restart') or record.get('last_restart'),
+            'watchdog_faults': _RUNTIME.recorder.get('watchdog_faults') or record.get('watchdog_faults') or [],
             'lock_owner': lock or None,
             'lock_alive': _pid_alive((lock or {}).get('mcp_pid')) if lock else False}
 

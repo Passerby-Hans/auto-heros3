@@ -2065,6 +2065,51 @@ void CollectFinalEvidence(State& s)
 // report
 // ---------------------------------------------------------------------------
 
+void WriteFramedReaderDiagnosticsJson(a3::JsonWriter& w, const a3::FramedAudioStats& st)
+{
+    w.begin_object();
+    w.key("last_packet_sequence"); w.value_uint(st.last_packet_sequence);
+    w.key("last_packet_sample"); w.value_uint(st.last_packet_sample);
+    w.key("last_packet_offset"); w.value_uint(st.last_packet_offset);
+    w.key("last_packet_pts_ns"); w.value_uint(st.last_packet_pts_ns);
+    w.key("last_packet_age_ns"); w.value_uint(st.last_packet_age_ns);
+    w.key("first_submitted_age_ns"); w.value_uint(st.first_submitted_age_ns);
+    w.key("steady_max_packet_age_ns"); w.value_uint(st.steady_max_packet_age_ns);
+    w.key("preroll_max_packet_age_ns"); w.value_uint(st.preroll_max_packet_age_ns);
+    w.key("read_offset"); w.value_uint(st.file_bytes);
+    w.key("eof_reopens"); w.value_uint(st.eof_reopens);
+    const auto stage = [&](const char* name, const a3::FramedStageTiming& t) {
+        w.key(name); w.begin_object();
+        w.key("calls"); w.value_uint(t.calls);
+        w.key("last_ns"); w.value_uint(t.last_ns);
+        w.key("max_ns"); w.value_uint(t.max_ns);
+        w.key("slow_calls"); w.value_uint(t.slow_calls);
+        w.end_object();
+    };
+    w.key("slow_threshold_ns"); w.value_uint(50000000ULL);
+    stage("open", st.open_timing);
+    stage("seek_read", st.read_timing);
+    stage("parse_crc", st.parse_timing);
+    stage("obs_source_output_audio", st.submit_timing);
+    stage("reader_loop_gap", st.loop_timing);
+    stage("eof_sleep", st.idle_timing);
+    stage("publish_lock_wait", st.publish_lock_timing);
+    w.key("fatal"); w.begin_object();
+    w.key("latched"); w.value_bool(st.fatal_latched);
+    w.key("code"); w.value_string(st.error_code);
+    w.key("detail"); w.value_string(st.error);
+    w.key("has_packet"); w.value_bool(st.fatal_has_packet);
+    w.key("sequence"); w.value_uint(st.fatal_sequence);
+    w.key("sample"); w.value_uint(st.fatal_sample);
+    w.key("now_ns"); w.value_uint(st.fatal_now_ns);
+    w.key("pts_ns"); w.value_uint(st.fatal_pts_ns);
+    w.key("age_ns"); w.value_uint(st.fatal_age_ns);
+    w.key("file_offset"); w.value_uint(st.fatal_file_offset);
+    w.key("read_offset"); w.value_uint(st.fatal_read_offset);
+    w.end_object();
+    w.end_object();
+}
+
 void WriteTailJson(a3::JsonWriter& w, const State& s)
 {
     const auto& d = s.output_drain;
@@ -2101,6 +2146,7 @@ void WriteTailJson(a3::JsonWriter& w, const State& s)
     w.key("submitted_gaps"); w.value_uint(after.submitted_gaps);
     w.key("integrity_ok"); w.value_bool(after.stream_integrity_ok && after.timeline_ok &&
         after.packet_integrity_ok && after.error_code.empty());
+    w.key("reader_diagnostics"); WriteFramedReaderDiagnosticsJson(w, after);
     w.end_object();
     w.end_object();
 }
@@ -2886,6 +2932,7 @@ void WriteFramedAudioStatsJson(JsonWriter& w, const a3::FramedAudioStats& st)
     w.key("capture_epoch_qpc"); w.value_uint(st.capture_epoch_qpc);
     w.key("saw_first"); w.value_bool(st.saw_first);
     w.key("saw_last"); w.value_bool(st.saw_last);
+    w.key("reader_diagnostics"); WriteFramedReaderDiagnosticsJson(w, st);
     w.end_object();
 }
 
@@ -3186,6 +3233,7 @@ std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
         w.key("timeline_ok"); w.value_bool(framed.timeline_ok);
         w.key("error_code"); w.value_string(framed.error_code);
         w.key("error"); w.value_string(framed.error);
+        w.key("reader_diagnostics"); WriteFramedReaderDiagnosticsJson(w, framed);
         w.end_object();
         w.key("result");
         w.begin_object();

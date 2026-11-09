@@ -51,6 +51,15 @@ class HarnessTests(unittest.TestCase):
     def test_explicit_time_threshold(self):
         self.assertEqual(h.recording_arguments(self.args(rollover_seconds=900)), {"rollover_seconds": 900})
 
+    def test_uninterrupted_recording_requires_explicit_zero_restarts(self):
+        h.require_zero_restarts({"restart_count": 0, "checks_ok": True}, "fake stop")
+        for count in (1, 2, -1, None, "0", False):
+            with self.assertRaises(RuntimeError):
+                h.require_zero_restarts({"restart_count": count, "checks_ok": True,
+                    "native_checks_ok": True}, "fake successful recovered stop")
+        with self.assertRaises(RuntimeError):
+            h.require_zero_restarts({"checks_ok": True}, "missing restart count")
+
     def test_default_strips_all_audio_overrides(self):
         with patch.dict(os.environ, {"AUTO_HEROS3_AUDIO_DRIVER": "disk", "A3_BAD": "1",
                                     "A3CAPTURE_FILE": "bad", "SDL_AUDIODRIVER": "wasapi",

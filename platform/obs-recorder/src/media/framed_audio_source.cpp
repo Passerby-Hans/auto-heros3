@@ -7,10 +7,12 @@
 #include <obs-source.h>
 
 #include <util/platform.h>
+#include <util/base.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <windows.h>
 #include <mutex>
 #include <thread>
@@ -40,10 +42,58 @@ FramedAudioStats CopyStats(FramedAudioData* d)
     return d->stats;
 }
 
-void Publish(FramedAudioData* d, const FramedAudioStats& stats)
+void AccumulateStage(FramedStageTiming& timing, uint64_t started, uint64_t now)
 {
-    std::lock_guard<std::mutex> lock(d->stats_mutex);
-    d->stats = stats;
+    timing.last_ns = now >= started ? now - started : 0;
+    ++timing.calls;
+    timing.max_ns = std::max(timing.max_ns, timing.last_ns);
+    if (timing.last_ns >= 50000000ULL) ++timing.slow_calls;
+}
+
+void LogSlowStage(const FramedStageTiming& timing, uint64_t now, const char* stage,
+                  const FramedAudioStats& stats)
+{
+    if (timing.last_ns < 50000000ULL) return;
+    blog(LOG_WARNING, "A3_FRAMED_SLOW stage=%s duration_ns=%llu now_ns=%llu "
+         "context_seq=%llu context_sample=%llu packet_offset=%llu read_offset=%llu",
+         stage, static_cast<unsigned long long>(timing.last_ns),
+         static_cast<unsigned long long>(now),
+         static_cast<unsigned long long>(stats.last_packet_sequence),
+         static_cast<unsigned long long>(stats.last_packet_sample),
+         static_cast<unsigned long long>(stats.last_packet_offset),
+         static_cast<unsigned long long>(stats.file_bytes));
+    std::fflush(stdout);
+    std::fflush(stderr);
+}
+
+void ObserveStage(FramedStageTiming& timing, uint64_t started, const char* stage,
+                  const FramedAudioStats& stats)
+{
+    const uint64_t now = os_gettime_ns();
+    AccumulateStage(timing, started, now);
+    LogSlowStage(timing, now, stage, stats);
+}
+
+void Publish(FramedAudioData* d, FramedAudioStats& stats)
+{
+    const uint64_t started = os_gettime_ns();
+    uint64_t acquired = 0;
+    {
+        std::lock_guard<std::mutex> lock(d->stats_mutex);
+        acquired = os_gettime_ns();
+        AccumulateStage(stats.publish_lock_timing, started, acquired);
+        d->stats = stats;
+    }
+    // Never call the OBS logger while holding our statistics mutex.
+    LogSlowStage(stats.publish_lock_timing, acquired, "publish_lock_wait", stats);
+}
+
+std::string StageSummary(const char* name, const FramedStageTiming& timing)
+{
+    return std::string(name) + "={calls=" + std::to_string(timing.calls) +
+        ",last_ns=" + std::to_string(timing.last_ns) +
+        ",max_ns=" + std::to_string(timing.max_ns) +
+        ",slow=" + std::to_string(timing.slow_calls) + "} ";
 }
 
 void ConvertAndPush(FramedAudioData* d, const audio::ParsedPacket& packet,
@@ -71,7 +121,9 @@ void ConvertAndPush(FramedAudioData* d, const audio::ParsedPacket& packet,
     audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
     audio.samples_per_sec = 44100;
     audio.timestamp = timestamp_ns;
+    const uint64_t submit_started = os_gettime_ns();
     obs_source_output_audio(d->source, &audio);
+    ObserveStage(stats->submit_timing, submit_started, "obs_source_output_audio", *stats);
     stats->submitted_packets++;
     stats->submitted_frames += frames;
     stats->submitted_end_sample = packet.header.sample_start + frames;
@@ -98,15 +150,47 @@ void ReaderThread(FramedAudioData* d)
     bool test_late_pending = false;
     bool test_delayed = false;
     uint64_t last_progress_ns = os_gettime_ns();
+    uint64_t last_loop_start_ns = 0;
     std::string err;
     std::vector<uint8_t> readbuf(65536);
     uint64_t offset = 0;
+    bool packet_context_valid = false;
     HANDLE file = INVALID_HANDLE_VALUE;
 
     auto fail = [&](const std::string& code, const std::string& detail) {
         if (!fatal_error) {
             stats.error_code = code;
             stats.error = detail;
+            stats.fatal_latched = true;
+            stats.fatal_has_packet = packet_context_valid;
+            stats.fatal_sequence = packet_context_valid ? stats.last_packet_sequence : 0;
+            stats.fatal_sample = packet_context_valid ? stats.last_packet_sample : 0;
+            stats.fatal_now_ns = os_gettime_ns();
+            stats.fatal_pts_ns = packet_context_valid ? stats.last_packet_pts_ns : 0;
+            stats.fatal_age_ns = stats.fatal_pts_ns && stats.fatal_now_ns > stats.fatal_pts_ns
+                ? stats.fatal_now_ns - stats.fatal_pts_ns : 0;
+            stats.fatal_file_offset = packet_context_valid ? stats.last_packet_offset : parser.next_offset();
+            stats.fatal_read_offset = offset;
+            const std::string stages = StageSummary("open_reopen", stats.open_timing) +
+                StageSummary("seek_read", stats.read_timing) + StageSummary("parse_crc", stats.parse_timing) +
+                StageSummary("obs_submit", stats.submit_timing) + StageSummary("loop_gap", stats.loop_timing) +
+                StageSummary("eof_sleep", stats.idle_timing) + StageSummary("publish_lock", stats.publish_lock_timing);
+            blog(LOG_ERROR, "A3_FRAMED_FATAL code='%s' detail='%s' has_packet=%u "
+                 "seq=%llu sample=%llu now_ns=%llu pts_ns=%llu age_ns=%llu "
+                 "packet_offset=%llu read_offset=%llu eof_reopens=%llu stages='%s'",
+                 code.c_str(), detail.c_str(), packet_context_valid ? 1u : 0u,
+                 static_cast<unsigned long long>(stats.fatal_sequence),
+                 static_cast<unsigned long long>(stats.fatal_sample),
+                 static_cast<unsigned long long>(stats.fatal_now_ns),
+                 static_cast<unsigned long long>(stats.fatal_pts_ns),
+                 static_cast<unsigned long long>(stats.fatal_age_ns),
+                 static_cast<unsigned long long>(stats.fatal_file_offset),
+                 static_cast<unsigned long long>(stats.fatal_read_offset),
+                 static_cast<unsigned long long>(stats.eof_reopens), stages.c_str());
+            // The watchdog may terminate this host before final report generation.
+            // Flush the first fatal event now; this is not a power-loss durability claim.
+            std::fflush(stdout);
+            std::fflush(stderr);
         }
         fatal_error = true;
         stats.stream_integrity_ok = false;
@@ -117,10 +201,14 @@ void ReaderThread(FramedAudioData* d)
         Publish(d, stats);
     };
 
-    auto open_file = [&]() -> HANDLE {
-        return CreateFileA(d->cfg.path.c_str(), GENERIC_READ,
+    auto open_file = [&](bool reopen = false) -> HANDLE {
+        const uint64_t started = os_gettime_ns();
+        if (reopen && file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        HANDLE opened = CreateFileA(d->cfg.path.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ObserveStage(stats.open_timing, started, reopen ? "close_reopen" : "open", stats);
+        return opened;
     };
     const uint64_t open_deadline_ns = os_gettime_ns() + 10000000000ULL;
     while (!d->cfg.live && file == INVALID_HANDLE_VALUE &&
@@ -145,24 +233,27 @@ void ReaderThread(FramedAudioData* d)
     }
     if (file == INVALID_HANDLE_VALUE) {
         if (stats.error.empty()) stats.error = d->stopping.load() ? "stopped" : "cannot open";
-        stats.error_code = "open_failed";
-        stats.stream_integrity_ok = false;
-        stats.timeline_ok = false;
-        Publish(d, stats);
+        fail("open_failed", stats.error);
         return;
     }
     stats.opened = true;
     Publish(d, stats);
 
     while (!d->stopping.load(std::memory_order_acquire)) {
+        if (last_loop_start_ns)
+            ObserveStage(stats.loop_timing, last_loop_start_ns, "reader_loop_gap", stats);
+        last_loop_start_ns = os_gettime_ns();
+        packet_context_valid = false;
+        const uint64_t read_started = os_gettime_ns();
         LARGE_INTEGER li;
         li.QuadPart = static_cast<LONGLONG>(offset);
         SetFilePointerEx(file, li, nullptr, FILE_BEGIN);
         DWORD got = 0;
         const BOOL read_ok = ReadFile(file, readbuf.data(),
                                       static_cast<DWORD>(readbuf.size()), &got, nullptr);
+        const DWORD read_error = read_ok ? ERROR_SUCCESS : GetLastError();
+        ObserveStage(stats.read_timing, read_started, "seek_read", stats);
         if (!read_ok) {
-            const DWORD read_error = GetLastError();
             if (read_error != ERROR_HANDLE_EOF) {
                 fail("io_error", "ReadFile error " + std::to_string(read_error));
                 break;
@@ -170,18 +261,26 @@ void ReaderThread(FramedAudioData* d)
             got = 0;
         }
         if (got > 0) last_progress_ns = os_gettime_ns();
-        if (got > 0)
         if (got > 0) {
             offset += static_cast<uint64_t>(got);
             stats.file_bytes = offset;
             std::vector<audio::ParsedPacket> packets;
-            if (!parser.feed(readbuf.data(), got, packets, &err)) {
+            const uint64_t parse_started = os_gettime_ns();
+            const bool parsed = parser.feed(readbuf.data(), got, packets, &err);
+            ObserveStage(stats.parse_timing, parse_started, "parse_crc", stats);
+            if (!parsed) {
                 fail(err, err);
                 break;
             }
             stats.packet_integrity_ok = true;
             stats.validation_performed = true;
             for (auto& packet : packets) {
+                packet_context_valid = true;
+                stats.last_packet_sequence = packet.header.sequence;
+                stats.last_packet_sample = packet.header.sample_start;
+                stats.last_packet_offset = packet.stream_offset;
+                stats.last_packet_pts_ns = 0;
+                stats.last_packet_age_ns = 0;
                 if (!stream_started) {
                     if (!validator.StartAtFirst(&err)) {
                         fail("stream_start", err);
@@ -229,6 +328,10 @@ void ReaderThread(FramedAudioData* d)
                     }
                     const uint64_t now = os_gettime_ns();
                     const uint64_t age = now > ts ? now - ts : 0;
+                    stats.last_packet_pts_ns = ts;
+                    stats.last_packet_age_ns = age;
+                    if (first_submitted)
+                        stats.steady_max_packet_age_ns = std::max(stats.steady_max_packet_age_ns, age);
                     const auto delivery = audio::ClassifyLivePacket(
                         age, d->cfg.late_budget_ns, first_submitted);
                     if (delivery != audio::LivePacketDisposition::Submit) {
@@ -239,6 +342,7 @@ void ReaderThread(FramedAudioData* d)
                              * validated sample timeline unchanged. */
                             stats.preroll_skipped_packets++;
                             stats.preroll_skipped_frames += packet.header.sample_count;
+                            stats.preroll_max_packet_age_ns = std::max(stats.preroll_max_packet_age_ns, age);
                             continue;
                         }
                         fail("late_budget_exceeded",
@@ -252,6 +356,7 @@ void ReaderThread(FramedAudioData* d)
                         fail("timeline_replay", err);
                         break;
                     }
+                    stats.last_packet_pts_ns = ts;
                     while (!d->stopping.load(std::memory_order_acquire) &&
                            os_gettime_ns() < ts) {
                         os_sleepto_ns(std::min(ts, os_gettime_ns() + 2000000ULL));
@@ -266,6 +371,8 @@ void ReaderThread(FramedAudioData* d)
                 }
                 if (stats.submitted_packets == 0)
                     stats.submitted_start_sample = packet.header.sample_start;
+                if (!first_submitted && packet.header.sample_count > 0)
+                    stats.first_submitted_age_ns = stats.last_packet_age_ns;
                 ConvertAndPush(d, packet, ts, &stats);
                 if (packet.header.sample_count > 0) first_submitted = true;
                 // Test-only stall injection: the next packet is then observed
@@ -302,8 +409,8 @@ void ReaderThread(FramedAudioData* d)
             if (got == 0) {
                 /* A synchronous handle can remain at its old EOF while the
                  * SDL worker appends.  Reopen to refresh the file size. */
-                if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-                file = open_file();
+                ++stats.eof_reopens;
+                file = open_file(true);
                 if (file == INVALID_HANDLE_VALUE) {
                     fail("io_error", "cannot reopen live framed file");
                     break;
@@ -318,7 +425,9 @@ void ReaderThread(FramedAudioData* d)
                     fail("capture_stalled", "live framed file made no progress for 5s");
                     break;
                 }
+                const uint64_t idle_started = os_gettime_ns();
                 os_sleep_ms(10);
+                ObserveStage(stats.idle_timing, idle_started, "eof_sleep", stats);
             }
         } else {
             if (got == 0) {
@@ -330,10 +439,8 @@ void ReaderThread(FramedAudioData* d)
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 
     if (!stream_started) {
-        if (stats.error.empty()) {
-            stats.error_code = d->cfg.live ? "capture_not_ready" : "empty_stream";
-            stats.error = stats.error_code;
-        }
+        if (!fatal_error)
+            fail(d->cfg.live ? "capture_not_ready" : "empty_stream", "no complete validated packet");
         Publish(d, stats);
         return;
     }
@@ -368,11 +475,8 @@ void ReaderThread(FramedAudioData* d)
         stats.packet_integrity_ok = false;
         stats.timeline_ok = false;
     }
-    if (!d->cfg.live && replay_finished && !stats.saw_last) {
-        stats.stream_integrity_ok = false;
-        stats.error_code = "missing_last";
-        stats.error = "replay ended without LAST";
-    }
+    if (!d->cfg.live && replay_finished && !stats.saw_last && !fatal_error)
+        fail("missing_last", "replay ended without LAST");
     Publish(d, stats);
 }
 

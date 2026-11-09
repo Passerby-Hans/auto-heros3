@@ -18,6 +18,13 @@ struct FramedAudioConfig {
     uint64_t late_budget_ns = audio::kDefaultLateBudgetNs;
 };
 
+struct FramedStageTiming {
+    uint64_t calls = 0;
+    uint64_t last_ns = 0;
+    uint64_t max_ns = 0;
+    uint64_t slow_calls = 0; // >= 50 ms; diagnostic only, never changes delivery policy
+};
+
 struct FramedAudioStats {
     bool created = false;
     bool opened = false;
@@ -42,6 +49,31 @@ struct FramedAudioStats {
     uint64_t preroll_skipped_frames = 0;
     uint64_t submitted_gaps = 0;
     uint64_t max_packet_age_ns = 0;
+    uint64_t last_packet_sequence = 0;
+    uint64_t last_packet_sample = 0;
+    uint64_t last_packet_offset = 0;
+    uint64_t last_packet_pts_ns = 0;
+    uint64_t last_packet_age_ns = 0;
+    uint64_t first_submitted_age_ns = 0;
+    uint64_t steady_max_packet_age_ns = 0;
+    uint64_t preroll_max_packet_age_ns = 0;
+    uint64_t eof_reopens = 0;
+    FramedStageTiming open_timing;
+    FramedStageTiming read_timing;
+    FramedStageTiming parse_timing;
+    FramedStageTiming submit_timing;
+    FramedStageTiming loop_timing; // start-to-start; overlaps stage timings, not additive
+    FramedStageTiming idle_timing;
+    FramedStageTiming publish_lock_timing;
+    bool fatal_latched = false;
+    bool fatal_has_packet = false;
+    uint64_t fatal_sequence = 0;
+    uint64_t fatal_sample = 0;
+    uint64_t fatal_now_ns = 0;
+    uint64_t fatal_pts_ns = 0;
+    uint64_t fatal_age_ns = 0;
+    uint64_t fatal_file_offset = 0;
+    uint64_t fatal_read_offset = 0;
     uint64_t first_timestamp_ns = 0;
     uint64_t last_timestamp_ns = 0;
     // Half-open end of the last submitted packet, unlike last_timestamp_ns

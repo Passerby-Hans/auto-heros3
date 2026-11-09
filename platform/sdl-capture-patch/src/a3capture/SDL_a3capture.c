@@ -32,6 +32,8 @@
 
 #define A3CAPTURE_QUEUE_SLOTS 256
 #define A3CAPTURE_DEFAULT_FILE "a3capture.raw"
+#define A3CAPTURE_SLOW_WRITE_US 100000ULL
+#define A3CAPTURE_HEALTH_INTERVAL_US 10000000ULL
 
 typedef struct A3Packet
 {
@@ -39,6 +41,22 @@ typedef struct A3Packet
     Uint8 *data;
     Uint64 enqueued_qpc;
 } A3Packet;
+
+/* Worker-owned copy: logging must never keep the queue mutex or a recycled
+ * packet pointer. Timings end before logging, so diagnostic I/O cannot erase
+ * the original write measurement. Any delay it adds is visible on the next
+ * packet's queue wait. */
+typedef struct A3WriteObservation
+{
+    A3AudioPacketHeader header;
+    Uint64 enqueue_qpc, write_start_qpc, write_end_qpc;
+    Uint64 latency_us, queue_wait_us, write_io_us, capture_age_us;
+    Uint64 latency_max_us, queue_wait_max_us, write_io_max_us, capture_age_max_us;
+    Uint64 measurements, clock_errors, queue_depth_max, slots_used_max;
+    Uint64 generated_frames, written_frames, dropped_frames;
+    Uint32 queue_depth_waiting, slots_used;
+    SDL_bool clock_valid, write_ok, failed;
+} A3WriteObservation;
 
 struct SDL_PrivateAudioData
 {
@@ -119,22 +137,85 @@ static int A3Deadline(const struct SDL_PrivateAudioData *h, Uint64 frame, Uint64
  * Queue wait includes injected worker delay; write_io measures SDL_RWwrite
  * itself.  A successful write means accepted by the OS, not durable fsync. */
 static void A3ObserveWriteLocked(struct SDL_PrivateAudioData *h, const A3Packet *packet,
-                                 Uint64 write_start, Uint64 write_end)
+                                 Uint64 write_start, Uint64 write_end,
+                                 A3WriteObservation *observation)
 {
     Uint64 elapsed = 0, queue_wait = 0, write_io = 0, capture_age = 0;
-    if (!a3_qpc_elapsed_us(packet->enqueued_qpc, write_end, h->qpc_frequency, &elapsed) ||
-        !a3_qpc_elapsed_us(packet->enqueued_qpc, write_start, h->qpc_frequency, &queue_wait) ||
-        !a3_qpc_elapsed_us(write_start, write_end, h->qpc_frequency, &write_io) ||
-        !a3_qpc_elapsed_us(packet->header.planned_qpc, write_end, h->qpc_frequency, &capture_age)) {
+    const SDL_bool valid =
+        a3_qpc_elapsed_us(packet->enqueued_qpc, write_end, h->qpc_frequency, &elapsed) &&
+        a3_qpc_elapsed_us(packet->enqueued_qpc, write_start, h->qpc_frequency, &queue_wait) &&
+        a3_qpc_elapsed_us(write_start, write_end, h->qpc_frequency, &write_io) &&
+        a3_qpc_elapsed_us(packet->header.planned_qpc, write_end, h->qpc_frequency, &capture_age)
+            ? SDL_TRUE : SDL_FALSE;
+    if (!valid) {
         ++h->latency_clock_errors;
-        return;
+    } else {
+        ++h->write_measurements;
+        h->write_latency_last_us = elapsed;
+        if (elapsed > h->write_latency_max_us) h->write_latency_max_us = elapsed;
+        if (queue_wait > h->queue_wait_max_us) h->queue_wait_max_us = queue_wait;
+        if (write_io > h->write_io_max_us) h->write_io_max_us = write_io;
+        if (capture_age > h->capture_to_write_max_us) h->capture_to_write_max_us = capture_age;
     }
-    ++h->write_measurements;
-    h->write_latency_last_us = elapsed;
-    if (elapsed > h->write_latency_max_us) h->write_latency_max_us = elapsed;
-    if (queue_wait > h->queue_wait_max_us) h->queue_wait_max_us = queue_wait;
-    if (write_io > h->write_io_max_us) h->write_io_max_us = write_io;
-    if (capture_age > h->capture_to_write_max_us) h->capture_to_write_max_us = capture_age;
+    SDL_zero(*observation);
+    observation->header = packet->header;
+    observation->enqueue_qpc = packet->enqueued_qpc;
+    observation->write_start_qpc = write_start;
+    observation->write_end_qpc = write_end;
+    observation->clock_valid = valid;
+    observation->latency_us = elapsed;
+    observation->queue_wait_us = queue_wait;
+    observation->write_io_us = write_io;
+    observation->capture_age_us = capture_age;
+    observation->latency_max_us = h->write_latency_max_us;
+    observation->queue_wait_max_us = h->queue_wait_max_us;
+    observation->write_io_max_us = h->write_io_max_us;
+    observation->capture_age_max_us = h->capture_to_write_max_us;
+    observation->measurements = h->write_measurements;
+    observation->clock_errors = h->latency_clock_errors;
+    observation->queue_depth_waiting = (Uint32)h->queue_count;
+    observation->slots_used = A3CAPTURE_QUEUE_SLOTS - (Uint32)h->free_count;
+    observation->queue_depth_max = h->queue_depth_max;
+    observation->slots_used_max = h->slots_used_max;
+    observation->generated_frames = h->generated_frames;
+    observation->dropped_frames = h->dropped_frames;
+}
+
+static void A3LogWriteObservation(const A3WriteObservation *o, const char *event)
+{
+    /* No strings from filenames/game/user data: one parseable JSON record.
+     * SDL invokes VCMI's existing logger, whose file sink flushes each line.
+     * This is not a power-loss/fsync guarantee, and a permanently blocked
+     * write cannot emit its completion record. */
+    SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+        "a3capture_write_diag {\"schema\":\"a3-worker-diag/1\",\"event\":\"%s\","
+        "\"capture_id\":%llu,\"generation\":%u,\"sequence\":%u,"
+        "\"sample_start\":%llu,\"sample_end\":%llu,\"qpc_frequency\":%llu,"
+        "\"planned_qpc\":%llu,\"actual_start_qpc\":%llu,\"actual_end_qpc\":%llu,"
+        "\"enqueue_qpc\":%llu,\"write_start_qpc\":%llu,\"write_end_qpc\":%llu,"
+        "\"clock_valid\":%d,\"write_ok\":%d,\"failed\":%d,"
+        "\"write_latency_us\":%llu,\"queue_wait_us\":%llu,\"write_io_us\":%llu,"
+        "\"capture_to_write_us\":%llu,\"write_latency_max_us\":%llu,"
+        "\"queue_wait_max_us\":%llu,\"write_io_max_us\":%llu,\"capture_to_write_max_us\":%llu,"
+        "\"measurements\":%llu,\"clock_errors\":%llu,\"queue_depth_waiting\":%u,"
+        "\"slots_used_including_writer\":%u,\"queue_depth_max\":%llu,\"slots_used_max\":%llu,"
+        "\"generated_frames\":%llu,\"written_frames\":%llu,\"dropped_frames\":%llu}",
+        event, (unsigned long long)o->header.capture_id, (unsigned)o->header.generation,
+        (unsigned)o->header.sequence, (unsigned long long)o->header.sample_start,
+        (unsigned long long)(o->header.sample_start + o->header.sample_count),
+        (unsigned long long)o->header.qpc_frequency, (unsigned long long)o->header.planned_qpc,
+        (unsigned long long)o->header.actual_start_qpc, (unsigned long long)o->header.actual_end_qpc,
+        (unsigned long long)o->enqueue_qpc, (unsigned long long)o->write_start_qpc,
+        (unsigned long long)o->write_end_qpc, (int)o->clock_valid, (int)o->write_ok, (int)o->failed,
+        (unsigned long long)o->latency_us, (unsigned long long)o->queue_wait_us,
+        (unsigned long long)o->write_io_us, (unsigned long long)o->capture_age_us,
+        (unsigned long long)o->latency_max_us, (unsigned long long)o->queue_wait_max_us,
+        (unsigned long long)o->write_io_max_us, (unsigned long long)o->capture_age_max_us,
+        (unsigned long long)o->measurements, (unsigned long long)o->clock_errors,
+        (unsigned)o->queue_depth_waiting, (unsigned)o->slots_used,
+        (unsigned long long)o->queue_depth_max, (unsigned long long)o->slots_used_max,
+        (unsigned long long)o->generated_frames, (unsigned long long)o->written_frames,
+        (unsigned long long)o->dropped_frames);
 }
 
 static void A3LogLatencyLocked(const struct SDL_PrivateAudioData *h, const char *phase)
@@ -207,6 +288,7 @@ static DWORD WINAPI A3Worker(LPVOID arg)
 {
     SDL_AudioDevice *device = (SDL_AudioDevice *)arg;
     struct SDL_PrivateAudioData *h = device->hidden;
+    Uint64 last_diagnostic_qpc = 0;
 
     for (;;) {
         A3Packet *packet = NULL;
@@ -279,8 +361,9 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                 }
             }
             const Uint64 write_end = SDL_GetPerformanceCounter();
+            A3WriteObservation observation;
             SDL_LockMutex(h->lock);
-            A3ObserveWriteLocked(h, packet, write_start, write_end);
+            A3ObserveWriteLocked(h, packet, write_start, write_end, &observation);
             if (header_wrote == header_len && payload_wrote == payload) {
                 ++h->written_packets;
                 h->written_bytes += header_len + payload;
@@ -296,8 +379,28 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                              (unsigned long long)payload,
                              (unsigned long long)packet->header.sample_start);
             }
+            observation.write_ok = header_wrote == header_len && payload_wrote == payload
+                ? SDL_TRUE : SDL_FALSE;
+            observation.failed = h->failed;
+            observation.written_frames = h->written_frames;
             h->free_slots[h->free_count++] = packet;
             SDL_UnlockMutex(h->lock);
+            /* Worker only, after releasing/recycling. Never log from the SDL
+             * callback or hold its queue lock while VCMI's logger flushes. */
+            Uint64 diagnostic_elapsed_us = 0;
+            const SDL_bool health_due = !last_diagnostic_qpc ||
+                (a3_qpc_elapsed_us(last_diagnostic_qpc, write_end,
+                                    observation.header.qpc_frequency, &diagnostic_elapsed_us) &&
+                 diagnostic_elapsed_us >= A3CAPTURE_HEALTH_INTERVAL_US)
+                    ? SDL_TRUE : SDL_FALSE;
+            const SDL_bool slow = observation.latency_us >= A3CAPTURE_SLOW_WRITE_US ||
+                observation.queue_wait_us >= A3CAPTURE_SLOW_WRITE_US ||
+                observation.write_io_us >= A3CAPTURE_SLOW_WRITE_US;
+            if (!observation.clock_valid || !observation.write_ok || slow || health_due) {
+                A3LogWriteObservation(&observation, !observation.clock_valid ? "clock_error" :
+                    !observation.write_ok ? "write_error" : slow ? "slow_write" : "health");
+                last_diagnostic_qpc = write_end;
+            }
         }
     }
 

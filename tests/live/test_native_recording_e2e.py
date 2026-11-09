@@ -217,6 +217,13 @@ def session_arguments(target: str, display_index: str) -> dict:
     return result
 
 
+def require_zero_restarts(record: dict, source: str) -> None:
+    """Successful recovery does not prove an uninterrupted acceptance recording."""
+    count = record.get("restart_count")
+    if type(count) is not int or count != 0:
+        raise RuntimeError(f"uninterrupted recording requires restart_count=0; {source} reported {count!r}")
+
+
 def rollover_events(report: dict, required_reason: str | None = None) -> list[dict]:
     events = []
     for entry in report.get("output_events", []):
@@ -634,6 +641,10 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                             status = await call("recording_status", timeout=15)
                             if not status.get("recording"):
                                 raise RuntimeError("recording_status became inactive")
+                            if not args.kill_native_once:
+                                uninterrupted_state = json.loads((out / "state/recording.json").read_text(encoding="utf-8"))
+                                evidence["uninterrupted_state"] = uninterrupted_state
+                                require_zero_restarts(uninterrupted_state, "state/recording.json")
                             if args.kill_native_once and not killed_once and time.monotonic() - started >= args.seconds / 2:
                                 import psutil
                                 state_path = out / "state/recording.json"
@@ -711,6 +722,10 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                             raise RuntimeError("recording_stop validation failed")
                         if args.double_stop and replies[0] != replies[1]:
                             raise RuntimeError("concurrent stop did not return the same run result")
+                        if not args.kill_native_once:
+                            for reply in replies:
+                                require_zero_restarts(reply, "recording_stop")
+                            evidence["uninterrupted_recording_ok"] = True
                         if args.kill_native_once:
                             if not killed_once or int(replies[0].get("restart_count") or 0) < 1:
                                 raise RuntimeError("kill injection/restart missing from final stop result")

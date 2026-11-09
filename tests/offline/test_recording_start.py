@@ -447,6 +447,161 @@ def test_spawn_callback_persists_before_connect_returns():
                   and not M._recording_lock_path().exists())
 
 
+def test_watchdog_fault_snapshot_precedes_cleanup():
+    real_watchdog = M._libobs_watchdog
+
+    class OnePoll:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, timeout):
+            self.calls += 1
+            return self.calls > 1
+
+        def set(self):
+            self.calls = 2
+
+    with NativeEnv() as env:
+        rec, client = env.start()
+        old_out, old_run = Path(rec['dir']), rec['recording_run_id']
+        artifacts = {'source_commit': 'a' * 40, 'checkpoint_sha256': 'b' * 64,
+                     'artifacts': {'private-sdl': 'c' * 64}}
+        (old_out / 'native-artifacts.json').write_text(json.dumps(artifacts))
+        native = {'ok': True, 'active': True, 'state': 'recording',
+                  'framed_audio': {'enabled': True, 'opened': True,
+                                   'error_code': 'late_budget_exceeded',
+                                   'error': 'packet age 750000000ns',
+                                   'submitted_end_sample': 123456, 'max_packet_age_ns': 750000000,
+                                   'packet_integrity_ok': True, 'stream_integrity_ok': True,
+                                   'timeline_ok': True, 'submitted_gaps': 0,
+                                   'nested_future_metric': {'unmodified': [4, 5, 6]}},
+                  'output': {'total_frames': 72000, 'total_bytes': 1234567}}
+        closed = client.close
+        observed = []
+
+        def checked_close(force=False):
+            refs = rec['watchdog_faults']
+            document = json.loads(Path(refs[-1]['path']).read_text(encoding='utf-8'))
+            observed.append(document)
+            check('watchdog full fault is on disk before closing live host',
+                  force and not client.proc.closed and refs[-1]['saved']
+                  and document['native_status'] == native)
+            closed(force=force)
+
+        rec['watchdog_stop'] = OnePoll()
+        with patch.object(client, 'status', return_value=native), \
+                patch.object(client, 'close', checked_close):
+            real_watchdog(rec)
+        doc = observed[0]
+        check('fault preserves old run identity and exact checkpoint declaration',
+              doc['recording_run_id'] == old_run and doc['dir'] == str(old_out)
+              and doc['artifact_manifest']['data'] == artifacts
+              and doc['observation_point'] == 'before_native_process_cleanup'
+              and doc['observed_at'] > 0 and doc['monotonic_ns'] > 0)
+        check('fault preserves status observation without truncating nested framed metrics',
+              doc['last_status_observation']['response'] == native
+              and doc['status_exception'] is None and doc['reason'] == 'framed_audio_failed')
+        persisted = json.loads(M._recording_state_path().read_text(encoding='utf-8'))
+        check('restart persists fault reference and old run while clearing stale current health',
+              rec['restart_count'] == 1 and 'last_native_status' not in rec
+              and persisted['watchdog_faults'] == rec['watchdog_faults']
+              and persisted['last_restart']['fault_saved'] is True
+              and persisted['runs'][-2]['watchdog_fault']['fault_id'] == doc['fault_id'])
+        current = M.recording_status()
+        check('recording status exposes restart and fault even after replacement',
+              current['restart_count'] == 1 and current['watchdog_faults'] == rec['watchdog_faults']
+              and current['last_restart']['fault_id'] == doc['fault_id'])
+        first = rec['watchdog_faults'][0]
+        first_bytes = Path(first['path']).read_bytes()
+        replacement = env.clients[-1]
+        replacement.proc.closed = True
+        M._libobs_restart_after_death(rec, 7)
+        check('second restart uses a new immutable fault and retains prior reference',
+              rec['restart_count'] == 2 and len(rec['watchdog_faults']) == 2
+              and rec['watchdog_faults'][1]['fault_id'] != first['fault_id']
+              and Path(first['path']).read_bytes() == first_bytes)
+        second = json.loads(Path(rec['watchdog_faults'][1]['path']).read_text())
+        check('dead host snapshot does not invent a fresh or previous-host status',
+              second['native_status'] is None and second['last_status_observation'] is None
+              and second['reason'] == 7)
+        result = M.recording_stop()
+        check('final stop retains all fault references without changing superseded semantics',
+              result['ok'] and result['restart_count'] == 2
+              and result['watchdog_faults'] == rec['watchdog_faults']
+              and result['last_restart']['fault_id'] == rec['watchdog_faults'][-1]['fault_id'])
+        check('previous interrupted files remain explicitly unvalidated',
+              all(item['state'] == 'unvalidated' for item in result['files']
+                  if item['run_dir'] != result['dir']))
+
+
+def test_watchdog_status_exception_keeps_last_observation():
+    real_watchdog = M._libobs_watchdog
+
+    class TwoPolls:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, timeout):
+            self.calls += 1
+            return self.calls > 2
+
+        def set(self):
+            self.calls = 3
+
+    with NativeEnv() as env:
+        rec, client = env.start()
+        rec['watchdog_stop'] = TwoPolls()
+        healthy = {'ok': True, 'active': True, 'state': 'recording',
+                   'framed_audio': {'enabled': False}, 'last_exact_sample': 654321}
+        with patch.object(client, 'status', side_effect=[healthy, TimeoutError('injected IPC deadline')]), \
+                patch.object(M.time, 'monotonic', side_effect=[10.0, 13.0]):
+            real_watchdog(rec)
+        fault = rec['watchdog_faults'][0]
+        doc = json.loads(Path(fault['path']).read_text())
+        check('status failure distinguishes current exception from last successful response',
+              doc['native_status'] is None and doc['last_status_observation']['response'] == healthy
+              and doc['status_exception'] == {'type': 'TimeoutError', 'message': 'injected IPC deadline'}
+              and doc['reason'] == 'status_failed')
+        check('missing provenance file is disclosed rather than filled from a new checkpoint',
+              doc['artifact_manifest']['data'] is None
+              and 'FileNotFoundError' in doc['artifact_manifest']['error'])
+        check('status failure evidence survives successful recovery stop',
+              M.recording_stop()['watchdog_faults'] == [fault])
+
+
+def test_watchdog_fault_write_failure_is_explicit():
+    with NativeEnv() as env:
+        rec, client = env.start()
+        with patch.object(M, '_libobs_write_fault_snapshot', side_effect=OSError('injected disk full')):
+            M._libobs_restart_after_death(rec, 'framed_audio_failed', force=True,
+                                        native_status={'framed_audio': {'error_code': 'late_budget_exceeded'}})
+        ref = rec['watchdog_faults'][0]
+        check('fault write failure never claims saved and does not abandon old owner',
+              ref['saved'] is False and 'injected disk full' in ref['error']
+              and not Path(ref['path']).exists() and client.proc.closed and rec['restart_count'] == 1)
+        persisted = json.loads(M._recording_state_path().read_text())
+        check('unsaved fault and full observation are exposed in replacement state',
+              persisted['watchdog_faults'] == [ref]
+              and persisted['last_restart']['fault_saved'] is False
+              and ref['unsaved_snapshot']['native_status']['framed_audio']['error_code'] == 'late_budget_exceeded')
+        result = M.recording_stop()
+        check('stop discloses diagnostic loss even when recovered media checks pass',
+              result['ok'] and result['watchdog_faults'] == [ref]
+              and result['last_restart']['fault_error'] == ref['error'])
+    for point in ('fsync', 'replace'):
+        with NativeEnv() as env:
+            path = env.env.root / f'watchdog-fault-{point}.json'
+            with patch.object(M.os, point, side_effect=OSError(f'injected {point} failure')):
+                try:
+                    M._libobs_write_fault_snapshot(path, {'unaltered': 1})
+                except OSError as exc:
+                    check(f'fault writer propagates {point} failure', point in str(exc))
+                else:
+                    check(f'fault writer propagates {point} failure', False)
+            check(f'fault writer {point} failure leaves no successful file or temp',
+                  not path.exists() and not path.with_name(path.name + '.tmp').exists())
+
+
 if __name__ == '__main__':
     test_concurrent_admission()
     test_stop_then_start()
@@ -458,4 +613,7 @@ if __name__ == '__main__':
     test_guarded_server_transactions()
     test_stop_and_restart_cannot_abandon_live_owner()
     test_spawn_callback_persists_before_connect_returns()
+    test_watchdog_fault_snapshot_precedes_cleanup()
+    test_watchdog_status_exception_keeps_last_observation()
+    test_watchdog_fault_write_failure_is_explicit()
     print(f'{CHECKS}/{CHECKS} checks passed')

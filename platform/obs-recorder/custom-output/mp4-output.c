@@ -605,7 +605,6 @@ static bool change_file(struct mp4_output *out, struct encoder_packet *pkt)
 	}
 
 	info("Waiting for file writer to finish...");
-	const int64_t closed_bytes = serializer_get_pos(&out->serializer);
 
 	/* flush/close file and destroy old muxer */
 	buffered_file_serializer_free(&out->serializer);
@@ -613,6 +612,9 @@ static bool change_file(struct mp4_output *out, struct encoder_packet *pkt)
 	mp4_mux_destroy(out->muxer);
 	out->muxer = NULL;
 	mp4_clear_chapters(out);
+	/* Finalization seeks back to rewrite MP4 headers. The serializer cursor
+	 * is therefore not file length; inspect the fully closed artifact. */
+	const int64_t closed_bytes = os_get_file_size(out->path.array);
 
 	info("File split complete. Finalization took %" PRIu64 " ms.", (os_gettime_ns() - start_time) / 1000000);
 

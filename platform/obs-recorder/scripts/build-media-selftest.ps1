@@ -242,7 +242,8 @@ if ($configureExit -eq 0) {
     Write-Host ("MSVC /showIncludes prefix patched in {0} Ninja file(s)" -f $showIncludesPatched)
     $buildArgs = @('--build', $BuildDir, '--target', 'obs-media-selftest',
         'audio-core-tests', 'framed-core-tests', 'framed-source-smoke',
-        'stop-policy-tests', 'split-policy-tests', 'owner-policy-tests', '--config', $Config)
+        'stop-policy-tests', 'split-policy-tests', 'owner-policy-tests',
+        'live-audio-policy-tests', '--config', $Config)
     if ($RequireClean) { $buildArgs += '--clean-first' }
     $buildOutput = (& $cmake @buildArgs 2>&1 | Out-String)
     $buildExit = $LASTEXITCODE

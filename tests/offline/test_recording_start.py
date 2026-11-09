@@ -602,6 +602,67 @@ def test_watchdog_fault_write_failure_is_explicit():
                   not path.exists() and not path.with_name(path.name + '.tmp').exists())
 
 
+def test_product_shared_transport_survives_restart():
+    from types import SimpleNamespace
+    with NativeEnv() as env:
+        session = SimpleNamespace(client_pid=12345, session_id='fake-session',
+                                  audio_driver='a3capture', audio_driver_explicit=False,
+                                  audio_capture_file=str(env.framed), audio_sdl_sha256='c' * 64,
+                                  alive=lambda: True)
+        env.env.agent(SimpleNamespace(session=session, _load_session=lambda: session))
+        Path(str(env.framed) + '.ready').write_text('ready')
+        (M._dir() / 'game-audio.raw').write_bytes(b'stale file must never be selected')
+        calls = []
+
+        def launch(out, **kwargs):
+            calls.append(dict(kwargs))
+            return env.start_client(out, **kwargs)
+
+        with patch.object(M, '_libobs_start_client', launch):
+            start = M.recording_start()
+            rec = M._RUNTIME.recorder
+            check('default product start explicitly configures live shared memory',
+                  start['ok'] and start['audio_framed_transport'] == 'shared_memory'
+                  and start['audio_route'] == 'session_a3capture'
+                  and calls[0]['audio_framed_transport'] == 'shared_memory'
+                  and calls[0]['audio_framed_live'] is True and calls[0]['audio_raw'] is None
+                  and calls[0]['client_pid'] == session.client_pid)
+            original = dict(rec['config'])
+            persisted = json.loads(M._recording_state_path().read_text())
+            check('recording state preserves original transport config and capture PID',
+                  persisted['config'] == original
+                  and original['audio_framed_transport'] == 'shared_memory'
+                  and original['client_pid'] == session.client_pid)
+            env.clients[0].proc.closed = True
+            M._libobs_restart_after_death(rec, 9)
+            check('watchdog restart reuses transport and capture identity without raw fallback',
+                  len(calls) == 2 and calls[1]['audio_framed_transport'] == 'shared_memory'
+                  and calls[1]['audio_framed_live'] is True and calls[1]['audio_raw'] is None
+                  and calls[1]['audio_framed'] == env.framed
+                  and calls[1]['client_pid'] == session.client_pid
+                  and rec['config'] == original)
+            fault = json.loads(Path(rec['watchdog_faults'][0]['path']).read_text())
+            check('fault and restarted state retain exact transport configuration',
+                  fault['config'] == original
+                  and json.loads(M._recording_state_path().read_text())['config'] == original)
+            check('public status reports selected transport after restart',
+                  M.recording_status()['audio_framed_transport'] == 'shared_memory')
+            stop = M.recording_stop()
+            check('stop reports transport even when recovered old run remains unvalidated',
+                  stop['audio_framed_transport'] == 'shared_memory' and stop['restart_count'] == 1
+                  and any(item['state'] == 'unvalidated' for item in stop['files']))
+
+    with NativeEnv() as env:
+        rec, client = env.start()
+        del rec['config']['audio_framed_transport']
+        client.proc.closed = True
+        M._libobs_restart_after_death(rec, 7)
+        check('missing persisted transport cannot silently restart with file default',
+              len(env.clients) == 1 and not rec['active']
+              and 'audio_framed_transport' in rec['recording_failed'])
+        check('unknown restored transport remains an explicit failed stop', not M.recording_stop()['ok'])
+
+
 if __name__ == '__main__':
     test_concurrent_admission()
     test_stop_then_start()
@@ -616,4 +677,5 @@ if __name__ == '__main__':
     test_watchdog_fault_snapshot_precedes_cleanup()
     test_watchdog_status_exception_keeps_last_observation()
     test_watchdog_fault_write_failure_is_explicit()
+    test_product_shared_transport_survives_restart()
     print(f'{CHECKS}/{CHECKS} checks passed')

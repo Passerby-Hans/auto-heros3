@@ -57,12 +57,48 @@ def framed_failure(report: dict) -> dict:
     return {"error_code": codes[0], "origin": "failed_named_source_gates"}
 
 
-def expected_stall_failure(report: dict, native_exit: int, stall_ms: int) -> bool:
+def expected_stall_failure(report: dict, native_exit: int, stall_ms: int,
+                           transport: str = "file", reader_stall_ms: int = 0) -> bool:
     allowed = ({"late_budget_exceeded"} if stall_ms == 1000 else
                {"capture_stalled", "late_budget_exceeded", "producer_error"}
                if stall_ms == 6000 else set())
+    if transport == "shared_memory":
+        allowed = {"live_producer_fatal"} if stall_ms == 6000 else set()
+    if reader_stall_ms >= 750:
+        allowed = {"late_budget_exceeded"}
+    if transport == "shared_memory" and stall_ms == 6000 and not reader_stall_ms:
+        source = ((report.get("media") or {}).get("tail") or {}).get("source_after_drain") or {}
+        # A six-second archive stall must exhaust this queue. An unrelated
+        # clock failure, write error or producer exit is not the expected test.
+        if (source.get("reader_diagnostics") or {}).get("producer_fatal_code") != 2:
+            return False
     return (native_exit == 6 and report.get("exit_code") == 6 and
             report.get("status") == "fail" and framed_failure(report).get("error_code") in allowed)
+
+
+def shared_delivery_checks(report: dict) -> dict:
+    source = ((report.get("media") or {}).get("tail") or {}).get("source_after_drain") or {}
+    d = source.get("reader_diagnostics") or {}
+    return {
+        "shared_transport": d.get("transport") == "shared_memory",
+        "identity_header_only": d.get("read_offset") == 128 and d.get("eof_reopens") == 0,
+        "mmcss": d.get("mmcss_registered") is True,
+        "fresh_attach": type(d.get("first_submitted_age_ns")) is int and
+                         0 <= d["first_submitted_age_ns"] <= 70000000,
+        "archive_committed": d.get("archive_commit_ok") is True and
+                             type(d.get("archive_committed_end_sample")) is int and
+                             d["archive_committed_end_sample"] >= source.get("submitted_end_sample", 0),
+        "no_producer_fatal": d.get("producer_fatal_code") == 0,
+        "no_reader_fatal": (d.get("fatal") or {}).get("latched") is False,
+        "no_submitted_gap": source.get("submitted_gaps") == 0,
+    }
+
+
+def expected_missing_map(report: dict, native_exit: int) -> bool:
+    rows = [s for s in report.get("steps", []) if s.get("name") == "framed_audio_opened"]
+    return (native_exit == 9 and report.get("exit_code") == 9 and report.get("status") == "fail" and
+            len(rows) == 1 and rows[0].get("ok") is False and
+            "error_code='live_map_missing'" in rows[0].get("detail", ""))
 
 
 def producer_metrics(text: str) -> dict:
@@ -149,6 +185,9 @@ def main() -> int:
     ap.add_argument("--seconds", type=int, default=8)
     ap.add_argument("--split", type=int, default=3)
     ap.add_argument("--stall-ms", type=int, help="Use live SDL producer instead of pulse replay")
+    ap.add_argument("--transport", choices=("shared_memory", "file"), default="shared_memory")
+    ap.add_argument("--reader-stall-ms", type=int, default=0, choices=(0, 750))
+    ap.add_argument("--missing-map", action="store_true", help="Require fail-closed with valid identity but no map")
     ap.add_argument("--decode", action="store_true")
     ap.add_argument("--av", action="store_true", help="Measure every synthetic pulse (requires replay)")
     ap.add_argument("--pattern", choices=("pulse", "pn"), default="pulse")
@@ -159,6 +198,10 @@ def main() -> int:
         ap.error("stall-ms must be 0, 300, 1000 or 6000")
     if args.av and (args.pattern != "pulse" or args.stall_ms is not None):
         ap.error("--av requires a replayed pulse fixture")
+    if args.reader_stall_ms and args.stall_ms is None:
+        ap.error("reader stall requires a live producer (--stall-ms 0)")
+    if args.missing_map and (args.stall_ms is not None or args.av or args.transport != "shared_memory"):
+        ap.error("missing-map requires shared_memory without a producer or A/V measurement")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     exe = ROOT / "platform/obs-recorder/build-media/bin/auto-heros3-recorder.exe"
@@ -185,6 +228,11 @@ def main() -> int:
             # immediately so the recording's first sample is also measurable.
             command += ["--video-pulse", "--av-origin-delay-ms",
                         "1000" if args.pattern == "pulse" else "0"]
+            if args.missing_map:
+                command += ["--audio-framed-live", "--audio-framed-transport", "shared_memory",
+                            "--audio-capture-pid", str(os.getpid())]
+            else:
+                command += ["--audio-framed-transport", "file"]
         else:
             producer_env = dict(env)
             producer_env["A3CAPTURE_TEST_WORKER_STALL_ONCE_MS"] = str(args.stall_ms)
@@ -201,7 +249,10 @@ def main() -> int:
                 if producer.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError("private SDL producer did not publish its first packet")
                 time.sleep(.02)
-            command += ["--audio-framed-live"]
+            command += ["--audio-framed-live", "--audio-framed-transport", args.transport,
+                        "--audio-capture-pid", str(producer.pid)]
+            if args.reader_stall_ms:
+                env["A3_FRAMED_TEST_DELAY_AFTER_FIRST_MS"] = str(args.reader_stall_ms)
         evidence["command"] = command
         with (out / "native.log").open("w", encoding="utf-8") as log:
             consumer = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT, env=env)
@@ -217,13 +268,20 @@ def main() -> int:
         if not framed:
             framed = framed_failure(report)
         evidence["framed"] = framed
-        expected_failure = args.stall_ms is not None and args.stall_ms >= 1000
-        if expected_failure:
+        expected_failure = (bool(args.reader_stall_ms) or args.stall_ms == 6000 or
+                            args.transport == "file" and args.stall_ms == 1000)
+        if args.missing_map:
+            ok = expected_missing_map(report, evidence["native_exit"])
+        elif expected_failure:
             code = framed_failure(report).get("error_code")
             evidence["observed_failures"] = [code] if code else []
-            ok = expected_stall_failure(report, evidence["native_exit"], args.stall_ms)
+            ok = expected_stall_failure(report, evidence["native_exit"], args.stall_ms,
+                                        args.transport, args.reader_stall_ms)
         else:
             ok = evidence["native_exit"] == 0 and report.get("status") == "pass"
+            if args.stall_ms is not None and args.transport == "shared_memory":
+                evidence["shared_delivery_checks"] = shared_delivery_checks(report)
+                ok = ok and all(evidence["shared_delivery_checks"].values())
             clips = list(out.glob("clip-*.mp4"))
             evidence["intervals"] = [check_interval(p) for p in clips]
             # One-second GOP quantization may extend each requested split.

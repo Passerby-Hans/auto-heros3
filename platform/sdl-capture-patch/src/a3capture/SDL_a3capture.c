@@ -21,6 +21,7 @@
 #include "../SDL_sysaudio.h"
 #include "audio_clock_c.h"
 #include "a3_audio_protocol_c.h"
+#include "a3_audio_live.h"
 
 /* Use Windows kernel threads and SDL_RWops.  The private SDL2 DLL is linked
  * with /NODEFAULTLIB; pulling stdio/_beginthreadex into the backend would
@@ -66,6 +67,8 @@ struct SDL_PrivateAudioData
     volatile SDL_bool stopping;
     SDL_bool worker_done;
     SDL_RWops *out;
+    HANDLE live_mapping;
+    A3AudioLiveShared *live;
     char *out_path;
     char *ready_path;
     char *stop_path;
@@ -130,6 +133,90 @@ static int A3Deadline(const struct SDL_PrivateAudioData *h, Uint64 frame, Uint64
 {
     const a3_qpc_clock clock = {h->epoch_qpc, h->qpc_frequency, h->sample_rate};
     return a3_qpc_deadline(&clock, frame, out);
+}
+
+/* The audio thread is the sole live publisher. No reader owns a slot lock;
+ * killing/restarting the recorder cannot stop subsequent publications. */
+static void A3PublishLive(struct SDL_PrivateAudioData *h,
+                          const A3AudioPacketHeader *header, const void *payload)
+{
+    A3AudioLiveSlot *slot;
+    LONG64 complete;
+    if (!h->live) return;
+    slot = &h->live->slots[header->sequence % A3_AUDIO_LIVE_CAPACITY];
+    complete = ((LONG64)header->sequence + 1) * 2;
+    InterlockedExchange64(&slot->stamp, complete + 1);
+    slot->packet_bytes = sizeof(*header) + header->payload_bytes;
+    SDL_memcpy(slot->packet, header, sizeof(*header));
+    if (header->payload_bytes) {
+        SDL_memcpy(slot->packet + sizeof(*header), payload, header->payload_bytes);
+    }
+    MemoryBarrier();
+    InterlockedExchange64(&slot->stamp, complete);
+    InterlockedExchange64(&h->live->header.published_sequence_plus1,
+                          (LONG64)header->sequence + 1);
+    if (header->flags & A3_AUDIO_FLAG_LAST) {
+        InterlockedExchange(&h->live->header.closed, 1);
+    }
+}
+
+static void A3ArchiveFailed(struct SDL_PrivateAudioData *h, LONG code)
+{
+    if (h->live) InterlockedExchange(&h->live->header.archive_failed, 1);
+    a3_audio_live_set_fatal(h->live, code);
+}
+
+static int A3OpenLive(struct SDL_PrivateAudioData *h)
+{
+    char name[80];
+    FILETIME created, exited, kernel, user;
+    A3AudioLiveHeader *header;
+    SDL_snprintf(name, sizeof(name), A3_AUDIO_LIVE_MAP_FORMAT,
+                 (unsigned long long)h->capture_id, (unsigned)h->generation);
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+        return SDL_SetError("a3capture cannot identify live producer");
+    }
+    h->live_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                          0, sizeof(A3AudioLiveShared), name);
+    if (!h->live_mapping) return SDL_SetError("a3capture cannot create live mapping");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h->live_mapping);
+        h->live_mapping = NULL;
+        return SDL_SetError("a3capture live mapping identity already exists");
+    }
+    h->live = (A3AudioLiveShared *)MapViewOfFile(h->live_mapping, FILE_MAP_ALL_ACCESS,
+                                                0, 0, sizeof(A3AudioLiveShared));
+    if (!h->live) {
+        CloseHandle(h->live_mapping);
+        h->live_mapping = NULL;
+        return SDL_SetError("a3capture cannot map live memory");
+    }
+    /* Touch every page outside the callback; the mapping uses pagefile-backed
+     * memory, never the archive file. This is not a hard real-time guarantee. */
+    SDL_memset(h->live, 0, sizeof(*h->live));
+    header = &h->live->header;
+    header->magic = A3_AUDIO_LIVE_MAGIC;
+    header->version = A3_AUDIO_LIVE_VERSION;
+    header->header_bytes = sizeof(*header);
+    header->struct_bytes = sizeof(*h->live);
+    header->capacity = A3_AUDIO_LIVE_CAPACITY;
+    header->slot_bytes = sizeof(A3AudioLiveSlot);
+    header->payload_capacity = A3_AUDIO_LIVE_PAYLOAD_BYTES;
+    header->packet_header_bytes = A3_AUDIO_HEADER_BYTES;
+    header->producer_pid = GetCurrentProcessId();
+    header->producer_creation_filetime = ((Uint64)created.dwHighDateTime << 32) | created.dwLowDateTime;
+    header->capture_id = h->capture_id;
+    header->generation = h->generation;
+    header->sample_rate = h->sample_rate;
+    header->channels = A3_AUDIO_CHANNELS_STEREO;
+    header->sample_format = A3_AUDIO_FORMAT_S16LE;
+    header->frames_per_packet = h->samples_per_callback;
+    header->capture_epoch_qpc = h->capture_epoch_qpc;
+    header->qpc_frequency = h->qpc_frequency;
+    InterlockedExchange(&header->initialized, 1);
+    SDL_Log("a3capture live opened: name='%s' bytes=%u slots=%u producer_pid=%u",
+            name, (unsigned)sizeof(*h->live), A3_AUDIO_LIVE_CAPACITY, (unsigned)header->producer_pid);
+    return 0;
 }
 
 /* Worker observations only; callers hold h->lock.  Completion measures the
@@ -248,10 +335,19 @@ static void A3MakeFinalLocked(struct SDL_PrivateAudioData *h)
     if (h->final_requested || h->final_written) {
         return;
     }
+    if (h->next_sequence > UINT32_MAX) {
+        a3_audio_live_set_fatal(h->live, A3_AUDIO_LIVE_FATAL_SEQUENCE_EXHAUSTED);
+        h->failed = SDL_TRUE;
+        h->stopping = SDL_TRUE;
+        return;
+    }
     A3AudioPacketHeader fh = {0};
     const Uint64 now = SDL_GetPerformanceCounter();
     Uint64 planned = now;
-    A3Deadline(h, h->generated_frames, &planned);
+    if (!A3Deadline(h, h->generated_frames, &planned)) {
+        h->failed = SDL_TRUE;
+        a3_audio_live_set_fatal(h->live, A3_AUDIO_LIVE_FATAL_CLOCK);
+    }
     memcpy(fh.magic, "A3AP", 4);
     fh.version = A3_AUDIO_WIRE_VERSION;
     fh.header_bytes = A3_AUDIO_HEADER_BYTES;
@@ -282,6 +378,9 @@ static void A3MakeFinalLocked(struct SDL_PrivateAudioData *h)
         fh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
     }
     a3_audio_finalize_packet(&fh, NULL, 0);
+    /* Live termination is independent of a worker currently blocked in disk
+     * I/O. archive_closed is published separately after disk LAST succeeds. */
+    A3PublishLive(h, &fh, NULL);
     h->final_header = fh;
     h->final_requested = SDL_TRUE;
     h->stopping = SDL_TRUE;
@@ -289,8 +388,9 @@ static void A3MakeFinalLocked(struct SDL_PrivateAudioData *h)
 
 static DWORD WINAPI A3Worker(LPVOID arg)
 {
-    SDL_AudioDevice *device = (SDL_AudioDevice *)arg;
-    struct SDL_PrivateAudioData *h = device->hidden;
+    /* CloseDevice clears device->hidden before joining. Hold the actual state
+     * pointer even if the OS first schedules this worker after close starts. */
+    struct SDL_PrivateAudioData *h = (struct SDL_PrivateAudioData *)arg;
     Uint64 last_diagnostic_qpc = 0;
 
     for (;;) {
@@ -312,6 +412,8 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                 SDL_LockMutex(h->lock);
                 if (wrote == sizeof(final_header)) {
                     h->final_written = SDL_TRUE;
+                    if (h->live && !InterlockedCompareExchange(&h->live->header.archive_failed, 0, 0))
+                        InterlockedExchange(&h->live->header.archive_closed, 1);
                     ++h->written_packets;
                     h->written_bytes += sizeof(final_header);
                     SDL_Log("a3capture final written: generated=%llu queued=%llu "
@@ -327,6 +429,7 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                     A3LogLatencyLocked(h, "final");
                 } else {
                     h->failed = SDL_TRUE;
+                    A3ArchiveFailed(h, A3_AUDIO_LIVE_FATAL_ARCHIVE_WRITE);
                     SDL_snprintf(h->write_error, sizeof(h->write_error),
                                  "short final header %llu/%llu",
                                  (unsigned long long)wrote,
@@ -371,9 +474,14 @@ static DWORD WINAPI A3Worker(LPVOID arg)
                 ++h->written_packets;
                 h->written_bytes += header_len + payload;
                 h->written_frames += packet->header.sample_count;
-                h->committed_frames = h->written_frames;
+                if (!h->live || !InterlockedCompareExchange(&h->live->header.archive_failed, 0, 0)) {
+                    h->committed_frames = packet->header.sample_start + packet->header.sample_count;
+                    if (h->live) InterlockedExchange64(&h->live->header.archive_committed_end_sample,
+                                                        (LONG64)h->committed_frames);
+                }
             } else {
                 h->failed = SDL_TRUE;
+                A3ArchiveFailed(h, A3_AUDIO_LIVE_FATAL_ARCHIVE_WRITE);
                 SDL_snprintf(h->write_error, sizeof(h->write_error),
                              "short packet header=%llu/%llu payload=%llu/%llu frame=%llu",
                              (unsigned long long)header_wrote,
@@ -448,23 +556,60 @@ static void A3CAPTURE_PlayDevice(_THIS)
 {
     struct SDL_PrivateAudioData *h = _this->hidden;
     A3Packet *packet = NULL;
+    A3AudioPacketHeader hh = {0};
     const Uint64 now = SDL_GetPerformanceCounter();
     const Uint64 frame_start = h->generated_frames;
     Uint64 planned = 0;
 
-    SDL_LockMutex(h->lock);
+    /* SDL has one audio callback thread, and joins it before CloseDevice.
+     * Publish live PCM before taking the archive queue's short mutex. The
+     * worker's WriteFile/diagnostic logging is outside that mutex. */
     if (h->final_requested || h->stopping) {
-        SDL_UnlockMutex(h->lock);
+        return;
+    }
+    if (h->next_sequence > UINT32_MAX) {
+        a3_audio_live_set_fatal(h->live, A3_AUDIO_LIVE_FATAL_SEQUENCE_EXHAUSTED);
         return;
     }
     const Uint64 sequence = h->next_sequence++;
     if (!A3Deadline(h, frame_start, &planned)) {
+        a3_audio_live_set_fatal(h->live, A3_AUDIO_LIVE_FATAL_CLOCK);
+        SDL_LockMutex(h->lock);
         h->failed = SDL_TRUE;
         SDL_snprintf(h->write_error, sizeof(h->write_error),
                      "deadline overflow at frame %llu",
                      (unsigned long long)frame_start);
+        SDL_UnlockMutex(h->lock);
         planned = now;
     }
+    memcpy(hh.magic, "A3AP", 4);
+    hh.version = A3_AUDIO_WIRE_VERSION;
+    hh.header_bytes = A3_AUDIO_HEADER_BYTES;
+    hh.capture_id = h->capture_id;
+    hh.generation = h->generation;
+    hh.sequence = (Uint32)sequence;
+    hh.sample_rate = h->sample_rate;
+    hh.channels = A3_AUDIO_CHANNELS_STEREO;
+    hh.sample_format = A3_AUDIO_FORMAT_S16LE;
+    hh.payload_bytes = h->payload_bytes;
+    hh.sample_start = frame_start;
+    hh.sample_count = h->samples_per_callback;
+    hh.planned_qpc = planned;
+    hh.actual_start_qpc = h->callback_start_qpc ? h->callback_start_qpc : now;
+    hh.actual_end_qpc = now;
+    hh.qpc_frequency = h->qpc_frequency;
+    hh.capture_epoch_qpc = h->capture_epoch_qpc;
+    if (!h->sent_any) hh.flags |= A3_AUDIO_FLAG_FIRST;
+    if (h->pending_discontinuity_count > 0) {
+        hh.flags |= A3_AUDIO_FLAG_DISCONTINUITY;
+        hh.discontinuity_start = h->pending_discontinuity_start;
+        hh.discontinuity_count = h->pending_discontinuity_count;
+    }
+    if (h->overflow_events > 0) hh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
+    a3_audio_finalize_packet(&hh, h->mixbuf, h->payload_bytes);
+    A3PublishLive(h, &hh, h->mixbuf);
+
+    SDL_LockMutex(h->lock);
     if (h->free_count > 0) {
         packet = h->free_slots[--h->free_count];
         const Uint64 slots_used = A3CAPTURE_QUEUE_SLOTS - h->free_count;
@@ -480,39 +625,10 @@ static void A3CAPTURE_PlayDevice(_THIS)
         h->pending_discontinuity_count += h->samples_per_callback;
         h->dropped_frames += h->samples_per_callback;
         h->failed = SDL_TRUE;
+        A3ArchiveFailed(h, A3_AUDIO_LIVE_FATAL_ARCHIVE_OVERFLOW);
     }
     if (packet) {
-        A3AudioPacketHeader hh = {0};
-        memcpy(hh.magic, "A3AP", 4);
-        hh.version = A3_AUDIO_WIRE_VERSION;
-        hh.header_bytes = A3_AUDIO_HEADER_BYTES;
-        hh.capture_id = h->capture_id;
-        hh.generation = h->generation;
-        hh.sequence = (Uint32)sequence;
-        hh.sample_rate = h->sample_rate;
-        hh.channels = A3_AUDIO_CHANNELS_STEREO;
-        hh.sample_format = A3_AUDIO_FORMAT_S16LE;
-        hh.payload_bytes = h->payload_bytes;
-        hh.sample_start = frame_start;
-        hh.sample_count = h->samples_per_callback;
-        hh.planned_qpc = planned;
-        hh.actual_start_qpc = h->callback_start_qpc ? h->callback_start_qpc : now;
-        hh.actual_end_qpc = now;
-        hh.qpc_frequency = h->qpc_frequency;
-        hh.capture_epoch_qpc = h->capture_epoch_qpc;
-        if (!h->sent_any) {
-            hh.flags |= A3_AUDIO_FLAG_FIRST;
-        }
-        if (h->pending_discontinuity_count > 0) {
-            hh.flags |= A3_AUDIO_FLAG_DISCONTINUITY;
-            hh.discontinuity_start = h->pending_discontinuity_start;
-            hh.discontinuity_count = h->pending_discontinuity_count;
-        }
-        if (h->overflow_events > 0) {
-            hh.flags |= A3_AUDIO_FLAG_QUEUE_OVERFLOW;
-        }
         memcpy(packet->data, h->mixbuf, h->payload_bytes);
-        a3_audio_finalize_packet(&hh, packet->data, h->payload_bytes);
         packet->header = hh;
         packet->enqueued_qpc = SDL_GetPerformanceCounter();
         h->queue[(h->queue_head + h->queue_count) % A3CAPTURE_QUEUE_SLOTS] = packet;
@@ -531,6 +647,7 @@ static void A3CAPTURE_PlayDevice(_THIS)
     h->generated_frames += h->samples_per_callback;
     if (!A3Deadline(h, h->generated_frames, &h->next_deadline_qpc)) {
         h->failed = SDL_TRUE;
+        a3_audio_live_set_fatal(h->live, A3_AUDIO_LIVE_FATAL_CLOCK);
     }
     SDL_UnlockMutex(h->lock);
 }
@@ -578,14 +695,18 @@ static void A3CAPTURE_CloseDevice(_THIS)
     SDL_UnlockMutex(h->lock);
     if (h->worker) {
         const DWORD wait = WaitForSingleObject(h->worker, 5000);
-        if (wait == WAIT_TIMEOUT) {
+        if (wait != WAIT_OBJECT_0) {
             // Do not free memory still referenced by the worker.  Leaking this
             // spike state is safer than a use-after-free on shutdown.
-            SDL_Log("a3capture close timeout; worker detached, resources retained");
+            SDL_Log("a3capture close wait failed=%u; worker detached, resources retained", (unsigned)wait);
+            A3ArchiveFailed(h, A3_AUDIO_LIVE_FATAL_PRODUCER_ABORT);
             return;
         }
         CloseHandle(h->worker);
         h->worker = NULL;
+    }
+    if (h->live && !InterlockedCompareExchange(&h->live->header.archive_closed, 0, 0)) {
+        A3ArchiveFailed(h, A3_AUDIO_LIVE_FATAL_PRODUCER_ABORT);
     }
     if (h->out) {
         SDL_RWclose(h->out);
@@ -593,6 +714,14 @@ static void A3CAPTURE_CloseDevice(_THIS)
     }
     if (h->ready_path) {
         DeleteFileA(h->ready_path);
+    }
+    if (h->live) {
+        UnmapViewOfFile(h->live);
+        h->live = NULL;
+    }
+    if (h->live_mapping) {
+        CloseHandle(h->live_mapping);
+        h->live_mapping = NULL;
     }
     SDL_Log("a3capture closed: generated=%llu queued=%llu written=%llu committed=%llu "
             "dropped=%llu late=%llu overflow=%llu depth_max=%llu write_latency_max_us=%llu failed=%d error='%s'",
@@ -727,9 +856,10 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
             (unsigned)_this->spec.format, _this->spec.freq, (unsigned)_this->spec.channels,
             (unsigned)_this->spec.samples, (unsigned)_this->spec.size);
     if (_this->spec.format != AUDIO_S16LSB || _this->spec.freq != 44100 ||
-        _this->spec.channels != 2 || _this->spec.samples == 0) {
+        _this->spec.channels != 2 || _this->spec.samples != 1024 ||
+        _this->spec.size != A3_AUDIO_LIVE_PAYLOAD_BYTES) {
         SDL_free(path);
-        return SDL_SetError("a3capture requires s16le/44100/stereo");
+        return SDL_SetError("a3capture requires s16le/44100/stereo/1024 frames");
     }
 
     h = (struct SDL_PrivateAudioData *)SDL_calloc(1, sizeof(*h));
@@ -819,9 +949,13 @@ static int A3CAPTURE_OpenDevice(_THIS, const char *devname)
     }
     h->free_count = A3CAPTURE_QUEUE_SLOTS;
     _this->hidden = h;
+    if (A3OpenLive(h) < 0) {
+        A3CAPTURE_CloseDevice(_this);
+        return -1;
+    }
 
     if (!h->test_no_thread) {
-        h->worker = CreateThread(NULL, 0, A3Worker, _this, 0, NULL);
+        h->worker = CreateThread(NULL, 0, A3Worker, h, 0, NULL);
         if (!h->worker) {
             A3CAPTURE_CloseDevice(_this);
             return -1;

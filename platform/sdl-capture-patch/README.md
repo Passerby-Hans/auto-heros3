@@ -19,8 +19,9 @@ never opens a physical playback device.
 ## Backend contract
 
 - SDL audio callback receives/produces 1024 frames per callback at 44100 Hz.
-- The callback records planned and actual QPC timestamps and pushes a bounded
-  packet to a worker; it performs no pipe/file/log/flush I/O.
+- The callback records planned and actual QPC timestamps and publishes a CRC
+  protected packet to a pagefile-backed live ring before enqueuing the same
+  packet for the archive worker; it performs no pipe/file/log/flush I/O.
 - Absolute deadline = capture epoch QPC + cumulative sample frames converted to
   QPC ticks; processing time is included in the current period, not added as a
   new full-period sleep.
@@ -52,14 +53,15 @@ latency allowance:
 | Boundary | Default | Behavior |
 | --- | --- | --- |
 | Live packet age, from capture sample PTS to reader | 500ms | Before first submission only, old history may be skipped. After first submission, age greater than the budget fails with `late_budget_exceeded`; no PTS rebasing, dropped-block concealment, or silence injection. |
-| Growing-file progress | 5s | No new bytes for more than 5s fails with `capture_stalled`. Returning stale bytes may instead trigger the packet-age check. |
+| Live shared-memory progress | 5s | No new published packets for more than 5s fails with `capture_stalled`. Returning stale packets may instead trigger the packet-age check. The explicit file diagnostic has an equivalent file-progress gate. |
 | Producer archive capacity | 256 slots, including the worker's in-flight packet | At 1024 frames / 44100 Hz this stores at most 262144 frames (5.9443s) from an initially empty ring. Occupied slots reduce available capacity. Overflow marks the exact dropped sample interval and fails integrity. It does not grant 5.94s of acceptable live latency. |
 
-The default delivery matrix is: a 300ms-old packet is eligible for submission;
-a 1s-old packet after recording has started fails; a 6s return is late, while
-6s without file progress fails the stall check. If a producer worker is blocked
-for 6s with callbacks continuing at their nominal cadence, the 256-slot ring
-also exhausts. Which error is observed first depends on the injected boundary.
+The default delivery matrix is: a 300ms-old live packet is eligible for submission;
+a 1s-old live packet after recording has started fails. Archive write latency is
+measured separately: a 1s archive stall must not delay shared-memory delivery.
+If the archive worker is blocked for 6s with callbacks continuing at nominal
+cadence, its 256-slot queue exhausts and the shared fatal flag exposes that
+archive loss. These are different injected boundaries and different tests.
 Eligibility does not prove libobs output retained all samples; live source and
 decoded-output tests are separate gates.
 
@@ -77,6 +79,20 @@ zero. `queue_depth_max` excludes the worker's in-flight packet; `slots_used_max`
 includes it. Final/closed observations must have `measurements > 0`,
 `clock_errors == 0`, and maxima within the tested scenario's limits.
 Successful writes mean OS acceptance, not a flush-to-storage durability guarantee.
+
+The live mapping uses `a3_audio_live.h` and the capture ID/generation from the
+archive's validated first header. The native reader validates the producer PID
+and creation FILETIME, then attaches to recent packets without scanning the
+archive. Slots use a single-writer sequence stamp; readers never hold a slot
+lock that a killed recorder could leave behind. After attachment, overwrite,
+CRC errors, sample gaps and stale packets are fatal. Recording stop also waits
+up to 5s for the archive to commit the retained sample interval; an incomplete
+archive cannot be reported as successful. `closed` means live LAST, whereas
+`archive_closed` means LAST was accepted by the archive write path.
+
+Product session audio explicitly requires `shared_memory`; missing mappings do
+not fall back to file polling. `audio_framed_transport='file'` remains an explicit
+diagnostic option, and static replay continues to use framed files.
 
 For a single producer-stall experiment, set
 `A3CAPTURE_TEST_WORKER_STALL_ONCE_MS=300`, `1000`, or `6000`; it pauses the worker

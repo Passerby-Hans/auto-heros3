@@ -44,6 +44,43 @@ typedef void (*PFN_SDL_CloseAudioDevice)(SDL_AudioDeviceID);
 #define SDL_AUDIO_ALLOW_CHANNELS_CHANGE 0x00000002
 
 static int g_failed = 0;
+/* Optional deterministic test input is loaded once, before SDL initialization.
+ * The callback never performs file I/O and never loops an exhausted fixture. */
+static Uint8 *g_pcm = NULL;
+static size_t g_pcm_bytes = 0;
+static size_t g_pcm_cursor = 0;
+static int g_pcm_exhausted = 0;
+#define A3_SMOKE_MAX_PCM_BYTES (512ULL * 1024ULL * 1024ULL)
+
+static int load_pcm_fixture(const char *path)
+{
+    FILE *f;
+    int64_t bytes;
+    size_t got;
+    if (!path || !*path) return 1;
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (_fseeki64(f, 0, SEEK_END) != 0 || (bytes = _ftelli64(f)) <= 0 ||
+        (uint64_t)bytes > A3_SMOKE_MAX_PCM_BYTES || bytes % 4 != 0 ||
+        _fseeki64(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    g_pcm = (Uint8 *)malloc((size_t)bytes);
+    if (!g_pcm) { fclose(f); return 0; }
+    got = fread(g_pcm, 1, (size_t)bytes, f);
+    /* Detect a file growing/truncating while loaded instead of silently
+     * accepting an ambiguous prefix as the deterministic fixture. */
+    if (got != (size_t)bytes || fgetc(f) != EOF || ferror(f)) {
+        fclose(f);
+        free(g_pcm);
+        g_pcm = NULL;
+        return 0;
+    }
+    fclose(f);
+    g_pcm_bytes = got;
+    return 1;
+}
 static void check(const char *name, int ok, const char *detail)
 {
     printf("%s %s%s%s\n", ok ? "PASS" : "FAIL", name,
@@ -54,6 +91,22 @@ static void check(const char *name, int ok, const char *detail)
 static void audio_cb(void *userdata, Uint8 *stream, int len)
 {
     (void)userdata;
+    if (g_pcm) {
+        const size_t available = g_pcm_bytes - g_pcm_cursor;
+        const size_t copied = len > 0 && (size_t)len < available ? (size_t)len : available;
+        if (len <= 0 || len % 4 != 0) {
+            g_pcm_exhausted = 1;
+            if (len > 0) memset(stream, 0, (size_t)len);
+            return;
+        }
+        memcpy(stream, g_pcm + g_pcm_cursor, copied);
+        g_pcm_cursor += copied;
+        if (copied < (size_t)len) {
+            memset(stream + copied, 0, (size_t)len - copied);
+            g_pcm_exhausted = 1;
+        }
+        return;
+    }
     int16_t *p = (int16_t *)stream;
     int frames = len / 4;
     static double phase = 0.0;
@@ -73,6 +126,10 @@ int main(int argc, char **argv)
     if (argc < 3) {
         fprintf(stderr, "usage: a3capture_smoke <SDL2.dll> <output.raw>\n");
         return 2;
+    }
+    if (!load_pcm_fixture(getenv("A3_SMOKE_PCM_FILE"))) {
+        fprintf(stderr, "FAIL pcm_fixture_load (required s16le/stereo, positive multiple of 4, <=512MiB)\n");
+        return 8;
     }
     wchar_t dll_w[MAX_PATH];
     MultiByteToWideChar(CP_UTF8, 0, argv[1], -1, dll_w, MAX_PATH);
@@ -142,6 +199,14 @@ int main(int argc, char **argv)
     printf("STEP closing device\n");
     pause(dev, 1);
     close(dev);
+    if (g_pcm) {
+        char pcm_detail[160];
+        snprintf(pcm_detail, sizeof(pcm_detail), "consumed_bytes=%llu available_bytes=%llu exhausted=%d",
+                 (unsigned long long)g_pcm_cursor, (unsigned long long)g_pcm_bytes, g_pcm_exhausted);
+        check("pcm_fixture_complete", !g_pcm_exhausted, pcm_detail);
+        free(g_pcm);
+        g_pcm = NULL;
+    }
     printf("STEP device closed; quitting SDL\n");
     quit();
     printf("STEP SDL quit; freeing DLL\n");

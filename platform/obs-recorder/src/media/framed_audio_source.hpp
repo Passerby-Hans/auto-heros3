@@ -13,6 +13,8 @@ struct FramedAudioConfig {
     uint32_t sample_rate = 44100;
     uint32_t channels = 2;
     bool live = false;
+    std::string transport = "shared_memory";
+    uint32_t expected_producer_pid = 0;
     bool start_at_zero = true;
     uint64_t replay_origin_ns = 0;
     uint64_t late_budget_ns = audio::kDefaultLateBudgetNs;
@@ -30,6 +32,19 @@ struct FramedAudioStats {
     bool opened = false;
     std::string path;
     std::string mode;
+    std::string transport;
+    std::string map_name;
+    uint32_t producer_pid = 0;
+    uint64_t producer_creation_filetime = 0;
+    uint64_t producer_fatal_code = 0;
+    uint64_t archive_committed_end_sample = 0;
+    uint64_t archive_lag_frames = 0;
+    uint64_t archive_lag_max_frames = 0;
+    uint64_t archive_drain_wait_ns = 0;
+    uint64_t snapshot_retries = 0;
+    bool archive_closed = false;
+    bool archive_commit_ok = false;
+    bool mmcss_registered = false;
     std::string error;
     std::string error_code;
     uint64_t file_bytes = 0;

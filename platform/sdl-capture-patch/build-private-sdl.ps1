@@ -30,17 +30,10 @@ $archiveHash = Get-Sha256 $archive
 if ($archiveHash -ne $lock.source_sha256) {
     throw "source lock mismatch: archive=$archiveHash expected=$($lock.source_sha256)"
 }
-$patchFiles = @(
-    (Join-Path $scriptDir 'apply.py'),
-    (Join-Path $scriptDir 'src\a3capture\SDL_a3capture.c'),
-    (Join-Path $scriptDir 'tests\a3capture_smoke.c'),
-    (Join-Path $scriptDir 'tests\validate_framed.py'),
-    (Join-Path $scriptDir 'tests\test_pipe.py'),
-    (Join-Path $scriptDir 'tests\test_stop.py'),
-    (Join-Path $RepoRoot 'platform\audio-protocol\python\a3_framed.py'),
-    (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.c'),
-    (Join-Path $RepoRoot 'platform\obs-recorder\src\audio\audio_clock_c.h')
-)
+if (-not $lock.patch_inputs -or $lock.patch_inputs.Count -eq 0) {
+    throw 'source lock must enumerate normalized patch_inputs'
+}
+$patchFiles = @($lock.patch_inputs | ForEach-Object { Join-Path $RepoRoot $_ })
 # Recipe hashes are independent of Git's Windows autocrlf checkout conversion.
 $patchConcat = ($patchFiles | ForEach-Object { (Get-Content -LiteralPath $_ -Raw).Replace("`r`n", "`n") }) -join "`n---A3PATCH---`n"
 $patchHash = [System.BitConverter]::ToString(

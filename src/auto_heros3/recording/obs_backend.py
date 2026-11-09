@@ -328,9 +328,17 @@ class ObsRecorder:
                 window_exe: str | None = None, audio_raw: Path | None = None,
                 audio_framed: Path | None = None,
                 audio_framed_live: bool = False,
+                audio_framed_transport: str = 'file',
                 max_time_sec: int = 900, max_size_mb: int = 0,
                 overlay_path: Path | None = None,
                 duration_ms: int = 0) -> dict:
+        if audio_framed_transport not in ('file', 'shared_memory'):
+            raise ObsBackendError('invalid audio framed transport', code='audio_framed_transport_invalid')
+        if audio_framed_transport == 'shared_memory' and (
+                not audio_framed or not audio_framed_live or not window_pid or int(window_pid) <= 0
+                or audio_raw):
+            raise ObsBackendError('shared_memory requires live framed identity and an owned capture PID',
+                                  code='audio_framed_transport_invalid')
         args: dict[str, Any] = {'out_dir': str(out_dir), 'max_time_sec': int(max_time_sec),
                                 'max_size_mb': int(max_size_mb),
                                 'duration_ms': int(duration_ms)}
@@ -349,6 +357,7 @@ class ObsRecorder:
         if audio_framed:
             args['audio_framed'] = str(audio_framed)
             args['audio_framed_live'] = bool(audio_framed_live)
+            args['audio_framed_transport'] = audio_framed_transport
         return self.request('prepare', timeout=30.0, **args)
 
     def start_recording(self, timeout: float = 30.0) -> dict:

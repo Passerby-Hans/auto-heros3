@@ -110,6 +110,22 @@ set_target_properties(split-policy-tests PROPERTIES
   OUTPUT_NAME "split-policy-tests"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# Shared-memory snapshot/identity policy; no libobs or media.
+add_executable(live-audio-policy-tests
+  tests/live_audio_policy_tests.cpp
+  src/audio/framed_core.cpp src/audio/audio_clock_c.c
+  ../audio-protocol/src/a3_audio_protocol.cpp
+  ../audio-protocol/src/a3_audio_protocol_c.c)
+target_compile_features(live-audio-policy-tests PRIVATE cxx_std_17)
+target_compile_definitions(live-audio-policy-tests PRIVATE
+  WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+target_compile_options(live-audio-policy-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+target_include_directories(live-audio-policy-tests PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include")
+set_target_properties(live-audio-policy-tests PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # First IPC connection ownership; no libobs, media, or Windows process mutation.
 add_executable(owner-policy-tests tests/ipc_owner_policy_tests.cpp)
 target_compile_features(owner-policy-tests PRIVATE cxx_std_17)
@@ -187,6 +203,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
   target_link_libraries(obs-media-selftest PRIVATE
     "${OBS_SDK_LIB}"
     advapi32
+    avrt
     gdi32
     version
   )
@@ -257,7 +274,7 @@ if(OBS_RECORDER_BUILD_MEDIA_SELFTEST)
     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/media"
     "${CMAKE_CURRENT_SOURCE_DIR}/../audio-protocol/include")
-  target_link_libraries(framed-source-smoke PRIVATE "${OBS_SDK_LIB}" advapi32 gdi32 version)
+  target_link_libraries(framed-source-smoke PRIVATE "${OBS_SDK_LIB}" advapi32 avrt gdi32 version)
   set_target_properties(framed-source-smoke PROPERTIES
     OUTPUT_NAME "framed-source-smoke"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

@@ -6304,6 +6304,7 @@ def _size_cap_mb(max_segment_gb: float) -> int:
 def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                          audio_framed: Path | None = None,
                          audio_framed_live: bool = False,
+                         audio_framed_transport: str = 'file',
                          audio_sdl_sha256: str = '',
                          pending_owner: dict | None = None,
                          max_time_sec: int, max_size_mb: int = 0,
@@ -6311,6 +6312,12 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
     """Create/connect/prepare/start one native recorder process for a run."""
     from auto_heros3.recording.obs_backend import ObsRecorder
     from auto_heros3.recording.native_artifacts import NativeArtifactsError, load_native_artifacts
+    if audio_framed_transport not in ('file', 'shared_memory'):
+        raise NativeArtifactsError('audio_framed_transport_invalid', str(audio_framed_transport))
+    if audio_framed_transport == 'shared_memory' and (
+            not audio_framed or not audio_framed_live or int(client_pid) <= 0 or audio_raw):
+        raise NativeArtifactsError('audio_framed_transport_invalid',
+                                   'shared_memory requires live framed identity and an owned capture PID')
     artifacts = load_native_artifacts(ROOT)
     if _obs_recorder_exe().resolve() != artifacts['recorder_exe']:
         raise NativeArtifactsError('native_recorder_override_mismatch', str(_obs_recorder_exe()))
@@ -6340,10 +6347,15 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                               audio_raw=Path(audio_raw) if audio_raw else None,
                               audio_framed=Path(audio_framed) if audio_framed else None,
                               audio_framed_live=bool(audio_framed_live),
+                              audio_framed_transport=audio_framed_transport,
                               max_time_sec=int(max_time_sec), max_size_mb=int(max_size_mb),
                               overlay_path=overlay_path, duration_ms=0)
         if not prep.get('ok'):
             raise RuntimeError(f"prepare failed: {prep.get('error')}")
+        if (audio_framed_transport == 'shared_memory'
+                and prep.get('audio_framed_transport') != 'shared_memory'):
+            raise NativeArtifactsError('native_audio_transport_unconfirmed',
+                                       'native prepare did not confirm shared_memory; refusing file fallback')
         start = client.start_recording()
         if not start.get('ok'):
             raise RuntimeError(f"start failed: {start.get('error')}")
@@ -6572,6 +6584,7 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False,
                 audio_raw=Path(cfg['audio_raw']) if cfg.get('audio_raw') and not cfg.get('audio_framed') else None,
                 audio_framed=Path(cfg['audio_framed']) if cfg.get('audio_framed') else None,
                 audio_framed_live=bool(cfg.get('audio_framed_live')),
+                audio_framed_transport=cfg['audio_framed_transport'],
                 audio_sdl_sha256=cfg.get('audio_sdl_sha256', ''),
                 pending_owner=rec,
                 max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0),
@@ -6647,9 +6660,12 @@ def _active_recording_info() -> dict | None:
 
 
 def _select_native_audio_source(audio_framed: str = '', audio_framed_live: bool = False,
+                                audio_framed_transport: str = '',
                                 *, identity: dict | None = None) -> dict:
     """Select from the running session, never from leftover files or current env."""
     from auto_heros3.recording.native_artifacts import NativeArtifactsError
+    if audio_framed_transport not in ('', 'file', 'shared_memory'):
+        raise NativeArtifactsError('audio_framed_transport_invalid', str(audio_framed_transport))
     if audio_framed:
         # Explicit replay/live fixture diagnostics are a conscious source
         # override, not an automatic fallback for a broken session source.
@@ -6658,8 +6674,12 @@ def _select_native_audio_source(audio_framed: str = '', audio_framed_live: bool 
             path = _dir() / path
         if not path.is_file():
             raise NativeArtifactsError('audio_framed_missing', str(path))
+        transport = audio_framed_transport or 'file'
+        if transport == 'shared_memory' and not audio_framed_live:
+            raise NativeArtifactsError('audio_framed_transport_invalid', 'shared_memory is live-only')
         return {'audio_raw': None, 'audio_framed': path,
                 'audio_framed_live': bool(audio_framed_live),
+                'audio_framed_transport': transport,
                 'audio_route': 'explicit_framed', 'audio_sdl_sha256': ''}
     try:
         agent = _agent()
@@ -6694,14 +6714,21 @@ def _select_native_audio_source(audio_framed: str = '', audio_framed_live: bool 
     if not path.is_absolute() or not path.is_file():
         raise NativeArtifactsError('native_session_audio_missing', str(path))
     if driver == 'a3capture':
+        if audio_framed_transport not in ('', 'shared_memory'):
+            raise NativeArtifactsError('native_audio_transport_mismatch',
+                                       'session_a3capture requires shared_memory; file is diagnostic-only')
         if not Path(str(path) + '.ready').is_file():
             raise NativeArtifactsError('native_audio_not_ready', str(path) + '.ready')
         sdl_sha = getattr(session, 'audio_sdl_sha256', '')
         if not re.fullmatch(r'[0-9a-f]{64}', sdl_sha):
             raise NativeArtifactsError('native_session_audio_identity_missing', 'restart the session')
         return {'audio_raw': None, 'audio_framed': path, 'audio_framed_live': True,
+                'audio_framed_transport': 'shared_memory',
                 'audio_route': 'session_a3capture', 'audio_sdl_sha256': sdl_sha}
+    if audio_framed_transport not in ('', 'file'):
+        raise NativeArtifactsError('native_audio_transport_mismatch', 'disk compatibility has no framed transport')
     return {'audio_raw': path, 'audio_framed': None, 'audio_framed_live': False,
+            'audio_framed_transport': 'file',
             'audio_route': 'explicit_session_disk', 'audio_sdl_sha256': ''}
 
 
@@ -6844,6 +6871,7 @@ def _libobs_abort_start(rec: dict, reason: str, *, restart_owned: bool = False,
               'detail': reason, 'retryable': not exited, 'cleanup_errors': errors,
               'pid': rec.get('native_pid') or getattr(proc, 'pid', None), 'process_exit_confirmed': exited,
               'recording_run_id': rec.get('recording_run_id'),
+              'audio_framed_transport': (rec.get('config') or {}).get('audio_framed_transport'),
               'runs': list(rec.get('runs') or []), 'restart_count': rec.get('restart_count', 0),
               'last_restart': rec.get('last_restart'),
               'watchdog_faults': list(rec.get('watchdog_faults') or [])}
@@ -6873,7 +6901,8 @@ def _libobs_abort_start(rec: dict, reason: str, *, restart_owned: bool = False,
 
 def _recording_start_libobs(fps: int, height: int, crf: int,
                             rollover_seconds: float, max_segment_gb: float = 1.5,
-                            audio_framed: str = "", audio_framed_live: bool = False) -> dict:
+                            audio_framed: str = "", audio_framed_live: bool = False,
+                            audio_framed_transport: str = '') -> dict:
     """Start the current native libobs IPC recorder with verified session audio."""
     if int(fps) != 60 or int(height) != 1080 or float(crf) != 10.0:
         return {'ok': False, 'error': 'unsupported_native_recording_parameters',
@@ -6888,7 +6917,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         return {'ok': False, 'error': 'no_owned_client', 'identity': identity}
     from auto_heros3.recording.native_artifacts import NativeArtifactsError
     try:
-        audio = _select_native_audio_source(audio_framed, audio_framed_live, identity=identity)
+        audio = _select_native_audio_source(audio_framed, audio_framed_live,
+                                            audio_framed_transport, identity=identity)
     except NativeArtifactsError as exc:
         return {'ok': False, 'error': exc.code, 'detail': exc.detail, 'identity': identity}
     audio_raw, framed_path = audio['audio_raw'], audio['audio_framed']
@@ -6926,6 +6956,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
               'client_pid': int(client_pid), 'audio_raw': str(audio_raw) if audio_raw else '',
               'audio_framed': str(framed_path) if framed_path else '',
               'audio_framed_live': bool(audio_framed_live),
+              'audio_framed_transport': audio['audio_framed_transport'],
               'audio_route': audio['audio_route'], 'audio_sdl_sha256': audio['audio_sdl_sha256'],
               'max_time_sec': int(rollover_seconds) if rollover_seconds else 900,
               'max_size_mb': _size_cap_mb(max_segment_gb),
@@ -6947,6 +6978,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
         client, prep = _libobs_start_client(
             out, client_pid=int(client_pid), audio_raw=audio_raw,
             audio_framed=framed_path, audio_framed_live=bool(audio_framed_live),
+            audio_framed_transport=audio['audio_framed_transport'],
             audio_sdl_sha256=audio['audio_sdl_sha256'],
             pending_owner=rec,
             max_time_sec=config['max_time_sec'], max_size_mb=config['max_size_mb'],
@@ -6985,6 +7017,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
             'window': prep.get('window'), 'audio_raw': str(audio_raw) if audio_raw else '',
             'audio_framed': str(framed_path) if framed_path else '',
             'audio_framed_live': bool(audio_framed_live), 'audio_route': audio['audio_route'],
+            'audio_framed_transport': audio['audio_framed_transport'],
             'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
             'max_segment_gb': float(max_segment_gb),
             'max_size_mb': _size_cap_mb(max_segment_gb),
@@ -7068,6 +7101,7 @@ def _libobs_recover_state(record: dict) -> dict:
             'python_manifest': (python_manifest or {}).get('path'),
             'manifest_state': manifest_state,
             'python_manifest_summary': python_manifest,
+            'audio_framed_transport': (record.get('config') or {}).get('audio_framed_transport'),
             'restart_count': record.get('restart_count', 0),
             'last_restart': record.get('last_restart'),
             'watchdog_faults': record.get('watchdog_faults') or [],
@@ -7177,6 +7211,7 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
                   'dir': str(out) if out else None,
                   'error': rec.get('recording_failed') or 'obs_client_missing',
                   'runs': runs,
+                  'audio_framed_transport': (rec.get('config') or {}).get('audio_framed_transport'),
                   'restart_count': int(rec.get('restart_count') or 0),
                   'last_restart': rec.get('last_restart'),
                   'watchdog_faults': list(rec.get('watchdog_faults') or [])}
@@ -7357,6 +7392,7 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
               'validation_errors': validation_errors,
               'segment_states': segment_states,
               'restart_count': int(rec.get('restart_count') or 0),
+              'audio_framed_transport': (rec.get('config') or {}).get('audio_framed_transport'),
               'last_restart': rec.get('last_restart'),
               'watchdog_faults': list(rec.get('watchdog_faults') or []),
               'max_segment_gb': cap_gb, 'max_size_mb': (rec.get('config') or {}).get('max_size_mb'),
@@ -7423,7 +7459,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     backend: str = 'libobs',
                     max_segment_gb: float = 1.5,
                     audio_framed: str = "",
-                    audio_framed_live: bool = False) -> dict:
+                    audio_framed_live: bool = False,
+                    audio_framed_transport: str = '') -> dict:
     """Passive overlay recording: 16:9 canvas (game 4:3 + reasoning/action panel).
 
     Runs in a separate process, so reloading this MCP server never interrupts a recording.
@@ -7437,6 +7474,9 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     backend='libobs' is the default native path. Manual fallback: set
     AUTO_HEROS3_AUDIO_DRIVER=disk and restart
     the session before using backend='legacy'.
+    Live session a3capture uses shared_memory; the framed file identifies its capture.
+    An explicit audio_framed diagnostic defaults to file transport. There is no
+    automatic fallback from shared_memory to file when the live transport fails.
     """
     if backend not in ('legacy', 'libobs'):
         return {'ok': False, 'error': 'invalid_backend', 'backend': backend}
@@ -7447,7 +7487,8 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                 'hint': 'stop the existing recorder before starting another one'}
     if backend == 'libobs':
         return _recording_start_libobs(int(fps), int(height), int(crf), float(rollover_seconds),
-                                           float(max_segment_gb), audio_framed, audio_framed_live)
+                                           float(max_segment_gb), audio_framed, audio_framed_live,
+                                           audio_framed_transport)
     # Selecting the old video backend cannot change a running SDL driver. An
     # old raw file is not evidence that this a3capture session produces disk PCM.
     try:
@@ -7782,6 +7823,8 @@ def recording_status() -> dict:
             'matches_current_run': bool(bound) and bound.get('run_id') == current.get('run_id')
             and bound.get('branch_id') == current.get('branch_id'),
             'native_health': native_health,
+            'audio_framed_transport': (_RUNTIME.recorder.get('config') or
+                                       record.get('config') or {}).get('audio_framed_transport'),
             'last_health': _RUNTIME.recorder.get('last_health'),
             'restart_count': int(_RUNTIME.recorder.get('restart_count') or record.get('restart_count') or 0),
             'last_restart': _RUNTIME.recorder.get('last_restart') or record.get('last_restart'),

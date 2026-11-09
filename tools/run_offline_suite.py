@@ -80,6 +80,8 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_native_media_contract.py",
     "test_native_promotion.py",
     "test_sdl_deployment.py",
+    "test_sdl_source_lock.py",
+    "test_shared_audio_delivery.py",
     "test_native_live_harness.py",
     "test_obs_wmi_apartment.py",
     "test_obs_process_ownership.py",
@@ -89,6 +91,7 @@ OFFLINE_SUITES: tuple[str, ...] = (
 # the real client and must be selected explicitly in an isolated directory.
 LIVE_SUITES: tuple[str, ...] = (
     "test_native_audio_delivery.py",
+    "test_native_live_continuity.py",
     "test_native_recording_e2e.py",
     "test_native_default_lifecycle.py",
     "test_n1_live_restore.py",

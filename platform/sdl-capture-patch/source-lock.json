@@ -3,14 +3,14 @@
   "runtime_sha256": "76ec39741feed5bb949a8126735ec3aec7737b8de6dfc4f6333b9f0eba3dc10c",
   "runtime_version": "2.32.10.0",
   "schema_version": 1,
-  "backend_status": "framed_capture",
+  "backend_status": "framed_capture_with_shared_live",
   "note": "Private SDL2.dll must be built from pinned source and staged locally; do not replace Conan/system DLL.",
   "source_url": "https://github.com/libsdl-org/SDL/releases/tag/release-2.32.10",
   "backend_name": "a3capture",
   "source_tag": "release-2.32.10",
   "protocol": "a3-audio/1",
   "runtime_dll": "vendor/vcmi-src/build/bin/SDL2.dll",
-  "patch_sha256": "7fca4a181b30a52e7d71a5c518cafbad3e023f1bea245ac96afba8a6c4c23397",
+  "patch_sha256": "fa2e7a7b47db3dd4c579aa3f535e0fa97be5874ff807ecc6973884953f946515",
   "source_lock_verified": true,
   "historical_checkpoint": {
     "private_dll_sha256": "6a52d5637b302a2e31b5af977e836fb5a955ca3bacbfbaaf49e5d178382b4785",
@@ -22,5 +22,21 @@
     "graceful_stop": "PASS: test marker -> LAST, drain, final counters (GRACEFUL_STOP_PASS)"
   },
   "patch_hash_normalization": "UTF-8 text, CRLF normalized to LF, LF---A3PATCH---LF separator",
-  "artifact_manifest": "stage/build.json"
+  "artifact_manifest": "stage/build.json",
+  "live_transport": "a3-audio-live/1",
+  "patch_inputs": [
+    "platform/sdl-capture-patch/apply.py",
+    "platform/sdl-capture-patch/src/a3capture/SDL_a3capture.c",
+    "platform/sdl-capture-patch/tests/a3capture_smoke.c",
+    "platform/sdl-capture-patch/tests/validate_framed.py",
+    "platform/sdl-capture-patch/tests/test_pipe.py",
+    "platform/sdl-capture-patch/tests/test_stop.py",
+    "platform/audio-protocol/python/a3_framed.py",
+    "platform/obs-recorder/src/audio/audio_clock_c.c",
+    "platform/obs-recorder/src/audio/audio_clock_c.h",
+    "platform/audio-protocol/include/a3_audio_wire.h",
+    "platform/audio-protocol/include/a3_audio_protocol_c.h",
+    "platform/audio-protocol/src/a3_audio_protocol_c.c",
+    "platform/audio-protocol/include/a3_audio_live.h"
+  ]
 }

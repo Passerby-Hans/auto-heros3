@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "note": "B0.1 guard: MCP tool surface the LLM client depends on. A refactor batch must keep the tool name set and every input schema identical; adding or changing a tool is an explicit interface change that requires updating this baseline deliberately. B0.7: explore_toward gained operation_id/time_budget_s and explore_cancel was added (operation contract); all other tools unchanged. 2026-11-09 deliberate reconciliation of already committed interfaces: game_resign (a43974c), game_pause/game_blocked (94d82da), recording_start audio_framed/audio_framed_live (71a5573). All other input schemas retained unchanged; exact tool/schema assertions remain enabled.",
+ "note": "B0.1 guard: MCP tool surface the LLM client depends on. A refactor batch must keep the tool name set and every input schema identical; adding or changing a tool is an explicit interface change that requires updating this baseline deliberately. B0.7: explore_toward gained operation_id/time_budget_s and explore_cancel was added (operation contract); all other tools unchanged. 2026-11-09 deliberate reconciliation of already committed interfaces: game_resign (a43974c), game_pause/game_blocked (94d82da), recording_start audio_framed/audio_framed_live (71a5573). All other input schemas retained unchanged; exact tool/schema assertions remain enabled. 2026-11-09: recording_start adds audio_framed_transport for explicit diagnostics; session a3capture requires shared_memory and never falls back to file.",
  "source": "tools/mcp_server_v2.py @ master 2f71e63 (2026-10-31, mcp SDK 2.3.0); additive interface sources a43974c / 94d82da / 71a5573, reconciled 2026-11-09",
  "tool_count": 37,
  "tools": [
@@ -744,6 +744,11 @@
       "default": false,
       "title": "Audio Framed Live",
       "type": "boolean"
+     },
+     "audio_framed_transport": {
+      "default": "",
+      "title": "Audio Framed Transport",
+      "type": "string"
      }
     },
     "type": "object",

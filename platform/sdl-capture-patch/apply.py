@@ -42,7 +42,7 @@ def main() -> int:
     for name in ("audio_clock_c.c", "audio_clock_c.h"):
         shutil.copy2(clock_dir / name, target / name)
     protocol_dir = root / "platform" / "audio-protocol"
-    for name in ("include/a3_audio_wire.h", "include/a3_audio_protocol_c.h",
+    for name in ("include/a3_audio_wire.h", "include/a3_audio_protocol_c.h", "include/a3_audio_live.h",
                  "src/a3_audio_protocol_c.c"):
         shutil.copy2(protocol_dir / name, target / Path(name).name)
     print(f"copied backend + shared C clock/wire -> {target}")

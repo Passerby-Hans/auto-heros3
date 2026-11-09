@@ -56,6 +56,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <io.h>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -265,6 +266,8 @@ struct Options {
     std::string audio_raw;            // empty => no raw audio source
     std::string audio_framed;         // A4 a3-audio/1 source (instead of raw)
     bool audio_framed_live = false;    // A4: follow a growing framed file
+    std::string audio_framed_transport = "shared_memory";
+    int audio_capture_pid = 0; // synthetic shared-memory producer; product uses window_pid
     int late_budget_ms = 500;          // packet freshness tolerance after first submit
     std::string outputs_module;          // private a3-obs-outputs.dll (test-only)
     bool audio_start_zero = false;    // default: start at EOF (live semantics)
@@ -1405,18 +1408,20 @@ bool CreateFramedAudioSource(State& s)
     s.audio_enabled = true;
     s.framed_audio_enabled = true;
     AddStep(s, "audio_framed_mode", true,
-            "a3-audio/1 framed file -> timestamped FLOAT_PLANAR async source; path='" +
+            "a3-audio/1 validated capture -> timestamped FLOAT_PLANAR async source; path='" +
                 s.opt.audio_framed + "'");
     a3::RegisterFramedAudioSource();
     AddStep(s, "register_framed_audio_source", true, "obs_register_source_s(a3_framed_audio)");
     obs_data_t* settings = obs_data_create();
     obs_data_set_string(settings, "path", s.opt.audio_framed.c_str());
     obs_data_set_bool(settings, "live", s.opt.audio_framed_live);
+    obs_data_set_string(settings, "transport", s.opt.audio_framed_live ? s.opt.audio_framed_transport.c_str() : "file");
+    obs_data_set_int(settings, "expected_producer_pid", s.opt.audio_capture_pid > 0
+        ? s.opt.audio_capture_pid : s.opt.window_pid);
     obs_data_set_int(settings, "late_budget_ns",
                      static_cast<long long>(s.opt.late_budget_ms) * 1000000LL);
-    // There is no legal attach descriptor in this first batch: live must fail
-    // explicitly rather than seek/re-stamp at an arbitrary EOF.  Static replay
-    // starts at the capture origin.
+    // Shared live attaches a bounded fresh snapshot with validated capture,
+    // sample and sequence identity. Static replay starts at the capture origin.
     obs_data_set_bool(settings, "start_at_zero", true);
     // The host owns the replay origin; the source core never samples wall time.
     obs_data_set_int(settings, "replay_origin_ns",
@@ -1455,14 +1460,15 @@ bool CreateFramedAudioSource(State& s)
     const uint64_t deadline = os_gettime_ns() + 3000000000ULL;
     while (os_gettime_ns() < deadline) {
         s.framed_audio_stats = a3::GetFramedAudioStats();
-        if (s.framed_audio_stats.opened) {
+        if (s.framed_audio_stats.opened || !s.framed_audio_stats.error_code.empty()) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    AddStep(s, "framed_audio_opened", s.framed_audio_stats.opened,
-            "path='" + s.opt.audio_framed + "' error='" + s.framed_audio_stats.error + "'");
-    if (!s.framed_audio_stats.opened) {
+    AddStep(s, "framed_audio_opened", s.framed_audio_stats.opened && s.framed_audio_stats.error_code.empty(),
+            "path='" + s.opt.audio_framed + "' error_code='" + s.framed_audio_stats.error_code +
+                "' error='" + s.framed_audio_stats.error + "'");
+    if (!s.framed_audio_stats.opened || !s.framed_audio_stats.error_code.empty()) {
         s.failure_exit_code = 9;
         return false;
     }
@@ -1843,6 +1849,7 @@ bool StopOutput(State& s)
             AddStep(s, "framed_audio_after_stop",
                     s.framed_audio_stats.validation_performed &&
                         s.framed_audio_stats.stream_integrity_ok &&
+                        (s.framed_audio_stats.transport != "shared_memory" || s.framed_audio_stats.archive_commit_ok) &&
                         s.framed_audio_stats.error_code.empty(),
                     "validated=" + std::to_string(s.framed_audio_stats.validated_packets) +
                         " submitted=" + std::to_string(s.framed_audio_stats.submitted_packets) +
@@ -2042,6 +2049,7 @@ void CollectFinalEvidence(State& s)
                     s.framed_audio_stats.packet_integrity_ok &&
                     s.framed_audio_stats.stream_integrity_ok &&
                     s.framed_audio_stats.timeline_ok &&
+                    (s.framed_audio_stats.transport != "shared_memory" || s.framed_audio_stats.archive_commit_ok) &&
                     s.framed_audio_stats.error.empty() &&
                     s.framed_audio_stats.submitted_gaps == 0,
                 "validated=" + std::to_string(s.framed_audio_stats.validated_packets) +
@@ -2068,9 +2076,24 @@ void CollectFinalEvidence(State& s)
 void WriteFramedReaderDiagnosticsJson(a3::JsonWriter& w, const a3::FramedAudioStats& st)
 {
     w.begin_object();
+    w.key("transport"); w.value_string(st.transport);
+    w.key("map_name"); w.value_string(st.map_name);
+    w.key("producer_pid"); w.value_uint(st.producer_pid);
+    w.key("producer_creation_filetime"); w.value_uint(st.producer_creation_filetime);
+    w.key("producer_fatal_code"); w.value_uint(st.producer_fatal_code);
+    w.key("archive_committed_end_sample"); w.value_uint(st.archive_committed_end_sample);
+    w.key("archive_lag_frames"); w.value_uint(st.archive_lag_frames);
+    w.key("archive_lag_max_frames"); w.value_uint(st.archive_lag_max_frames);
+    w.key("archive_drain_wait_ns"); w.value_uint(st.archive_drain_wait_ns);
+    w.key("archive_closed"); w.value_bool(st.archive_closed);
+    w.key("archive_commit_ok"); w.value_bool(st.archive_commit_ok);
+    w.key("mmcss_registered"); w.value_bool(st.mmcss_registered);
+    w.key("snapshot_retries"); w.value_uint(st.snapshot_retries);
     w.key("last_packet_sequence"); w.value_uint(st.last_packet_sequence);
     w.key("last_packet_sample"); w.value_uint(st.last_packet_sample);
     w.key("last_packet_offset"); w.value_uint(st.last_packet_offset);
+    w.key("offset_semantics"); w.value_string(st.transport == "shared_memory"
+        ? "logical_bytes_since_attachment; read_offset=identity_header_bytes_only" : "archive_file_bytes");
     w.key("last_packet_pts_ns"); w.value_uint(st.last_packet_pts_ns);
     w.key("last_packet_age_ns"); w.value_uint(st.last_packet_age_ns);
     w.key("first_submitted_age_ns"); w.value_uint(st.first_submitted_age_ns);
@@ -2901,6 +2924,7 @@ void WriteRawAudioStatsJson(JsonWriter& w, const a3::RawAudioStats& st, bool ena
 void WriteFramedAudioStatsJson(JsonWriter& w, const a3::FramedAudioStats& st)
 {
     w.begin_object();
+    w.key("transport"); w.value_string(st.transport);
     w.key("mode"); w.value_string(st.mode);
     w.key("path"); w.value_string(st.path);
     w.key("opened"); w.value_bool(st.opened);
@@ -3216,6 +3240,10 @@ std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
         w.begin_object();
         const a3::FramedAudioStats framed = a3::GetFramedAudioStats();
         w.key("enabled"); w.value_bool(s.framed_audio_enabled);
+        w.key("transport"); w.value_string(framed.transport);
+        w.key("map_name"); w.value_string(framed.map_name);
+        w.key("producer_pid"); w.value_uint(framed.producer_pid);
+        w.key("archive_committed_end_sample"); w.value_uint(framed.archive_committed_end_sample);
         w.key("opened"); w.value_bool(framed.opened);
         w.key("validated_packets"); w.value_uint(framed.validated_packets);
         w.key("submitted_packets"); w.value_uint(framed.submitted_packets);
@@ -3285,6 +3313,13 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     bool audio_framed_live = false;
     if (!GetBoolArg(req, "audio_framed_live", &audio_framed_live, &found, err))
         return ReplyError(sess, req, "invalid_args", err);
+    std::string audio_framed_transport = audio_framed_live ? "shared_memory" : "file";
+    if (!GetStringArg(req, "audio_framed_transport", &audio_framed_transport, &found, err))
+        return ReplyError(sess, req, "invalid_args", err);
+    if (audio_framed_transport != "shared_memory" && audio_framed_transport != "file")
+        return ReplyError(sess, req, "invalid_args", "audio_framed_transport must be shared_memory or file");
+    if (audio_framed_transport == "shared_memory" && (!audio_framed_live || audio_framed.empty()))
+        return ReplyError(sess, req, "invalid_args", "shared_memory requires a live framed identity file");
     if (audio_raw.empty() && audio_framed.empty())
         return ReplyError(sess, req, "invalid_args",
                           "\"audio_raw\" or \"audio_framed\" is required");
@@ -3305,6 +3340,8 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
         return ReplyError(sess, req, "invalid_args", err);
     if (pid < 0)
         return ReplyError(sess, req, "invalid_args", "\"window_pid\" must be >= 0");
+    if (audio_framed_transport == "shared_memory" && pid <= 0)
+        return ReplyError(sess, req, "invalid_args", "shared_memory requires a positive window_pid");
     long long max_time = 3;
     found = false;
     if (!GetIntArg(req, "max_time_sec", &max_time, &found, err))
@@ -3370,6 +3407,8 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     s.opt.audio_raw = audio_raw;
     s.opt.audio_framed = audio_framed;
     s.opt.audio_framed_live = audio_framed_live;
+    s.opt.audio_framed_transport = audio_framed_transport;
+    s.opt.audio_capture_pid = static_cast<int>(pid);
     s.opt.fixed_audio = !audio_framed.empty();
     s.opt.audio_start_zero = false; // live semantics: default EOF
     s.opt.window_title = title;
@@ -3402,6 +3441,7 @@ std::string ServePrepare(ServeSession& sess, State& s, const IpcRequest& req)
     return ReplyOk(sess, req, "prepared", [&](JsonWriter& w) {
         w.key("prepared");
         w.value_bool(true);
+        w.key("audio_framed_transport"); w.value_string(s.opt.audio_framed_transport);
         w.key("session_id");
         w.value_string(sess.session_id);
         w.key("out_dir");
@@ -4007,7 +4047,9 @@ void PrintUsage()
                 "  --window-pid N       window mode: restrict to a process id (optional)\n"
                 "  --audio-raw PATH      also add native raw-file audio source (s16le/44100/2)\n"
 "  --audio-framed PATH   A4: add native a3-audio/1 framed timestamped source\n"
-"  --audio-framed-live   A4: follow growing framed file instead of one-shot\n"
+"  --audio-framed-live   Consume a continuing timestamped capture\n"
+"  --audio-framed-transport shared_memory|file  Live defaults to shared_memory; replay uses file\n"
+"  --audio-capture-pid N Expected live shared-memory owner (window PID otherwise)\n"
 "  --outputs-module PATH private a3-obs-outputs.dll (test-only)\n"
                 "  --audio-start-zero    raw audio: read from byte 0 instead of EOF (tests)\n"
 "  --fixed-audio         A4: obs_reset_audio2 fixed buffering (max 1000ms)\n"
@@ -4071,6 +4113,10 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.audio_framed = next("--audio-framed");
         } else if (a == "--audio-framed-live") {
             opt.audio_framed_live = true;
+        } else if (a == "--audio-framed-transport") {
+            opt.audio_framed_transport = next("--audio-framed-transport");
+        } else if (a == "--audio-capture-pid") {
+            opt.audio_capture_pid = std::atoi(next("--audio-capture-pid").c_str());
         } else if (a == "--late-budget-ms") {
             opt.late_budget_ms = std::atoi(next("--late-budget-ms").c_str());
         } else if (a == "--outputs-module") {
@@ -4189,6 +4235,13 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
         exit_code = 2;
         return false;
     }
+    if ((opt.audio_framed_transport != "shared_memory" && opt.audio_framed_transport != "file") ||
+        (opt.audio_framed_live && opt.audio_framed_transport == "shared_memory" &&
+         opt.audio_capture_pid <= 0 && opt.window_pid <= 0)) {
+        std::fprintf(stderr, "shared_memory live audio needs a positive capture/window PID; invalid transport rejected\n");
+        exit_code = 2;
+        return false;
+    }
     if (opt.duration_ms < 1000 || opt.duration_ms > 600000) {
         std::fprintf(stderr, "--duration-ms out of range\n");
         exit_code = 2;
@@ -4226,6 +4279,12 @@ int main(int argc, char** argv)
     if (!state.opt.log_file.empty()) {
         if (!std::freopen(state.opt.log_file.c_str(), "w", stdout)) {
             std::fprintf(stderr, "cannot open --log file: %s\n", state.opt.log_file.c_str());
+            return 2;
+        }
+        // libobs LOG_ERROR uses stderr. WMI has no inherited console/redirection.
+        if (_dup2(_fileno(stdout), _fileno(stderr)) != 0) {
+            std::fprintf(stdout, "cannot redirect stderr to --log\n");
+            std::fflush(stdout);
             return 2;
         }
     }

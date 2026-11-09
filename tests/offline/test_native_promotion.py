@@ -203,6 +203,11 @@ def test_audio_route():
         check('session binding wins over current constructor and stale raw',
               result['audio_framed'] == framed and result['audio_raw'] is None
               and result['audio_framed_live'] is True)
+        check('product a3capture explicitly selects shared memory transport',
+              result['audio_framed_transport'] == 'shared_memory')
+        rejected('product session cannot fall back to archive file transport',
+                 lambda: M._select_native_audio_source(audio_framed_transport='file', identity=identity),
+                 'native_audio_transport_mismatch')
         agent.session = None
         check('MCP restart reloads persisted audio session', route()['audio_framed'] == framed)
         agent._load_session = lambda: None
@@ -225,12 +230,29 @@ def test_audio_route():
         session.audio_driver_explicit = True
         session.audio_capture_file = str(stale)
         check('explicit session disk compatibility uses its recorded raw file', route()['audio_raw'] == stale)
+        check('disk compatibility remains raw with no shared memory transport',
+              route()['audio_framed'] is None and route()['audio_framed_transport'] == 'file')
+        rejected('disk session cannot become a shared memory capture',
+                 lambda: M._select_native_audio_source(audio_framed_transport='shared_memory', identity=identity),
+                 'native_audio_transport_mismatch')
         session.session_id = 'old'
         rejected('session identity mismatch rejects stale stream', route, 'native_audio_session_mismatch')
         with patch.object(M, '_agent', side_effect=AssertionError('explicit diagnostic should not use agent')):
             selected = M._select_native_audio_source(str(framed), False)
             check('explicit replay remains deliberate and does not become live',
-                  selected['audio_route'] == 'explicit_framed' and not selected['audio_framed_live'])
+                  selected['audio_route'] == 'explicit_framed' and not selected['audio_framed_live']
+                  and selected['audio_framed_transport'] == 'file')
+            check('explicit live file diagnostic does not implicitly switch transport',
+                  M._select_native_audio_source(str(framed), True)['audio_framed_transport'] == 'file')
+            check('explicit live shared memory diagnostic is a conscious override',
+                  M._select_native_audio_source(str(framed), True, 'shared_memory')['audio_framed_transport']
+                  == 'shared_memory')
+            rejected('shared memory cannot be selected for replay',
+                     lambda: M._select_native_audio_source(str(framed), False, 'shared_memory'),
+                     'audio_framed_transport_invalid')
+            rejected('unknown transport does not silently select file',
+                     lambda: M._select_native_audio_source(str(framed), True, 'unknown'),
+                     'audio_framed_transport_invalid')
         session.session_id, session.audio_driver = 'current', 'a3capture'
         session.audio_capture_file = str(framed)
         ready.unlink()
@@ -272,9 +294,112 @@ def test_launch_preflight():
         check('failed preflight creates no run artifacts', not out.exists())
 
 
+def test_transport_prepare_protocol_and_signatures():
+    import inspect
+    from auto_heros3.recording.obs_backend import ObsRecorder, ObsBackendError
+    client = ObsRecorder(Path('fake.exe'), 'test-pipe', Path('obs'), Path('log'),
+                         outputs_module=Path('private.dll'))
+    check('existing recorder positional construction remains compatible',
+          client.pipe_name == 'test-pipe' and client.outputs_module == Path('private.dll'))
+    check('transport is an additive keyword with file compatibility default',
+          inspect.signature(ObsRecorder.prepare).parameters['audio_framed_transport'].default == 'file'
+          and inspect.signature(M.recording_start).parameters['audio_framed_transport'].default == '')
+    with patch.object(client, 'request', return_value={'ok': True}) as request:
+        client.prepare(Path('out'), window_pid=123, audio_framed=Path('identity.a3a'),
+                       audio_framed_live=True, audio_framed_transport='shared_memory')
+        args = request.call_args.kwargs
+        check('prepare sends explicit shared transport and expected producer window PID',
+              args['audio_framed_transport'] == 'shared_memory' and args['window_pid'] == 123
+              and args['audio_framed'] == 'identity.a3a' and args['audio_framed_live'] is True
+              and 'audio_raw' not in args)
+        client.prepare(Path('out'), audio_framed=Path('replay.a3a'))
+        check('framed replay explicitly keeps file transport',
+              request.call_args.kwargs['audio_framed_transport'] == 'file'
+              and request.call_args.kwargs['audio_framed_live'] is False)
+        client.prepare(Path('out'), audio_raw=Path('legacy.raw'))
+        check('raw compatibility payload is unchanged',
+              request.call_args.kwargs['audio_raw'] == 'legacy.raw'
+              and 'audio_framed_transport' not in request.call_args.kwargs)
+        base = dict(window_pid=123, audio_framed=Path('identity.a3a'),
+                    audio_framed_live=True, audio_framed_transport='shared_memory')
+        for description, override in (
+                ('replay', {'audio_framed_live': False}),
+                ('missing producer PID', {'window_pid': None}),
+                ('missing identity', {'audio_framed': None}),
+                ('raw collision', {'audio_raw': Path('stale.raw')}),
+                ('unknown transport', {'audio_framed_transport': 'unknown'})):
+            count = request.call_count
+            try:
+                client.prepare(Path('out'), **(base | override))
+            except ObsBackendError as exc:
+                check(f'prepare rejects {description} before IPC',
+                      exc.code == 'audio_framed_transport_invalid' and request.call_count == count)
+            else:
+                raise AssertionError(description)
+
+
+def test_shared_transport_requires_native_confirmation():
+    from auto_heros3.recording import native_artifacts, obs_backend
+    with tempfile.TemporaryDirectory() as temp:
+        fixture = Fixture(Path(temp))
+        verified = fixture.load()
+        for mode in ('missing_echo', 'file_echo', 'map_missing', 'shared_memory'):
+            hosts = []
+
+            class Host:
+                def __init__(self, exe, **kwargs):
+                    self.starts, self.closed, self.prepare_args = 0, False, None
+                    hosts.append(self)
+
+                def connect(self):
+                    return {'ok': True}
+
+                def prepare(self, out, **kwargs):
+                    self.prepare_args = kwargs
+                    if mode == 'map_missing':
+                        return {'ok': False, 'error': 'shared_memory_map_missing'}
+                    return {'ok': True} | ({} if mode == 'missing_echo' else {
+                        'audio_framed_transport': 'file' if mode == 'file_echo' else 'shared_memory'})
+
+                def start_recording(self):
+                    self.starts += 1
+                    return {'ok': True}
+
+                def close(self, force=False):
+                    self.closed = True
+
+            out = fixture.root / mode
+            out.mkdir()
+            caught = None
+            with patch.object(native_artifacts, 'load_native_artifacts', return_value=verified), \
+                    patch.object(M, '_obs_recorder_exe', return_value=fixture.exe), \
+                    patch.object(obs_backend, 'ObsRecorder', Host):
+                try:
+                    M._libobs_start_client(out, client_pid=123, audio_raw=None,
+                        audio_framed=out / 'identity.a3a', audio_framed_live=True,
+                        audio_framed_transport='shared_memory', max_time_sec=900)
+                except (NativeArtifactsError, RuntimeError) as exc:
+                    caught = exc
+            host = hosts[0]
+            check(f'{mode} shared transport is sent exactly once with producer identity',
+                  len(hosts) == 1 and host.prepare_args['audio_framed_transport'] == 'shared_memory'
+                  and host.prepare_args['window_pid'] == 123 and host.prepare_args['audio_raw'] is None)
+            if mode == 'shared_memory':
+                check('confirmed shared transport alone may start media', caught is None and host.starts == 1)
+            else:
+                check(f'{mode} cannot fall back to file or start media',
+                      caught is not None and host.closed and host.starts == 0)
+                if mode != 'map_missing':
+                    check(f'{mode} old native protocol is explicitly rejected',
+                          isinstance(caught, NativeArtifactsError)
+                          and caught.code == 'native_audio_transport_unconfirmed')
+
+
 if __name__ == '__main__':
     with patch('subprocess.Popen', side_effect=AssertionError('offline tests cannot start processes')):
         test_artifacts()
         test_audio_route()
         test_launch_preflight()
+        test_transport_prepare_protocol_and_signatures()
+        test_shared_transport_requires_native_confirmation()
     print(f'{CHECKS}/{CHECKS} checks passed')

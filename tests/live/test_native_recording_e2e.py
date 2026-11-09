@@ -144,6 +144,41 @@ def endpoint_comparison(before: dict, after: dict, owned_pids: set[int]) -> dict
             "audible_office_continuity_proven": False}
 
 
+def observation_requires_abort(comparison: dict, observe_endpoint_changes: bool = False) -> bool:
+    """Observation mode never permits game/recorder physical audio sessions."""
+    return bool(comparison.get("owned_physical_sessions") or
+                (not observe_endpoint_changes and comparison.get("ok") is not True))
+
+
+def final_verdict(evidence: dict) -> dict:
+    """Separate media acceptance from environment observations without hiding either."""
+    comparisons = [row.get("comparison", {}) for row in evidence.get("endpoint_samples", [])]
+    after = evidence.get("endpoint_after_comparison", {})
+    endpoint_ok = bool(comparisons and all(row.get("ok") is True for row in comparisons) and
+                       after.get("ok") is True)
+    physical_seen = any(row.get("owned_physical_sessions") for row in comparisons + [after])
+    stops = evidence.get("recording_stop") or []
+    formal_stop_ok = bool(stops and all(row.get("ok") is True and
+        row.get("checks_ok") is True and row.get("native_checks_ok") is True for row in stops))
+    if evidence.get("double_stop"):
+        formal_stop_ok = formal_stop_ok and len(stops) == 2 and stops[0] == stops[1]
+    media_ok = bool(evidence.get("run_session_completed") is True and formal_stop_ok and
+        evidence.get("tail_verifier", {}).get("v2_ok") is True and
+        evidence.get("artifact_hashes_unchanged") is True and
+        evidence.get("settings_restored_by_product") is True and
+        evidence.get("settings_bytes_restored") is True and
+        evidence.get("runtime_sdl_bytes_restored") is True and
+        evidence.get("session_stop", {}).get("ok") is True and
+        evidence.get("owned_game_left_alive") is False and
+        evidence.get("owned_recorder_left_alive") is False and
+        evidence.get("remaining_vcmi_processes") == [] and not physical_seen and
+        not any(evidence.get(key) for key in ("error", "finalization_error",
+            "cleanup_recording_error", "cleanup_session_error", "forced_cleanup_errors", "forced_cleanup")))
+    ok = media_ok and endpoint_ok
+    return {"media_checks_ok": media_ok, "endpoint_checks_ok": endpoint_ok, "ok": ok,
+            "exit_code": 0 if ok else 2 if media_ok else 1}
+
+
 def isolated_env(out: Path) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("AUTO_HEROS3_", "A3_", "A3CAPTURE_", "SDL_AUDIO"))}
@@ -222,7 +257,7 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
         evidence.setdefault("endpoint_samples", []).append({"label": label, "snapshot": snapshot,
                                                             "comparison": comparison})
         write_json(out / "endpoint-samples.json", evidence["endpoint_samples"])
-        if not comparison["ok"]:
+        if observation_requires_abort(comparison, args.observe_endpoint_changes):
             raise RuntimeError("endpoint/session observation failed; no endpoint restore attempted")
 
     params = StdioServerParameters(command=sys.executable, args=["-X", "utf8", str(SERVER)],
@@ -446,6 +481,8 @@ def main() -> int:
     parser.add_argument("--double-stop", action="store_true")
     parser.add_argument("--kill-native-once", action="store_true",
                         help="terminate only the verified owned native PID halfway through; require watchdog recovery")
+    parser.add_argument("--observe-endpoint-changes", action="store_true",
+                        help="record environment changes without aborting media checks; owned physical audio still aborts")
     parser.add_argument("--save", type=Path, help="existing .vsgm1 copied into isolated saves")
     args = parser.parse_args()
     if not args.execute:
@@ -459,9 +496,11 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=False)
     evidence = {"requested_seconds": args.seconds, "double_stop": args.double_stop,
                 "kill_native_once": args.kill_native_once,
+                 "observe_endpoint_changes": args.observe_endpoint_changes,
                 "default_backend_changed": False, "physical_playback_requested": False,
                 "scope": "real game transport/structure; no game pulse or audible office continuity proof",
-                "started_at": time.time(), "ok": False}
+                 "started_at": time.time(), "run_session_completed": False,
+                 "media_checks_ok": False, "endpoint_checks_ok": False, "ok": False}
     settings_before = SETTINGS.read_bytes() if SETTINGS.exists() else None
     if settings_before is not None:
         (out / "settings-before.bin").write_bytes(settings_before)
@@ -479,7 +518,7 @@ def main() -> int:
         write_json(out / "endpoint-before.json", baseline)
         write_json(out / "result.json", evidence)
         asyncio.run(run_session(args, out, evidence, baseline))
-        evidence["ok"] = True
+        evidence["run_session_completed"] = True
     except BaseException as exc:
         evidence["error"] = f"{type(exc).__name__}: {exc}"
         evidence["traceback"] = traceback.format_exc()
@@ -518,24 +557,17 @@ def main() -> int:
                 write_json(out / "endpoint-after.json", after)
                 pids = {evidence[key]["pid"] for key in ("owned_game", "owned_recorder") if key in evidence}
                 evidence["endpoint_after_comparison"] = endpoint_comparison(baseline, after, pids)
-            evidence["ok"] = bool(evidence["ok"] and evidence["artifact_hashes_unchanged"] and
-                                  evidence["settings_restored_by_product"] and
-                                  evidence.get("endpoint_after_comparison", {}).get("ok") and
-                                  evidence.get("runtime_sdl_bytes_restored") and
-                                  evidence.get("session_stop", {}).get("ok") is True and
-                                  not evidence.get("cleanup_recording_error") and
-                                  not evidence.get("cleanup_session_error") and
-                                  not evidence.get("forced_cleanup_errors") and
-                                  not evidence.get("forced_cleanup") and not remaining)
         except BaseException as exc:
             evidence["finalization_error"] = f"{type(exc).__name__}: {exc}"
-            evidence["ok"] = False
+        evidence.update(final_verdict(evidence))
         evidence["finished_at"] = time.time()
         write_json(out / "result.json", evidence)
-    print(json.dumps({"ok": evidence["ok"], "evidence": str(out / "result.json"),
+    print(json.dumps({"ok": evidence["ok"], "media_checks_ok": evidence["media_checks_ok"],
+                      "endpoint_checks_ok": evidence["endpoint_checks_ok"],
+                      "exit_code": evidence["exit_code"], "evidence": str(out / "result.json"),
                       "error": evidence.get("error"), "finalization_error": evidence.get("finalization_error")},
                      ensure_ascii=False))
-    return 0 if evidence["ok"] else 1
+    return evidence["exit_code"]
 
 
 if __name__ == "__main__":

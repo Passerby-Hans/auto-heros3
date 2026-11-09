@@ -25,6 +25,10 @@ _spec = importlib.util.spec_from_file_location(
     "delivery_harness", ROOT / "tests/live/test_native_audio_delivery.py")
 delivery = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(delivery)
+_spec = importlib.util.spec_from_file_location(
+    "recording_e2e_harness", ROOT / "tests/live/test_native_recording_e2e.py")
+e2e = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(e2e)
 
 RESULTS = []
 
@@ -305,6 +309,44 @@ def main():
             "write_latency_max_us=1\na3capture latency: phase=closed "
             "write_latency_max_us=1000001 measurements=10 clock_errors=0\n") ==
             {"write_latency_max_us": 1000001, "measurements": 10, "clock_errors": 0})
+
+        endpoint_good = {"ok": True, "owned_physical_sessions": []}
+        endpoint_changed = {"ok": False, "owned_physical_sessions": [],
+                            "endpoint_controls_unchanged": False}
+        physical = {"ok": False, "owned_physical_sessions": [{"pid": 123}]}
+        check("e2e_default_strict_keeps_endpoint_abort", e2e.observation_requires_abort(endpoint_changed))
+        check("e2e_observe_environment_change_continues", not e2e.observation_requires_abort(endpoint_changed, True))
+        check("e2e_observe_physical_session_still_aborts", e2e.observation_requires_abort(physical, True))
+        full = {"run_session_completed": True, "artifact_hashes_unchanged": True,
+                "settings_restored_by_product": True, "settings_bytes_restored": True,
+                "runtime_sdl_bytes_restored": True, "session_stop": {"ok": True},
+                "owned_game_left_alive": False, "owned_recorder_left_alive": False,
+                "remaining_vcmi_processes": [], "tail_verifier": {"v2_ok": True},
+                "recording_stop": [{"ok": True, "checks_ok": True, "native_checks_ok": True}],
+                "endpoint_samples": [{"comparison": endpoint_good}],
+                "endpoint_after_comparison": endpoint_good}
+        check("e2e_all_checks_pass_exit0", e2e.final_verdict(full) == {
+            "ok": True, "media_checks_ok": True, "endpoint_checks_ok": True, "exit_code": 0})
+        transient = copy.deepcopy(full)
+        transient["endpoint_samples"].insert(0, {"comparison": endpoint_changed})
+        check("e2e_transient_environment_not_hidden_by_restoration", e2e.final_verdict(transient) == {
+            "ok": False, "media_checks_ok": True, "endpoint_checks_ok": False, "exit_code": 2})
+        changed_after = copy.deepcopy(full)
+        changed_after["endpoint_after_comparison"] = endpoint_changed
+        check("e2e_media_only_pass_exit2", e2e.final_verdict(changed_after)["exit_code"] == 2)
+        unsafe = copy.deepcopy(full)
+        unsafe["endpoint_samples"].append({"comparison": physical})
+        check("e2e_physical_audio_cannot_be_media_pass", e2e.final_verdict(unsafe)["exit_code"] == 1 and
+              not e2e.final_verdict(unsafe)["media_checks_ok"])
+        aborted = copy.deepcopy(full)
+        aborted["run_session_completed"] = False
+        aborted["cleanup_recording_stop"] = aborted.pop("recording_stop")[0]
+        check("e2e_cleanup_stop_cannot_replace_formal_stop", e2e.final_verdict(aborted)["exit_code"] == 1)
+        for field in ("artifact_hashes_unchanged", "settings_restored_by_product",
+                      "settings_bytes_restored", "runtime_sdl_bytes_restored"):
+            failed = copy.deepcopy(full)
+            failed[field] = False
+            check("e2e_reject_" + field, not e2e.final_verdict(failed)["media_checks_ok"])
 
         # Mock decoder/probe results. The subprocess function never launches a
         # process: it writes tiny deterministic fixture arrays in the temp dir.

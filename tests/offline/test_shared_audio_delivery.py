@@ -63,5 +63,5 @@ class SharedAudioDeliveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(SharedAudioDeliveryTests))
-    print(f"{'ALL_PASS' if result.wasSuccessful() else 'FAIL'} checks={result.testsRun} failures={len(result.failures) + len(result.errors)}")
+    print(f"{result.testsRun - len(result.failures) - len(result.errors)}/{result.testsRun} checks passed")
     raise SystemExit(0 if result.wasSuccessful() else 1)

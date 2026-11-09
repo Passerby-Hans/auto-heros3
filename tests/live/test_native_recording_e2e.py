@@ -521,7 +521,7 @@ async def run_session(args, out: Path, evidence: dict, baseline: dict) -> None:
                     if evidence["staged_sdl_during"] != evidence["artifacts_before"]["private_sdl"]["sha256"]:
                         raise RuntimeError("VCMI staged SDL does not match private artifact")
                     observe("session_started")
-                    for recording_index in range(2 if args.two_recordings else 1):
+                    for recording_index in range(args.recordings):
                         recording_attempted = True
                         stopped = False
                         arguments = recording_arguments(args)
@@ -727,6 +727,8 @@ def main() -> int:
                         help="explicit test threshold; omitted in default-path acceptance")
     parser.add_argument("--max-segment-gb", type=float, help="explicit size test cap, e.g. 0.02")
     parser.add_argument("--two-recordings", action="store_true", help="two recordings in the same game session")
+    parser.add_argument("--recordings", type=int, default=1,
+                        help="bounded repeated start/stop diagnostic, 1..30 recordings in one game")
     parser.add_argument("--control-requests", action="store_true",
                         help="accept explicit controller requests via out/control-requests.jsonl")
     parser.add_argument("--display-index", default="2",
@@ -744,6 +746,10 @@ def main() -> int:
         parser.error("LIVE test requires --execute; no game or recorder started")
     if not 1 <= args.seconds <= 3600:
         parser.error("--seconds must be between 1 and 3600")
+    if args.two_recordings:
+        args.recordings = 2
+    if not 1 <= args.recordings <= 30:
+        parser.error("--recordings must be 1..30")
     if args.rollover_seconds is not None and not 0 < args.rollover_seconds <= 3600:
         parser.error("--rollover-seconds must be positive and at most 3600")
     if args.max_segment_gb is not None and not 0 < args.max_segment_gb <= 1.5:
@@ -758,7 +764,7 @@ def main() -> int:
         parser.error("out must be a fresh directory below the repository var directory")
     out.mkdir(parents=True, exist_ok=False)
     evidence = {"requested_seconds": args.seconds, "double_stop": args.double_stop,
-                "requested_recordings": 2 if args.two_recordings else 1,
+                "requested_recordings": args.recordings,
                 "default_path": args.default_path, "control_requests": args.control_requests,
                 "display_index_argument": args.display_index,
                 "required_rollover_reason": args.require_rollover_reason,

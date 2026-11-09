@@ -14,7 +14,25 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+
+def _controller_process_identity() -> tuple[int, int]:
+    """Exact Win32 creation FILETIME; floats cannot carry this identity losslessly."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+    if not kernel32.GetProcessTimes(kernel32.GetCurrentProcess(), ctypes.byref(created),
+                                   ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    value = (created.dwHighDateTime << 32) | created.dwLowDateTime
+    if value <= 0:
+        raise RuntimeError('controller creation FILETIME unavailable')
+    return os.getpid(), value
 
 
 def _process_in_job(pid: int) -> bool:
@@ -46,7 +64,8 @@ class ObsBackendError(RuntimeError):
 class ObsRecorder:
     def __init__(self, exe: Path, pipe_name: str | None = None,
                  obs_dir: Path | None = None, log_path: Path | None = None,
-                 *, outputs_module: Path | None = None):
+                 *, outputs_module: Path | None = None,
+                 on_spawn: Callable[['ObsRecorder'], None] | None = None):
         self.exe = Path(exe)
         self.outputs_module = Path(outputs_module) if outputs_module else None
         self.pipe_name = pipe_name or f'auto-heros3-obs-{os.getpid()}-{uuid.uuid4().hex[:8]}'
@@ -54,6 +73,7 @@ class ObsRecorder:
         self.log_path = Path(log_path) if log_path else None
         self.proc: subprocess.Popen | None = None
         self.native_pid: int | None = None
+        self.native_identity: dict[str, Any] | None = None
         self.wmi_launched = False
         self._wmi_wrapper_pid: int | None = None
         self._handle = None
@@ -64,6 +84,11 @@ class ObsRecorder:
         self._lock = threading.Lock()
         self._request_lock = threading.Lock()
         self.last_error: str | None = None
+        self._on_spawn = on_spawn
+
+    def _notify_spawn(self) -> None:
+        if self._on_spawn is not None:
+            self._on_spawn(self)
 
     @property
     def pipe_path(self) -> str:
@@ -75,41 +100,100 @@ class ObsRecorder:
 
     def alive(self) -> bool:
         if self.proc is not None:
-            return self.proc.poll() is None
+            try:
+                return self.proc.poll() is None
+            except Exception:
+                return True  # unconfirmed exit must retain the admission owner
         if self.native_pid:
             try:
                 import psutil
-                return psutil.pid_exists(int(self.native_pid))
-            except Exception:
+            except ImportError:
+                return True
+            try:
+                process = psutil.Process(int(self.native_pid))
+                if self.native_identity is not None and not self._matches_native_identity(process):
+                    return False  # PID reused: the recorded process has exited
+                return process.is_running()
+            except psutil.NoSuchProcess:
                 return False
+            except Exception:
+                return True
         return False
 
+    def _matches_native_identity(self, process) -> bool:
+        import psutil
+        identity = self.native_identity
+        try:
+            return bool(identity and int(process.pid) == identity['pid'] and
+                        process.create_time() == identity['create_time'] and
+                        Path(process.exe()).resolve() == Path(identity['exe']))
+        except psutil.NoSuchProcess:
+            return False
+
+    def _remember_native_identity(self, pid: int) -> None:
+        import psutil
+        process = psutil.Process(pid)
+        exe = Path(process.exe()).resolve()
+        created = process.create_time()
+        if exe != self.exe.resolve() or created <= 0:
+            raise ObsBackendError('WMI recorder process identity mismatch', code='native_owner_mismatch')
+        self.native_identity = {'pid': pid, 'create_time': created, 'exe': str(exe)}
+
     def _spawn_wmi(self, cmd: list[str]) -> None:
-        """Launch outside the controller's kill-on-close job via WMI."""
+        """Launch outside the controller's job, initializing COM on this worker."""
+        import pythoncom
         import win32com.client
         log_path = self.log_path or Path(os.environ.get('TEMP', '.')) / f'{self.pipe_name}.log'
         wmi_cmd = list(cmd) + ['--log', str(log_path)]
         command_line = subprocess.list2cmdline(wmi_cmd)
-        loc = win32com.client.Dispatch('WbemScripting.SWbemLocator')
-        svc = loc.ConnectServer('.', r'root\cimv2')
-        obj = svc.Get('Win32_Process')
-        params = obj.Methods_('Create').InParameters.SpawnInstance_()
-        params.CommandLine = command_line
-        out = svc.ExecMethod('Win32_Process', 'Create', params)
-        if int(out.ReturnValue) != 0:
-            raise ObsBackendError(f'WMI Win32_Process.Create failed rc={out.ReturnValue}')
-        self.proc = None
-        self.wmi_launched = True
-        self._wmi_wrapper_pid = int(out.ProcessId)
-        self.native_pid = int(out.ProcessId)
+        # MCP and watchdog calls may run on different pool threads. Importing
+        # win32com initializes only its importing thread, not each later caller.
+        # CoInitializeEx also distinguishes an already-initialized MTA: WMI can
+        # use that apartment, but we must not uninitialize the caller's COM ref.
+        com_owned = False
+        try:
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+            com_owned = True
+        except pythoncom.com_error as exc:
+            if (exc.hresult & 0xffffffff) != 0x80010106:  # RPC_E_CHANGED_MODE
+                raise
+        loc = svc = obj = params = out = None
+        try:
+            loc = win32com.client.Dispatch('WbemScripting.SWbemLocator')
+            svc = loc.ConnectServer('.', r'root\cimv2')
+            obj = svc.Get('Win32_Process')
+            params = obj.Methods_('Create').InParameters.SpawnInstance_()
+            params.CommandLine = command_line
+            out = svc.ExecMethod('Win32_Process', 'Create', params)
+            if int(out.ReturnValue) != 0:
+                raise ObsBackendError(f'WMI Win32_Process.Create failed rc={out.ReturnValue}')
+            native_pid = int(out.ProcessId)
+            if native_pid <= 0:
+                raise ObsBackendError('WMI returned no recorder PID', code='native_owner_missing')
+            # Publish ownership before further fallible identity/COM cleanup.
+            # A failed connect must leave the parent able to retain this owner.
+            self.proc = None
+            self.wmi_launched = True
+            self._wmi_wrapper_pid = native_pid
+            self.native_pid = native_pid
+            self._notify_spawn()
+            self._remember_native_identity(native_pid)
+            self._notify_spawn()
+        finally:
+            # Release apartment-bound dispatch objects before balancing COM.
+            out = params = obj = svc = loc = None
+            if com_owned:
+                pythoncom.CoUninitialize()
 
     def connect(self, timeout: float = 20.0) -> dict:
         """Launch the native server and connect to its named pipe."""
         if self.proc is not None or self.native_pid is not None:
             raise ObsBackendError('recorder already started')
+        owner_pid, owner_created = _controller_process_identity()
         log = self.log_path.open('w', encoding='utf-8') if self.log_path else subprocess.DEVNULL
         cmd = [str(self.exe), '--serve', '--pipe', self.pipe_name,
-               '--obs-dir', str(self.obs_dir)]
+               '--obs-dir', str(self.obs_dir), '--owner-pid', str(owner_pid),
+               '--owner-created-filetime', str(owner_created)]
         if self.outputs_module:
             cmd += ['--outputs-module', str(self.outputs_module)]
         base_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -125,14 +209,12 @@ class ObsRecorder:
         except OSError:
             self.proc = subprocess.Popen(
                 cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=base_flags)
+        self._notify_spawn()
         if self.proc is not None and (_process_in_job(self.proc.pid) or
                                       os.environ.get('AUTO_HEROS3_OBS_FORCE_WMI') == '1'):
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=5)
-            except Exception:
-                pass
-            self.proc = None
+            # Never lose a still-running first child or launch a second native
+            # process when breaking out of the inherited job failed.
+            self._close_process(force=True)
             self._spawn_wmi(cmd)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -152,10 +234,10 @@ class ObsRecorder:
             self.close(force=True)
             raise ObsBackendError('timed out connecting to native recorder IPC')
         hello = self.request('hello', timeout=10.0)
-        try:
-            self.native_pid = int(hello.get('pid') or self.native_pid or 0) or self.native_pid
-        except Exception:
-            pass
+        reported_pid = int(hello.get('pid') or self.pid or 0)
+        if self.pid and reported_pid != self.pid:
+            raise ObsBackendError('native hello PID differs from launched owner', code='native_owner_mismatch')
+        self.native_pid = reported_pid or self.native_pid
         return hello
 
     def _abort_ipc(self, reason: str) -> None:
@@ -281,8 +363,79 @@ class ObsRecorder:
         except ObsBackendError:
             return {}
 
+    def _close_process(self, force: bool) -> None:
+        """Clear an owner only after exit; retain it on uncertain cleanup."""
+        if self.proc is not None:
+            process = self.proc  # Popen's Windows handle is bound to this child.
+            if process.poll() is None:
+                if not force:
+                    try:
+                        process.wait(timeout=15)
+                    except Exception:
+                        pass
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=3)
+                    except Exception:
+                        pass
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=3)
+                    except Exception:
+                        pass
+            if process.poll() is None:
+                raise ObsBackendError(f'native cleanup could not confirm exit pid={process.pid}',
+                                      code='native_cleanup_unconfirmed')
+        elif self.native_pid:
+            import psutil
+            try:
+                process = psutil.Process(int(self.native_pid))
+            except psutil.NoSuchProcess:
+                process = None
+            if process is not None:
+                if self.native_identity is None:
+                    raise ObsBackendError(f'native cleanup has no verified identity pid={self.native_pid}',
+                                          code='native_cleanup_unconfirmed')
+                if self._matches_native_identity(process):
+                    if not force:
+                        try:
+                            process.wait(timeout=15)
+                        except psutil.TimeoutExpired:
+                            pass
+                    for operation in ('terminate', 'kill'):
+                        if not self.alive():
+                            break
+                        # Recheck PID/create-time/executable immediately before
+                        # each mutation. Access failures preserve the owner.
+                        if not self._matches_native_identity(process):
+                            break
+                        try:
+                            getattr(process, operation)()
+                            process.wait(timeout=3)
+                        except psutil.NoSuchProcess:
+                            break
+                        except (psutil.AccessDenied, psutil.TimeoutExpired):
+                            pass
+                    if self.alive():
+                        raise ObsBackendError(f'native cleanup could not confirm exit pid={self.native_pid}',
+                                              code='native_cleanup_unconfirmed')
+                # An identity mismatch proves that the *old* owner exited.
+                # Do not signal the unrelated replacement process.
+        self.proc = None
+        self.native_pid = None
+        self.native_identity = None
+        self._wmi_wrapper_pid = None
+
     def close(self, force: bool = False) -> None:
-        """Close IPC/process; force cleanup never waits on an already-dead request channel."""
+        """Close IPC; cleanup failure retains process ownership for retry."""
         if self._handle is not None and not force:
             try:
                 self.shutdown()
@@ -296,39 +449,13 @@ class ObsRecorder:
                 pass
             self._handle = None
         self._stop_reader = True
-        if self.proc is not None:
-            if force:
-                try:
-                    self.proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    self.proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
-            else:
-                try:
-                    self.proc.wait(timeout=15)
-                except Exception:
-                    try:
-                        self.proc.terminate()
-                    except Exception:
-                        pass
-            self.proc = None
-        elif self.native_pid:
-            deadline = time.time() + (3 if force else 15)
-            while time.time() < deadline and self.alive():
-                time.sleep(0.1)
-            if self.alive():
-                try:
-                    import psutil
-                    psutil.Process(int(self.native_pid)).terminate()
-                except Exception:
-                    pass
-        self.native_pid = None
+        try:
+            self._close_process(force)
+        except ObsBackendError:
+            raise
+        except Exception as exc:
+            raise ObsBackendError(f'native cleanup could not confirm exit pid={self.pid}: {exc}',
+                                  code='native_cleanup_unconfirmed') from exc
 
     @property
     def events(self) -> list[dict]:

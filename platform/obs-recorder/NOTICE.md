@@ -73,13 +73,23 @@ source. They are not part of the source delivery and are excluded by
 
 ## Default policy
 
-The native path is experimental. The repository default is **legacy/disk**;
-the documented manual fallback from a failed native attempt is:
+The local default is **libobs/a3capture**. It requires the three-component clean
+checkpoint in `bin/native-checkpoint.json`, its immutable provenance records,
+and matching pinned OBS runtime/plugin DLLs. Startup verifies these bytes
+before opening a game or recording; this does not assert that arbitrary
+rebuilt binaries have passed media acceptance. The accepted build identities
+and limitations are recorded separately in the local validation report.
+
+Manual fallback, including when the native module is missing:
 
 ```text
 AUTO_HEROS3_AUDIO_DRIVER=disk
+# Stop and restart the game session with this environment.
 recording_start(backend='legacy')
 ```
 
-Default switching and artifact distribution still require the Codex review
-and the remaining P2 items.
+The canonical original SDL is hash-checked independently of the native module.
+A successful native install may remain beside VCMI; explicit disk startup
+restores the canonical DLL using the managed deployment record. Unknown DLLs
+are not overwritten. No automatic mid-run fallback or public distribution
+bundle is implied by selecting this local default.

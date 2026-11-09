@@ -110,6 +110,14 @@ set_target_properties(split-policy-tests PROPERTIES
   OUTPUT_NAME "split-policy-tests"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# First IPC connection ownership; no libobs, media, or Windows process mutation.
+add_executable(owner-policy-tests tests/ipc_owner_policy_tests.cpp)
+target_compile_features(owner-policy-tests PRIVATE cxx_std_17)
+target_compile_options(owner-policy-tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+set_target_properties(owner-policy-tests PROPERTIES
+  OUTPUT_NAME "owner-policy-tests"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # ---------------------------------------------------------------------------
 # S1b: libobs media self-test executable (obs-media-selftest.exe)
 #

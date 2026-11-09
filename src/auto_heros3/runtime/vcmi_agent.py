@@ -1020,6 +1020,18 @@ class VcmiAgent:
                 if time.time() - t0 > timeout:
                     raise BridgeError('commands.lock busy: another writer is submitting')
                 time.sleep(0.05)
+            except PermissionError as exc:
+                # Windows can report a delete-pending/shared lock name as
+                # EACCES instead of EEXIST. Retry only that contention surface;
+                # do not unlink an owner we could not inspect or append bytes.
+                import errno
+                winerror = getattr(exc, 'winerror', None)
+                if os.name != 'nt' or not (winerror in (5, 32, 33) or
+                        (winerror is None and exc.errno == errno.EACCES)):
+                    raise
+                if time.time() - t0 > timeout:
+                    raise BridgeError('commands.lock busy or inaccessible: writer lock not acquired') from exc
+                time.sleep(0.05)
 
     def submit(self, line: str) -> int:
         """Append one command and return its 1-based sequence number (bridge uses line index)."""

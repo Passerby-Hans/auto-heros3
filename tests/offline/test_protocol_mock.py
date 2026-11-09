@@ -192,6 +192,38 @@ def test_stop(tmp: Path) -> None:
     check('T4b session file removed', not agent.session_path.exists())
 
 
+def test_windows_submit_lock_contention(tmp: Path) -> None:
+    import errno
+    from unittest.mock import patch
+    agent = make_agent(tmp)
+    original_open = os.open
+    attempts = []
+
+    def access_denied_once(path, flags, *args):
+        if Path(path).name == 'commands.lock':
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise PermissionError(errno.EACCES, 'injected Windows delete-pending lock')
+        return original_open(path, flags, *args)
+
+    with patch('os.open', side_effect=access_denied_once):
+        seq = agent.submit('ping recovered-lock')
+    check('T6b transient Windows lock access denial retries before submit',
+          seq == 1 and len(attempts) == 2 and (tmp / 'commands.txt').read_text().splitlines() == ['ping recovered-lock'])
+    owner = tmp / 'commands.lock'
+    owner.write_bytes(b'unknown owner must not be deleted')
+    before = (tmp / 'commands.txt').read_bytes()
+    with patch('os.open', side_effect=PermissionError(errno.EACCES, 'injected persistent denial')):
+        try:
+            agent._acquire_submit_lock(timeout=0)
+        except vcmi_agent.BridgeError as exc:
+            check('T6c persistent lock denial is bounded and does not delete or write',
+                  'busy or inaccessible' in str(exc) and owner.read_bytes() == b'unknown owner must not be deleted'
+                  and (tmp / 'commands.txt').read_bytes() == before)
+        else:
+            check('T6c persistent lock denial is bounded and does not delete or write', False)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -216,6 +248,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         test_stop(td)
+    if os.name == 'nt':
+        with tempfile.TemporaryDirectory() as td:
+            test_windows_submit_lock_contention(Path(td))
     failed = [r for r in RESULTS if not r[1]]
     print(f'\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed')
     return 1 if failed else 0

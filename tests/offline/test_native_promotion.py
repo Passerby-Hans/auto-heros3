@@ -189,7 +189,8 @@ def test_audio_route():
         ready = Path(str(framed) + '.ready')
         identity = {'client_pid': 123, 'session_id': 'current'}
         session = SimpleNamespace(**identity, audio_driver='a3capture', audio_driver_explicit=False,
-                                  audio_capture_file=str(framed), audio_sdl_sha256='c' * 64)
+                                  audio_capture_file=str(framed), audio_sdl_sha256='c' * 64,
+                                  alive=lambda: True)
         agent = SimpleNamespace(session=session, audio_driver='disk', a3capture_file=stale,
                                 _load_session=lambda: session)
         env.agent(agent)
@@ -207,6 +208,12 @@ def test_audio_route():
         agent._load_session = lambda: None
         rejected('unknown restored session fails closed', route, 'native_audio_session_missing')
         agent.session = session
+        with patch.object(session, 'alive', return_value=False):
+            rejected('dead or recycled client cannot supply native session audio', route,
+                     'native_audio_session_dead')
+        with patch.object(session, 'alive', side_effect=RuntimeError('identity check unavailable')):
+            rejected('client identity check exception cannot select stale raw', route,
+                     'native_audio_session_unavailable')
         with patch.object(M, '_agent', side_effect=RuntimeError('broken lease')):
             rejected('agent exception cannot select stale raw', route, 'native_audio_session_unavailable')
         session.audio_driver = 'wasapi'

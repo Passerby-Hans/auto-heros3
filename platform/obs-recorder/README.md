@@ -37,6 +37,14 @@ in-process named-pipe server.
   see the S3a section below).
 - The OBS GUI (`obs64.exe`) is never started by any tool in this directory.
 
+The current media host's `--serve` mode requires `--owner-pid` and
+`--owner-created-filetime` (the exact Win32 process creation FILETIME).
+The production `ObsRecorder` adapter supplies both automatically. The host pins
+and verifies that controller's process handle, accepts only its pipe connection,
+and exits if the owner dies or no first connection arrives within 30 seconds.
+Historical hand-written media-host `--serve` commands below must include these
+identity arguments; the separate S0 `obs-recorder` probe is unchanged.
+
 ## Verified capability summary (actual observations)
 
 | Item | Observed |

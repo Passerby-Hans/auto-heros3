@@ -255,18 +255,20 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
    冒险法术 `game_act(action="cast_spell", args={"hero": 0, "spell": <id>})`。
 9. 卡住时探索：`explore_toward(hero=0, x=…, y=…, z=…, map_w=36, map_h=36)` 沿黑幕边界逐格开雾；
    遇到战斗或未应答 query 会直接返回对应状态。
-10. 需要录像：`recording_start(height=1080, fps=60)` … `recording_stop()`（需要 PATH 中有 `ffmpeg`）。
-    `height` 默认 1080；游戏窗在屏上时默认用 WGC 捕获客户端区域，完全离屏时自动回退 PrintWindow。
-    实测是“基本60 capture”（约54–56 callback/s，CFR60 容器含显式重复槽），不是稳定 60 个不同游戏画面；
-    `recording_stop()`/`meta.json` 会披露 `capture_backend`、`source_duplicates`、WGC 错误，不能把容器头当源60。
-    音频默认走 **SDL disk → named pipe relay**：VCMI 启动时把游戏音乐/音效写入管道，relay 落到
-    `game-audio.raw`，不经过物理输出端点；recorder 从 `recording_start` 的字节偏移开始读取并 mux 成 AAC。
-    其他办公音频不被静音。若用户游戏音量是 0，启动时会临时提升到 30/40 并在 stop 时逐字节恢复；
-    成品有音轨时 `audio_muxed=true`，失败会保留 video-only 并披露 `audio_error`。legacy
-    `--audio-source loopback` 会 mute 默认端点，不适合边录边办公。
+10. 需要录像：`recording_start()` … `recording_stop()`。默认使用链接 **libobs** 的自有原生进程，
+    不启动 OBS 界面。当前支持 1920×1080、CFR60、H.264（8Mbps CBR）和 AAC 44.1kHz 双声道；
+    游戏窗口以 WGC 捕获，右侧显示思考/操作。容器 60fps 不代表 60 个不同游戏画面，沿用 basic-60 合同。
+    默认每 900 秒或接近 1.5GB 分段；在闭 GOP 关键帧切换，实际切点和 TIME/SIZE 原因进入原生证据。
+    1.5GB 指十进制最终 MP4 上限；触发预留 2%，封口后仍逐段校验，超限标 partial，不能当成功。
+    音频默认为私有 **SDL a3capture → 带 QPC/样本索引/CRC 的文件 → native source → AAC**，
+    不打开物理播放端点，不修改 Windows 音量或静音。若游戏音量为 0，session 临时提升到 30/40，
+    session_stop 逐字节恢复设置。音频源绑定当前 session，缺 ready、错误 DLL 或旧会话身份会明确拒绝。
+    首次使用需安装/构建本机验证的 native checkpoint，见 `platform/obs-recorder/NOTICE.md`。
+    手动回退：设置 `AUTO_HEROS3_AUDIO_DRIVER=disk`，结束并重新启动 session，再调用
+    `recording_start(backend='legacy')`（legacy 需要 `ffmpeg`）。不在同一次录制中自动切换后端。
 11. 结束：`session_stop()`（只关闭本会话拥有的客户端）。
 
-> 游戏由 MCP server 自动以**屏幕外**窗口（虚拟桌面之外，如 -1600,0）、**静音**方式启动，不抢你的鼠标和焦点。
+> 游戏由 MCP server 自动以**屏幕外**窗口（虚拟桌面之外，如 -1600,0）、**仅向采集文件输出游戏声音**的方式启动，不抢你的鼠标和焦点。
 > 想用命令行调试也可以：
 > `python -X utf8 tools\vcmi_act.py start --map Maps/Arrogance`，随后 `state` / `do "end_turn"` / `shot` / `stop`。
 
@@ -645,21 +647,23 @@ In your MCP client:
    observation/recording); adventure spells: `game_act(action="cast_spell", args={"hero": 0, "spell": <id>})`.
 9. When stuck: `explore_toward(hero=0, x=…, y=…, z=…, map_w=36, map_h=36)` walks the shroud border and
    reveals it tile by tile; an active battle or an unanswered query is reported as its own status.
-10. Recording: `recording_start(height=1080, fps=60)` … `recording_stop()` (requires `ffmpeg` on `PATH`).
-    `height` defaults to 1080. An on-screen/VDD game window is captured through WGC and cropped to the
-    client area; a fully off-screen legacy window falls back to PrintWindow. The measured contract is
-    "basic-60 capture" (~54–56 callbacks/s, CFR60 output with explicit duplicate slots), not 60 distinct
-    game frames. `recording_stop()`/`meta.json` disclose `capture_backend`, `source_duplicates`, and WGC
-    errors; a 60 fps container header alone is never evidence of source 60 fps.
-    Audio defaults to the **SDL disk → named-pipe relay**: VCMI writes game music/SFX to a pipe,
-    a relay writes `game-audio.raw`, and no physical output endpoint is used; the recorder reads from
-    the `recording_start` byte offset and muxes AAC. Office/other app audio is not muted. Zero in-game
-    music/sound is temporarily raised to 30/40 for the session and restored byte-for-byte on stop. A
-    real track is reported as `audio_muxed=true`; failure stays video-only with `audio_error`. Legacy
-    `--audio-source loopback` mutes the default endpoint and is not suitable while using office audio.
+10. Recording: `recording_start()` … `recording_stop()`. The default is our own native process linked
+    to **libobs**, with no OBS UI. The supported profile is 1920×1080 CFR60, H.264 at 8Mbps CBR,
+    and stereo AAC at 44.1kHz. WGC captures the game with a reasoning/action panel alongside it.
+    The existing basic-60 capture contract applies; a 60fps container does not prove 60 distinct frames.
+    Rollover defaults to 900 seconds or approaching 1.5GB at closed-GOP keyframes; native evidence records
+    the presentation boundary and TIME/SIZE reason. The decimal final-MP4 cap has a 2% trigger reserve;
+    finalized files are checked and any excess is partial, never successful.
+    Private **SDL a3capture → QPC/sample-index/CRC framed file → native source → AAC** captures audio
+    without opening physical playback endpoints or changing Windows mute/volume. Zero game volume is
+    temporarily raised to 30/40 and settings are restored byte-for-byte on session_stop. Audio selection
+    follows the current session; missing readiness, mismatched DLLs and old session identity fail closed.
+    Native use requires the locally verified checkpoint described in `platform/obs-recorder/NOTICE.md`.
+    Manual fallback: set `AUTO_HEROS3_AUDIO_DRIVER=disk`, stop and restart the game session, then call
+    `recording_start(backend='legacy')` (requires `ffmpeg`). A run never silently changes backends.
 11. Finish with `session_stop()` (only closes the client owned by this session).
 
-> The MCP server starts the game **off-screen** (outside the virtual desktop, e.g. -1600,0) and **muted**, so
+> The MCP server starts the game **off-screen** (outside the virtual desktop, e.g. -1600,0) with **recording-only game audio**, so
 > it never steals your mouse or focus. For command-line debugging you can also use:
 > `python -X utf8 tools\vcmi_act.py start --map Maps/Arrogance`, then `state` / `do "end_turn"` / `shot` / `stop`.
 

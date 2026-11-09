@@ -1,7 +1,9 @@
 """Native stop ownership/retry regression; fake IPC/media, temporary files only."""
 from __future__ import annotations
+import json
 
 import sys
+import json
 import threading
 from contextlib import ExitStack
 from pathlib import Path
@@ -129,6 +131,9 @@ class NativeEnv:
     def start(self):
         result = M.recording_start(backend='libobs', audio_framed=str(self.framed))
         assert result['ok'], result
+        persisted = json.loads(M._recording_state_path().read_text(encoding='utf-8'))
+        assert persisted['config'] == M._RUNTIME.recorder['config']
+        assert persisted['config']['audio_route'] == 'explicit_framed'
         return M._RUNTIME.recorder, self.clients[-1]
 
     def __exit__(self, *args):
@@ -152,6 +157,21 @@ def join(thread):
 
 
 def main():
+    with NativeEnv() as env:
+        rec, client = env.start()
+        rec['config']['max_segment_gb'] = 8 / 1_000_000_000
+        out = client.out
+        result = M.recording_stop()
+        manifest = json.loads((out / 's4b/manifest.json').read_text(encoding='utf-8'))
+        errors = result.get('validation_errors', [])
+        check('oversized segment cannot become validated complete',
+              not result['ok'] and result['native_checks_ok']
+              and result['files'][0]['state'] == 'partial'
+              and manifest['segments'][0]['state'] == 'partial'
+              and manifest['state'] == 'partial')
+        check('oversized segment discloses actual bytes and configured cap',
+              any(error.get('error') == 'size_cap_exceeded' and error.get('cap_bytes') == 8
+                  and error.get('bytes') == (out / 'clip-000.mp4').stat().st_size for error in errors))
     # Two genuine contenders call teardown once and receive the same terminal result.
     with NativeEnv() as env:
         rec, client = env.start()

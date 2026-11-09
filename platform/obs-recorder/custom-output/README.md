@@ -1,6 +1,6 @@
 # Private a3 obs-outputs module
 
-Test/experimental output module derived from OBS Studio 32.1.0 `plugins/obs-outputs`.
+Private output module derived from OBS Studio 32.1.0 `plugins/obs-outputs`.
 
 Local changes:
 
@@ -13,7 +13,19 @@ Local changes:
 - `tkhd` and `elst` presentation durations use a single sample-domain calculation.
 
 The module is **not** intended as a default OBS installation module; it is an
-experimental artifact for the auto-heros3 native recording path.
+private artifact for the auto-heros3 native recording path.
+
+## Rollover contract
+
+Time triggers use the primary video presentation PTS. Encoder reorder DTS
+must not extend the first segment by another GOP. Only closed-GOP keyframes
+can split the current H.264 profile. TIME/SIZE/MANUAL reason, global PTS bounds
+and actual closed-file bytes are recorded in the output events.
+
+Size triggers count encoded payload, not final MP4 overhead. MCP reserves 2%
+below the requested final cap and validates every finalized MP4; an exceeded
+cap is partial/failure. This is not a hard limit on all temporary disk writes
+for arbitrary encoders, GOP lengths or untested caps.
 
 ## Stop and presentation contract
 

@@ -35,6 +35,7 @@
 #include <windows.h>
 
 #include <tlhelp32.h>
+#include <intrin.h>
 
 // obs.h must come before obs-source.h: obs.h includes obs-source.h itself and
 // the latter is not self-sufficient under `#pragma once` if entered first.
@@ -62,6 +63,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -70,6 +72,8 @@
 #include "raw_audio_source.hpp"
 #include "framed_audio_source.hpp"
 #include "panel_source.hpp"
+#include "ipc_owner_policy.hpp"
+#include "host-stop-policy.h"
 
 namespace fs = std::filesystem;
 
@@ -269,10 +273,13 @@ struct Options {
     bool video_pulse = false;          // A4: white/black video pulse source
     int av_origin_delay_ms = 0;        // test-only common future fence
     bool allow_single_segment = false;  // A/V measurement: no rollover expected
+    bool test_stop_timeout = false;     // explicit CLI fault injection only
 
     // S3a: persistent named-pipe IPC server (libobs stays initialized)
     bool serve = false;
     std::string pipe_name;
+    DWORD owner_pid = 0;
+    uint64_t owner_created_filetime = 0;
 };
 
 struct Step {
@@ -354,6 +361,8 @@ struct State {
     bool output_started = false;
     bool output_active_seen = false;
     bool output_stopped = false;
+    bool output_shutdown_unconfirmed = false;
+    bool output_quarantine_armed = false;
     int output_stop_code = -1;
     bool stop_signal_seen = false;
 
@@ -794,6 +803,31 @@ bool AllStepsOk(const State& s)
 // ---------------------------------------------------------------------------
 // obs lifecycle / pipeline
 // ---------------------------------------------------------------------------
+[[noreturn]] void TerminateUnconfirmedHost()
+{
+    TerminateProcess(GetCurrentProcess(), 5);
+    __fastfail(FAST_FAIL_FATAL_APP_EXIT); // no DLL detach if termination unexpectedly returns
+}
+
+DWORD WINAPI OutputQuarantineExitThread(LPVOID)
+{
+    // No shared State, stdio, libobs locks, or destructors on this path. This
+    // also bounds a stalled synchronous IPC write after evidence was saved.
+    Sleep(A3_HOST_QUARANTINE_BUDGET_MS);
+    TerminateUnconfirmedHost();
+}
+
+void ArmOutputQuarantineExit(State& s)
+{
+    if (!s.output_shutdown_unconfirmed || s.output_quarantine_armed)
+        return;
+    s.output_quarantine_armed = true;
+    HANDLE thread = CreateThread(nullptr, 0, OutputQuarantineExitThread, nullptr, 0, nullptr);
+    if (!thread)
+        TerminateUnconfirmedHost(); // a missing exit guard must not leave an orphan
+    CloseHandle(thread);
+}
+
 void Cleanup(State& s)
 {
     auto trace = [](const char* what) {
@@ -801,6 +835,14 @@ void Cleanup(State& s)
         std::fflush(stdout);
     };
     trace("begin");
+    if (s.output_shutdown_unconfirmed) {
+        // The failed report/IPC reply is already published. libobs may still
+        // own encoder locks; output_release/obs_shutdown and DLL detach can
+        // wait indefinitely. Terminate only this quarantined host, never the
+        // game/controller. The OS closes handles; no file is promoted to good.
+        trace("skipped_libobs_teardown: output_deactivation_timeout; self_exit=5");
+        TerminateUnconfirmedHost();
+    }
 
     // Safety net for error paths: make sure the synthetic media producer and
     // the raw-audio reader are stopped before any libobs object is released.
@@ -1711,6 +1753,8 @@ static bool QueryOutputDrainState(obs_output_t *output, OutputDrainState& state)
 
 bool StopOutput(State& s)
 {
+    if (s.output_shutdown_unconfirmed)
+        return false;
     if (!s.output) {
         AddStep(s, "output_stop_request", false, "no output object");
         return false;
@@ -1724,20 +1768,36 @@ bool StopOutput(State& s)
     obs_output_stop(s.output);
     AddStep(s, "output_stop_request", true, "obs_output_stop(): wait for closed-GOP/audio fence");
 
-    const uint64_t stop_deadline = os_gettime_ns() + 10000000000ULL;
-    while (os_gettime_ns() < stop_deadline) {
-        if (!obs_output_active(s.output)) {
+    const uint64_t wait_start = os_gettime_ns();
+    a3_host_stop_result result = A3_HOST_STOP_WAITING;
+    while (result == A3_HOST_STOP_WAITING) {
+        const uint64_t elapsed = os_gettime_ns() - wait_start;
+        // Once the budget has expired, do not re-enter libobs, even to query.
+        const bool active = elapsed >= A3_HOST_STOP_BUDGET_NS || obs_output_active(s.output);
+        result = a3_host_stop_observe(result, elapsed, active, s.opt.test_stop_timeout);
+        if (result == A3_HOST_STOP_INACTIVE) {
             s.output_stopped = true;
             s.t_output_inactive_ns = os_gettime_ns();
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (result == A3_HOST_STOP_WAITING)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (!s.output_stopped) {
-        s.output_last_error = CurrentOutputLastError(s.output);
-        AddStep(s, "output_stopped", false, "timeout waiting for output to stop");
-        obs_output_force_stop(s.output);
-        QueryOutputDrainState(s.output, s.output_drain);
+        s.output_shutdown_unconfirmed = true;
+        s.failure_exit_code = 5;
+        s.output_last_error = "output_deactivation_timeout";
+        s.stop_signal_seen = g_stop_signal_seen.load();
+        s.output_stop_code = g_stop_code.load();
+        AddStep(s, "output_stopped", false,
+                "output_deactivation_timeout after 10000 ms; no force-stop retry; "
+                "libobs teardown forbidden; cached evidence only; host exit=5");
+        // end_data_capture may have started and even completed concurrently.
+        // force_stop resets stopping_event before the private output's already
+        // inactive stop callback returns; that can erase the completion event.
+        // Neither force_stop nor a potentially blocking proc call is safe here.
+        s.framed_audio_stats = s.framed_audio_at_stop_request;
+        s.files = ListMp4Files(s.opt.out_dir);
         return false;
     }
     AddStep(s, "output_stopped", true,
@@ -1861,6 +1921,11 @@ bool RunOutput(State& s)
 
 void CollectFinalEvidence(State& s)
 {
+    if (s.output_shutdown_unconfirmed) {
+        AddStep(s, "final_evidence_unavailable", false,
+                "output deactivation unconfirmed; source/output queries skipped after timeout");
+        return;
+    }
     s.process_modules = EnumProcessModuleNames();
 
     const char* name = nullptr;
@@ -2040,6 +2105,43 @@ void WriteTailJson(a3::JsonWriter& w, const State& s)
     w.end_object();
 }
 
+bool WriteFailureEvidenceAtomic(const std::string& path, const std::string& text)
+{
+    const std::wstring destination = Utf8ToWide(path);
+    const std::wstring temporary = destination + L".failed-" +
+        std::to_wstring(GetCurrentProcessId()) + L".tmp";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    DWORD written = 0;
+    bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) &&
+              written == text.size() && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (ok)
+        ok = MoveFileExW(temporary.c_str(), destination.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (!ok)
+        DeleteFileW(temporary.c_str());
+    return ok;
+}
+
+void WriteOutputShutdownJson(a3::JsonWriter& w, const State& s)
+{
+    w.begin_object();
+    w.key("unconfirmed"); w.value_bool(s.output_shutdown_unconfirmed);
+    w.key("timeout_stage");
+    w.value_string(s.output_shutdown_unconfirmed ? "waiting_for_output_inactive" : "");
+    w.key("budget_ms"); w.value_int(A3_HOST_STOP_BUDGET_NS / 1000000ULL);
+    w.key("quarantine_exit_budget_ms"); w.value_int(A3_HOST_QUARANTINE_BUDGET_MS);
+    w.key("test_injected"); w.value_bool(s.opt.test_stop_timeout);
+    w.key("cleanup_policy");
+    w.value_string(s.output_shutdown_unconfirmed ? "terminate_host_without_libobs_teardown" : "normal");
+    w.key("post_timeout_evidence");
+    w.value_string(s.output_shutdown_unconfirmed ? "cached_at_stop_request; no final libobs queries" : "final");
+    w.end_object();
+}
+
 void WriteReport(State& s, int exit_code)
 {
     a3::JsonWriter w(true, 2);
@@ -2057,6 +2159,8 @@ void WriteReport(State& s, int exit_code)
     w.value_string(exit_code == 0 ? "pass" : "fail");
     w.key("exit_code");
     w.value_int(exit_code);
+    w.key("output_shutdown");
+    WriteOutputShutdownJson(w, s);
     w.key("timestamp_utc");
     w.value_string(UtcNowIso());
 
@@ -2204,8 +2308,12 @@ void WriteReport(State& s, int exit_code)
     w.key("output_events");
     w.begin_array();
     {
-        std::lock_guard<std::mutex> lock(g_events_mutex);
-        for (const auto& ev : g_events) {
+        std::unique_lock<std::mutex> lock(g_events_mutex, std::defer_lock);
+        if (s.output_shutdown_unconfirmed)
+            lock.try_lock();
+        else
+            lock.lock();
+        if (lock.owns_lock()) for (const auto& ev : g_events) {
             w.begin_object();
             w.key("name");
             w.value_string(ev.name);
@@ -2300,7 +2408,8 @@ void WriteReport(State& s, int exit_code)
     w.key("source_settings_json");
     w.value_string(s.audio_applied_settings_json);
     w.key("output_flags");
-    w.value_int(s.audio_source ? static_cast<long long>(obs_source_get_output_flags(s.audio_source)) : 0);
+    w.value_int(s.audio_source && !s.output_shutdown_unconfirmed
+        ? static_cast<long long>(obs_source_get_output_flags(s.audio_source)) : 0);
     w.key("source_monitoring_type");
     w.value_int(s.audio_source_monitoring_type);
     w.key("monitoring_type_none_value");
@@ -2308,7 +2417,8 @@ void WriteReport(State& s, int exit_code)
     w.key("source_volume");
     w.value_double(s.audio_source_volume, 3);
     w.key("audio_mixers");
-    w.value_int(s.audio_source ? static_cast<long long>(obs_source_get_audio_mixers(s.audio_source)) : 0);
+    w.value_int(s.audio_source && !s.output_shutdown_unconfirmed
+        ? static_cast<long long>(obs_source_get_audio_mixers(s.audio_source)) : 0);
     w.key("opened");
     w.value_bool(s.audio_stats.opened);
     w.key("open_error");
@@ -2398,7 +2508,8 @@ void WriteReport(State& s, int exit_code)
     w.key("source_pushed");
     w.begin_object();
     {
-        const a3::AvSourceStats stats = a3::GetAvSourceStats();
+        const a3::AvSourceStats stats = s.output_shutdown_unconfirmed
+            ? a3::AvSourceStats{} : a3::GetAvSourceStats();
         w.key("video_frames");
         w.value_uint(stats.video_frames_pushed);
         w.key("audio_chunks");
@@ -2457,7 +2568,13 @@ void WriteReport(State& s, int exit_code)
     std::string json = w.str();
     std::string path = s.opt.json_out.empty() ? JoinPath(s.opt.out_dir, "selftest.json") : s.opt.json_out;
     FILE* f = nullptr;
-    if (fopen_s(&f, path.c_str(), "wb") == 0 && f) {
+    if (s.output_shutdown_unconfirmed) {
+        WriteFailureEvidenceAtomic(path, json + "\n");
+        if (!s.serve_mode)
+            ArmOutputQuarantineExit(s);
+        // A blocked stdio sink must not prevent manifest save / quarantine.
+        return;
+    } else if (fopen_s(&f, path.c_str(), "wb") == 0 && f) {
         std::fwrite(json.data(), 1, json.size(), f);
         std::fclose(f);
     }
@@ -2809,6 +2926,8 @@ void WriteManifest(State& s, ServeSession& sess)
     w.value_string(sess.checks_ok ? "pass" : "fail");
     w.key("report_exit_code");
     w.value_int(sess.report_rc);
+    w.key("output_shutdown");
+    WriteOutputShutdownJson(w, s);
     w.key("started_utc");
     w.value_string(sess.started_utc);
     w.key("stopped_utc");
@@ -2879,7 +2998,10 @@ void WriteManifest(State& s, ServeSession& sess)
     w.end_object();
     sess.manifest_path = JoinPath(s.opt.out_dir, "manifest.json");
     FILE* f = nullptr;
-    if (fopen_s(&f, sess.manifest_path.c_str(), "wb") == 0 && f) {
+    if (s.output_shutdown_unconfirmed) {
+        WriteFailureEvidenceAtomic(sess.manifest_path, w.str() + "\n");
+        ArmOutputQuarantineExit(s);
+    } else if (fopen_s(&f, sess.manifest_path.c_str(), "wb") == 0 && f) {
         std::string text = w.str() + "\n";
         std::fwrite(text.data(), 1, text.size(), f);
         std::fclose(f);
@@ -2899,12 +3021,13 @@ bool ServeFinishRecording(ServeSession& sess, State& s, bool auto_stop, std::str
     const bool stop_ok = StopOutput(s);
     s.files = ListMp4Files(s.opt.out_dir);
     CollectFinalEvidence(s);
-    sess.checks_ok = AllStepsOk(s);
+    sess.checks_ok = stop_ok && AllStepsOk(s);
     sess.report_rc = stop_ok ? (sess.checks_ok ? 0 : 6) : 5;
     WriteReport(s, sess.report_rc);
     sess.selftest_path = JoinPath(s.opt.out_dir, "selftest.json");
     WriteManifest(s, sess);
-    sess.phase = ServePhase::Stopped;
+    sess.phase = s.output_shutdown_unconfirmed ? ServePhase::Failed : ServePhase::Stopped;
+    ArmOutputQuarantineExit(s);
     if (!stop_ok) {
         error = "output stop/drain failed; see selftest.json";
         sess.last_error_code = "output_stop_failed";
@@ -2968,12 +3091,18 @@ std::string ServeHello(ServeSession& sess, State& s, const IpcRequest& req)
 
 std::string ServeStatus(ServeSession& sess, State& s, const IpcRequest& req)
 {
+    if (s.output_shutdown_unconfirmed)
+        return ReplyError(sess, req, "output_stop_failed",
+                          "output_deactivation_timeout; active state unconfirmed; shutdown required; see selftest.json");
     // If the output died without an explicit stop, finalise now (explicit error).
     if (sess.phase == ServePhase::Recording && s.output && !obs_output_active(s.output)) {
         std::string err = "output became inactive without a stop request";
         sess.last_error_code = "output_stopped_unexpectedly";
         sess.last_error_message = err;
         ServeFinishRecording(sess, s, false, err);
+        if (s.output_shutdown_unconfirmed)
+            return ReplyError(sess, req, "output_stop_failed",
+                              "output_deactivation_timeout; terminal quarantine; see selftest.json");
     }
     if (!s.opt.out_dir.empty() && fs::is_directory(Utf8ToWide(s.opt.out_dir))) {
         s.files = ListMp4Files(s.opt.out_dir);
@@ -3343,6 +3472,9 @@ std::string ServeStart(ServeSession& sess, State& s, const IpcRequest& req)
 
 std::string ServeStop(ServeSession& sess, State& s, const IpcRequest& req)
 {
+    if (s.output_shutdown_unconfirmed)
+        return ReplyError(sess, req, "output_stop_failed",
+                          "output_deactivation_timeout is terminal; shutdown required; see selftest.json");
     if (sess.phase == ServePhase::Recording) {
         std::string error;
         const bool stop_ok = ServeFinishRecording(sess, s, false, error);
@@ -3420,11 +3552,17 @@ std::string ServeShutdown(ServeSession& sess, State& s, const IpcRequest& req)
         sess.stopped_utc = UtcNowIso();
         WriteManifest(s, sess);
     }
-    sess.last_error_code.clear();
-    sess.last_error_message.clear();
+    if (!s.output_shutdown_unconfirmed) {
+        sess.last_error_code.clear();
+        sess.last_error_message.clear();
+    }
     std::string line = ReplyOk(sess, req, "shutdown", [&](JsonWriter& w) {
         w.key("shutting_down");
         w.value_bool(true);
+        w.key("forced_process_exit");
+        w.value_bool(s.output_shutdown_unconfirmed);
+        w.key("process_exit_code");
+        w.value_int(s.output_shutdown_unconfirmed ? 5 : 0);
         w.key("session_id");
         w.value_string(sess.session_id);
         w.key("report_exit_code");
@@ -3461,6 +3599,11 @@ IpcReply HandleIpcLine(ServeSession& sess, State& s, const std::string& line)
     std::printf("IPC_REQ seq=%d cmd=%s request_id=%s\n", sess.requests, req.cmd.c_str(),
                 id_text.c_str());
     std::fflush(stdout);
+    if (s.output_shutdown_unconfirmed && req.cmd != "shutdown") {
+        reply.line = ReplyError(sess, req, "output_stop_failed",
+                               "output_deactivation_timeout is terminal; shutdown required; host exits within 5s");
+        return reply;
+    }
     if (req.cmd == "hello" || req.cmd == "capabilities") {
         reply.line = ServeHello(sess, s, req);
     } else if (req.cmd == "prepare") {
@@ -3493,19 +3636,6 @@ bool PipeWrite(HANDLE pipe, const std::string& text)
            written == payload.size();
 }
 
-bool ClientProcessAlive(DWORD pid)
-{
-    if (pid == 0)
-        return true;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h)
-        return false;
-    DWORD code = 0;
-    const bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
-    CloseHandle(h);
-    return alive;
-}
-
 std::string NormalizePipeName(const std::string& requested)
 {
     std::string name = requested;
@@ -3528,6 +3658,20 @@ std::string NormalizePipeName(const std::string& requested)
 
 int RunServeMode(State& s, const std::string& requested_pipe)
 {
+    // WMI children outlive the MCP job. Pin its process object before accepting
+    // any client, including when MCP dies between CreateProcess and publication.
+    struct OwnerHandle {
+        HANDLE value = nullptr;
+        ~OwnerHandle() { if (value) CloseHandle(value); }
+    } owner;
+    owner.value = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, s.opt.owner_pid);
+    FILETIME created {}, exited {}, kernel {}, user {};
+    if (!owner.value || !GetProcessTimes(owner.value, &created, &exited, &kernel, &user) ||
+        ((static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime) !=
+            s.opt.owner_created_filetime || WaitForSingleObject(owner.value, 0) != WAIT_TIMEOUT) {
+        std::fprintf(stderr, "SERVE_OWNER invalid_or_exited pid=%lu\n", s.opt.owner_pid);
+        return 3;
+    }
     const std::string pipe_path = NormalizePipeName(requested_pipe);
     if (pipe_path.empty()) {
         std::fprintf(stderr, "invalid pipe name: %s\n", requested_pipe.c_str());
@@ -3542,8 +3686,10 @@ int RunServeMode(State& s, const std::string& requested_pipe)
     a3::RegisterRawAudioSource();
 
     const std::wstring wpipe = Utf8ToWide(pipe_path);
+    // A synchronous handle with NOWAIT only during the bounded handshake.
+    // Restore WAIT before existing synchronous ReadFile/WriteFile operations.
     HANDLE pipe = CreateNamedPipeW(wpipe.c_str(), PIPE_ACCESS_DUPLEX,
-                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 65536,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT, 1, 65536,
                                    65536, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
         std::fprintf(stderr, "CreateNamedPipeW failed: %s (win32 %lu)\n", pipe_path.c_str(),
@@ -3558,23 +3704,46 @@ int RunServeMode(State& s, const std::string& requested_pipe)
     int exit_rc = 0;
     bool stop_serving = false;
     while (!stop_serving) {
-        const BOOL connected = ConnectNamedPipe(pipe, nullptr);
-        if (!connected) {
-            const DWORD err = GetLastError();
-            if (err != ERROR_PIPE_CONNECTED) {
-                std::printf("SERVE_CLIENT connect_error win32=%lu\n", err);
-                std::fflush(stdout);
-                continue;
+        const uint64_t wait_started_ms = GetTickCount64();
+        DWORD client_pid = 0;
+        while (true) {
+            const BOOL connected = ConnectNamedPipe(pipe, nullptr);
+            const DWORD err = connected ? ERROR_SUCCESS : GetLastError();
+            // NOWAIT ConnectNamedPipe may report success merely for entering
+            // listening state. Verify a real peer rather than trusting BOOL.
+            const bool peer_known = GetNamedPipeClientProcessId(pipe, &client_pid) != FALSE;
+            const auto decision = a3::DecideOwnerConnection(
+                WaitForSingleObject(owner.value, 0) == WAIT_TIMEOUT,
+                GetTickCount64() - wait_started_ms, peer_known, client_pid, s.opt.owner_pid);
+            if (decision == a3::OwnerConnectDecision::Accept) break;
+            if (decision != a3::OwnerConnectDecision::Wait) {
+                const char* reason = decision == a3::OwnerConnectDecision::Timeout ? "connect_timeout" :
+                    decision == a3::OwnerConnectDecision::WrongClient ? "wrong_client" : "owner_exited";
+                std::fprintf(stderr, "SERVE_OWNER %s owner_pid=%lu peer_pid=%lu\n",
+                             reason, s.opt.owner_pid, client_pid);
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+                return 3;
             }
+            if (!connected && err != ERROR_PIPE_LISTENING && err != ERROR_PIPE_CONNECTED &&
+                    err != ERROR_NO_DATA) {
+                std::fprintf(stderr, "SERVE_CLIENT connect_error win32=%lu\n", err);
+                CloseHandle(pipe);
+                return 3;
+            }
+            // Wait on the pinned owner, so death wakes us without another
+            // polling interval. WAIT_FAILED is fail-closed on the next check.
+            WaitForSingleObject(owner.value, 25);
+        }
+        DWORD pipe_mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        if (!SetNamedPipeHandleState(pipe, &pipe_mode, nullptr, nullptr)) {
+            std::fprintf(stderr, "SERVE_CLIENT blocking_mode_failed win32=%lu\n", GetLastError());
+            CloseHandle(pipe);
+            return 3;
         }
         std::printf("SERVE_CLIENT connected requests_so_far=%d\n", sess.requests);
         std::fflush(stdout);
-
-        DWORD client_pid = 0;
-        if (GetNamedPipeClientProcessId(pipe, &client_pid))
-            std::printf("SERVE_CLIENT pid=%lu\n", client_pid);
-        else
-            std::printf("SERVE_CLIENT pid=unknown win32=%lu\n", GetLastError());
+        std::printf("SERVE_CLIENT pid=%lu owner_verified=1\n", client_pid);
         std::fflush(stdout);
         uint64_t last_client_check_ns = 0;
 
@@ -3584,7 +3753,7 @@ int RunServeMode(State& s, const std::string& requested_pipe)
             const uint64_t now_ns = os_gettime_ns();
             if (client_pid != 0 && now_ns - last_client_check_ns >= 100000000ULL) {
                 last_client_check_ns = now_ns;
-                if (!ClientProcessAlive(client_pid)) {
+                if (WaitForSingleObject(owner.value, 0) != WAIT_TIMEOUT) {
                     std::printf("SERVE_CLIENT process_exited pid=%lu\n", client_pid);
                     std::fflush(stdout);
                     client_gone = true;
@@ -3672,7 +3841,7 @@ int RunServeMode(State& s, const std::string& requested_pipe)
                 }
                 if (reply.shutdown) {
                     stop_serving = true;
-                    exit_rc = 0;
+                    exit_rc = s.output_shutdown_unconfirmed ? 5 : 0;
                     break;
                 }
             }
@@ -3694,7 +3863,7 @@ int RunServeMode(State& s, const std::string& requested_pipe)
             // MCP death means no controller remains.  Save what was captured, then exit
             // instead of accepting a new client and pretending the interrupted run is live.
             stop_serving = true;
-            exit_rc = 0;
+            exit_rc = s.output_shutdown_unconfirmed ? 5 : 0;
         }
         DisconnectNamedPipe(pipe);
     }
@@ -3730,11 +3899,14 @@ void PrintUsage()
 "  --video-pulse         A4: white/black video pulse aligned with audio pulse\n"
 "  --av-origin-delay-ms N test-only common future origin delay\n"
 "  --allow-single-segment  A/V measurement harness: no >=3 split assertion\n"
+"  --test-stop-timeout   test-only: force terminal 10s deactivation timeout\n"
                 "  --duration-ms N      record duration in ms (default 17000; window mode 8000)\n"
                 "  --max-time-sec N     split max_time_sec (default 5; window mode 3)\n  --max-size-mb N      size split threshold in MiB (0 disables; IPC allows 1..4096)\n"
                 "  --json-out FILE      report path (default: <out-dir>\\selftest.json)\n"
                 "  --serve              S3a: run the named-pipe IPC server (libobs stays initialized)\n"
                 "  --pipe NAME          S3a: pipe name (default auto-heros3-media-<pid>)\n"
+                "  --owner-pid PID      required for --serve: owning controller PID\n"
+                "  --owner-created-filetime N  required exact Win32 creation identity\n"
                 "exit codes: 0 ok, 2 usage, 3 obs/module init, 4 pipeline, 5 output run,\n"
                 "            6 checks, 7 window_not_found, 8 capture/not-WGC failure,\n"
                 "            9 raw audio source failure\n");
@@ -3799,6 +3971,8 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.av_origin_delay_ms = std::atoi(next("--av-origin-delay-ms").c_str());
         } else if (a == "--allow-single-segment") {
             opt.allow_single_segment = true;
+        } else if (a == "--test-stop-timeout") {
+            opt.test_stop_timeout = true;
         } else if (a == "--duration-ms") {
             opt.duration_ms = std::atoi(next("--duration-ms").c_str());
             opt.duration_explicit = true;
@@ -3817,6 +3991,22 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
             opt.serve = true;
         } else if (a == "--pipe") {
             opt.pipe_name = next("--pipe");
+        } else if (a == "--owner-pid" || a == "--owner-created-filetime") {
+            const std::string value = next(a.c_str());
+            try {
+                if (value.empty() || !std::all_of(value.begin(), value.end(),
+                        [](unsigned char c) { return std::isdigit(c) != 0; }))
+                    throw std::invalid_argument("positive decimal integer required");
+                const uint64_t parsed = std::stoull(value);
+                if (!parsed || (a == "--owner-pid" && parsed > MAXDWORD))
+                    throw std::out_of_range("owner identity out of range");
+                if (a == "--owner-pid") opt.owner_pid = static_cast<DWORD>(parsed);
+                else opt.owner_created_filetime = parsed;
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "invalid %s: %s\n", a.c_str(), value.c_str());
+                exit_code = 2;
+                return false;
+            }
         } else if (a == "--help" || a == "-h") {
             PrintUsage();
             exit_code = 0;
@@ -3832,6 +4022,11 @@ bool ParseArgs(int argc, char** argv, Options& opt, int& exit_code)
         }
     }
     if (opt.serve) {
+        if (!opt.owner_pid || !opt.owner_created_filetime) {
+            std::fprintf(stderr, "--serve requires --owner-pid and --owner-created-filetime\n");
+            exit_code = 2;
+            return false;
+        }
         // S3a: one process initialises libobs once and serves the single-recording
         // lifecycle over a named pipe.  out_dir/window/audio come from `prepare`.
         opt.mode = RunMode::WindowWgc;

@@ -52,6 +52,8 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_recording_health.py",
     "test_recording_manifest.py",
     "test_native_stop.py",
+    "test_recording_start.py",
+    "test_recording_lock_guard.py",
     "test_recording_segment.py",
     "test_short_game_tools.py",
     "test_t35_spellcasting.py",
@@ -79,6 +81,8 @@ OFFLINE_SUITES: tuple[str, ...] = (
     "test_native_promotion.py",
     "test_sdl_deployment.py",
     "test_native_live_harness.py",
+    "test_obs_wmi_apartment.py",
+    "test_obs_process_ownership.py",
 )
 
 # LIVE suites: listed for transparency only; they run native capture/recording or
@@ -86,6 +90,7 @@ OFFLINE_SUITES: tuple[str, ...] = (
 LIVE_SUITES: tuple[str, ...] = (
     "test_native_audio_delivery.py",
     "test_native_recording_e2e.py",
+    "test_native_default_lifecycle.py",
     "test_n1_live_restore.py",
     "test_p6_live_hero_fields.py",
     "test_session_memory.py",

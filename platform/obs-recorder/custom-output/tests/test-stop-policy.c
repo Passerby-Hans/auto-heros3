@@ -1,5 +1,6 @@
 /* Standalone offline test; no OBS, codecs, clocks, devices or media output. */
 #include "../a3-stop-policy.h"
+#include "../../src/media/host-stop-policy.h"
 #include <stdio.h>
 
 static unsigned checks, failures;
@@ -23,6 +24,25 @@ static struct a3_stop_policy begun(void)
 
 int main(void)
 {
+	/* Host stop code/mux completeness cannot stand in for encoder deactivation.
+	 * After timeout, a late inactive observation cannot authorize destructor
+	 * waits or a second force-stop that would reset libobs' completion event. */
+	enum a3_host_stop_result host = A3_HOST_STOP_WAITING;
+	host = a3_host_stop_observe(host, A3_HOST_STOP_BUDGET_NS - 1, true, false);
+	CHECK(host == A3_HOST_STOP_WAITING);
+	host = a3_host_stop_observe(host, A3_HOST_STOP_BUDGET_NS, true, false);
+	CHECK(host == A3_HOST_STOP_UNCONFIRMED);
+	CHECK(a3_host_stop_observe(host, A3_HOST_STOP_BUDGET_NS + 1, false, false) ==
+	      A3_HOST_STOP_UNCONFIRMED);
+	CHECK(a3_host_stop_observe(A3_HOST_STOP_WAITING, A3_HOST_STOP_BUDGET_NS, false, false) ==
+	      A3_HOST_STOP_UNCONFIRMED);
+	CHECK(a3_host_stop_observe(A3_HOST_STOP_WAITING, A3_HOST_STOP_BUDGET_NS - 1, false, false) ==
+	      A3_HOST_STOP_INACTIVE);
+	CHECK(a3_host_stop_observe(A3_HOST_STOP_WAITING, 1, false, true) == A3_HOST_STOP_WAITING);
+	CHECK(a3_host_stop_observe(A3_HOST_STOP_WAITING, A3_HOST_STOP_BUDGET_NS, false, true) ==
+	      A3_HOST_STOP_UNCONFIRMED);
+	CHECK(a3_host_stop_observe(A3_HOST_STOP_INACTIVE, A3_HOST_STOP_BUDGET_NS + 1, true, false) ==
+	      A3_HOST_STOP_INACTIVE);
 	struct a3_stop_policy p = begun();
 	CHECK(a3_stop_request(&p, 1000000, false));
 	CHECK(a3_stop_request(&p, 2000000, false));

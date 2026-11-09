@@ -77,6 +77,37 @@ from auto_heros3.runtime.context import RuntimeContext  # noqa: E402
 # recorder process handle / writable paths).  The historical module attributes are served by the
 # _ServerModule bridge at the bottom of this file, so fixtures patch the state that is read.
 _RUNTIME = RuntimeContext(paths=runtime_paths_from_env(ROOT))
+# Admission is separate from each native run's stop lock. It covers the long
+# prepare/connect/start interval before a recorder handle can be published.
+_RECORDING_ADMISSION_LOCK = threading.Lock()
+_RECORDING_PREPARING: dict | None = None
+
+
+def _recording_start_admission(function):
+    @functools.wraps(function)
+    def guarded(*args, **kwargs):
+        global _RECORDING_PREPARING
+        if not _RECORDING_ADMISSION_LOCK.acquire(blocking=False):
+            return {'ok': False, 'error': 'recording_start_in_progress' if _RECORDING_PREPARING
+                    else 'recording_stop_in_progress', 'retryable': True}
+        token = uuid.uuid4().hex
+        _RECORDING_PREPARING = {'token': token, 'mcp_pid': os.getpid()}
+        try:
+            return function(*args, **kwargs)
+        finally:
+            # Unexpected preparation errors must not strand this attempt's
+            # persistent lock. Never release a live or pre-existing run's lock.
+            try:
+                owner = json.loads(_recording_lock_path().read_text(encoding='utf-8'))
+                if (isinstance(owner, dict) and owner.get('preparing_token') == token
+                        and _active_recording_info() is None):
+                    _release_recording_lock()
+            except (OSError, ValueError):
+                pass
+            finally:
+                _RECORDING_PREPARING = None
+                _RECORDING_ADMISSION_LOCK.release()
+    return guarded
 
 
 # ---------------------------------------------------------------- runtime paths (B0.4c)
@@ -6146,12 +6177,24 @@ def _evidence_identity() -> dict:
 
 def _acquire_recording_lock(identity: dict) -> dict:
     """R9: atomic singleton lock so two MCP processes can never start two recorders."""
+    from auto_heros3.recording.lock_guard import RecordingLockBusy, recording_lock_guard
+    try:
+        with recording_lock_guard(_recording_lock_path()):
+            return _acquire_recording_lock_guarded(identity)
+    except RecordingLockBusy:
+        return {'ok': False, 'error': 'recording_lock_busy', 'retryable': True}
+
+
+def _acquire_recording_lock_guarded(identity: dict) -> dict:
     path = _recording_lock_path()
     for _ in range(3):
         try:
             fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
-                os.write(fd, json.dumps(identity, ensure_ascii=False).encode('utf-8'))
+                owner = dict(identity, mcp_pid=os.getpid())
+                if _RECORDING_PREPARING is not None:
+                    owner['preparing_token'] = _RECORDING_PREPARING['token']
+                os.write(fd, json.dumps(owner, ensure_ascii=False).encode('utf-8'))
             finally:
                 os.close(fd)
             return {'ok': True, 'path': str(path)}
@@ -6159,11 +6202,22 @@ def _acquire_recording_lock(identity: dict) -> dict:
             try:
                 current = json.loads(path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
-                current = {}
+                # Another process may have created the lock but not finished
+                # writing its identity. An unreadable lock is not a dead owner.
+                return {'ok': False, 'error': 'recording_lock_busy', 'retryable': True}
+            if not isinstance(current, dict) or not (current.get('pid') or current.get('mcp_pid')):
+                return {'ok': False, 'error': 'recording_lock_busy', 'retryable': True}
             owner_pid = (current or {}).get('pid') or (current or {}).get('mcp_pid')
+            if current.get('native_pid') and _pid_alive(current['native_pid']):
+                return {'ok': False, 'error': 'recording_active', 'lock_owner': current,
+                        'reason': 'pending_native_owner_alive'}
             if _pid_alive(owner_pid) and int(owner_pid) != os.getpid():
                 return {'ok': False, 'error': 'recording_active', 'lock_owner': current}
             if owner_pid and int(owner_pid) == os.getpid():
+                if (_RECORDING_PREPARING is not None and
+                        current.get('preparing_token') == _RECORDING_PREPARING['token']):
+                    return {'ok': False, 'error': 'recording_start_in_progress',
+                            'lock_owner': current, 'retryable': True}
                 rec = _RUNTIME.recorder
                 proc = rec.get('proc')
                 if rec.get('client') is not None or rec.get('active') or (
@@ -6179,14 +6233,41 @@ def _acquire_recording_lock(identity: dict) -> dict:
     return {'ok': False, 'error': 'recording_lock_busy'}
 
 
-def _release_recording_lock() -> None:
+def _release_recording_lock() -> bool:
+    from auto_heros3.recording.lock_guard import RecordingLockBusy, recording_lock_guard
+    try:
+        with recording_lock_guard(_recording_lock_path()):
+            return _release_recording_lock_guarded()
+    except RecordingLockBusy:
+        return False
+
+
+def _release_recording_lock_guarded(*, allow_dead_owner: bool = False) -> bool:
     path = _recording_lock_path()
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
-        if int((data or {}).get('mcp_pid') or 0) == os.getpid():
+        if not isinstance(data, dict):
+            return False
+        owner = int((data or {}).get('mcp_pid') or 0)
+        if owner == os.getpid() or (allow_dead_owner and owner and not _pid_alive(owner)
+                                   and not _pid_alive(data.get('native_pid'))):
             path.unlink()
+            return True
     except (OSError, ValueError, TypeError):
         pass
+    return False
+
+
+def _bind_recording_native_owner(rec: dict) -> None:
+    """Make the native PID discoverable before any subsequent publication I/O."""
+    from auto_heros3.recording.lock_guard import recording_lock_guard
+    with recording_lock_guard(_recording_lock_path()):
+        owner = json.loads(_recording_lock_path().read_text(encoding='utf-8'))
+        if owner.get('mcp_pid') != os.getpid():
+            raise RuntimeError('recording_lock_owner_changed')
+        owner.update(native_pid=rec.get('native_pid') or getattr(rec.get('proc'), 'pid', None),
+                     dir=str(rec['dir']), recording_run_id=rec['recording_run_id'])
+        _atomic_write_json(_recording_lock_path(), owner)
 
 
 def _read_recording_state() -> dict:
@@ -6224,6 +6305,7 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                          audio_framed: Path | None = None,
                          audio_framed_live: bool = False,
                          audio_sdl_sha256: str = '',
+                         pending_owner: dict | None = None,
                          max_time_sec: int, max_size_mb: int = 0,
                          overlay_path: Path | None = None) -> tuple[object, dict]:
     """Create/connect/prepare/start one native recorder process for a run."""
@@ -6245,9 +6327,15 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
     })
     client = ObsRecorder(artifacts['recorder_exe'], obs_dir=artifacts['obs_dir'],
                          outputs_module=artifacts['outputs_module'],
+                         on_spawn=(lambda owner: _libobs_register_pending_owner(
+                             owner, pending_owner, capture_identity=False)) if pending_owner is not None else None,
                          log_path=Path(out) / 'server.log')
     try:
+        if pending_owner is not None:
+            _libobs_register_pending_owner(client, pending_owner)
         client.connect()
+        if pending_owner is not None:
+            _libobs_register_pending_owner(client, pending_owner)
         prep = client.prepare(Path(out), window_pid=int(client_pid),
                               audio_raw=Path(audio_raw) if audio_raw else None,
                               audio_framed=Path(audio_framed) if audio_framed else None,
@@ -6261,6 +6349,14 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
             raise RuntimeError(f"start failed: {start.get('error')}")
         return client, prep
     except Exception:
+        if pending_owner is not None:
+            # connect may have spawned before it failed. Preserve that owner
+            # before returning the exception to the run-level rollback path.
+            try:
+                _libobs_register_pending_owner(client, pending_owner)
+            except Exception as ownership_exc:
+                pending_owner['ownership_error'] = f'{type(ownership_exc).__name__}: {ownership_exc}'
+            raise
         try:
             client.close(force=True)
         except Exception:
@@ -6360,8 +6456,13 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
             old_client = rec.get('client')
             if old_client is not None:
                 old_client.close(force=True)
-        except Exception:
-            pass
+            if not _libobs_owned_process_exited(rec):
+                raise RuntimeError('previous native process exit unconfirmed')
+        except Exception as exc:
+            rec['restarting'] = False
+            _libobs_abort_start(rec, f'restart_cleanup_failed: {type(exc).__name__}: {exc}',
+                                restart_owned=True, failure_code='native_restart_failed')
+            return
         _libobs_mark_run_failed(old_out, f'native_recorder_died rc={returncode}')
         old_snap = _libobs_run_snapshot(old_out, 'failed')
         old_snap['recording_run_id'] = old_run_id
@@ -6386,22 +6487,38 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
         new_out.mkdir(parents=True, exist_ok=True)
         from auto_heros3.recording.recording_manifest import RecordingManifest
         new_run_id = f'{old_run_id or "obs"}-r{n}'
+        new_client = None
+        rec['_starting_client_registered'] = False
         try:
             m = RecordingManifest.create(
                 new_out / 's4b', recording_run_id=new_run_id,
                 owner_token=f'mcp-{os.getpid()}-{new_run_id}', backend='libobs',
                 game_identity=rec.get('identity') or {},
                 metadata={'restart_of': old_run_id, 'restart_count': n})
+            rec.update(dir=new_out, manifest=new_out / 's4b' / 'manifest.json',
+                       recording_run_id=new_run_id)
             client, prep = _libobs_start_client(
                 new_out, client_pid=int(cfg['client_pid']),
                 audio_raw=Path(cfg['audio_raw']) if cfg.get('audio_raw') and not cfg.get('audio_framed') else None,
                 audio_framed=Path(cfg['audio_framed']) if cfg.get('audio_framed') else None,
                 audio_framed_live=bool(cfg.get('audio_framed_live')),
                 audio_sdl_sha256=cfg.get('audio_sdl_sha256', ''),
+                pending_owner=rec,
                 max_time_sec=int(cfg['max_time_sec']), max_size_mb=int(cfg.get('max_size_mb') or 0),
                 overlay_path=Path(cfg['overlay_path']) if cfg.get('overlay_path') else None)
+            new_client = client
+            rec.update({'client': client, 'proc': client.proc, 'native_pid': client.pid, 'dir': new_out,
+                        'manifest': new_out / 's4b' / 'manifest.json',
+                        'recording_run_id': new_run_id, 'active': True})
+            _libobs_capture_process_owner(rec)
+            _bind_recording_native_owner(rec)
             m.transition_run('recording')
         except Exception as exc:  # noqa: BLE001
+            if new_client is not None or rec.get('_starting_client_registered'):
+                rec['restarting'] = False
+                _libobs_abort_start(rec, f'restart_failed: {type(exc).__name__}: {exc}',
+                                    restart_owned=True)
+                return
             _libobs_mark_run_failed(new_out, f'restart_failed: {type(exc).__name__}: {exc}')
             rec.update({'client': None, 'proc': None, 'active': False, 'restarting': False,
                         'recording_failed': f'restart_failed: {type(exc).__name__}: {exc}',
@@ -6423,21 +6540,14 @@ def _libobs_restart_after_death(rec: dict, returncode, *, force: bool = False) -
                     'config': cfg, 'last_restart': {
                         'from': old_run_id, 'to': new_run_id,
                         'native_returncode': returncode, 'time': time.time()}})
-        rec.setdefault('runs', []).append(_libobs_run_snapshot(
-            new_out, 'recording') | {'recording_run_id': new_run_id})
         try:
-            _atomic_write_json(_recording_state_path(),
-                               {'pid': client.pid,
-                                'dir': str(new_out), 'started': rec.get('started', time.time()),
-                                'backend': 'libobs', 'client_pid': cfg['client_pid'],
-                                'identity': rec.get('identity') or {},
-                                'recording_run_id': new_run_id,
-                                'manifest': str(new_out / 's4b' / 'manifest.json'),
-                                'restart_count': n,
-                                'runs': rec.get('runs')})
-        except Exception:
-            pass
-        _overlay('event', f'libobs 录制器退出 rc={returncode}，已重启 r{n} 继续录制')
+            rec.setdefault('runs', []).append(_libobs_run_snapshot(
+                new_out, 'recording') | {'recording_run_id': new_run_id})
+            _libobs_publish_state(rec)
+            _overlay('event', f'libobs 录制器退出 rc={returncode}，已重启 r{n} 继续录制')
+        except Exception as exc:
+            _libobs_abort_start(rec, f'restart_publish_failed: {type(exc).__name__}: {exc}',
+                                restart_owned=True)
 
 
 def _active_recording_info() -> dict | None:
@@ -6484,6 +6594,14 @@ def _select_native_audio_source(audio_framed: str = '', audio_framed_live: bool 
                                    f'{type(exc).__name__}: {exc}') from exc
     if session is None:
         raise NativeArtifactsError('native_audio_session_missing', 'start a new session')
+    try:
+        session_alive = session.alive()
+    except Exception as exc:
+        raise NativeArtifactsError('native_audio_session_unavailable',
+                                   f'cannot verify owned client: {type(exc).__name__}: {exc}') from exc
+    if not session_alive:
+        raise NativeArtifactsError('native_audio_session_dead',
+                                   'owned client PID/create-time/executable no longer match; start a new session')
     if identity and (session.client_pid != identity.get('client_pid')
                      or session.session_id != identity.get('session_id')):
         raise NativeArtifactsError('native_audio_session_mismatch',
@@ -6512,10 +6630,172 @@ def _select_native_audio_source(audio_framed: str = '', audio_framed_live: bool 
             'audio_route': 'explicit_session_disk', 'audio_sdl_sha256': ''}
 
 
+def _libobs_register_pending_owner(client, rec: dict, *, capture_identity: bool = True) -> None:
+    pid = client.pid
+    if (rec.get('client') is not client or
+            (pid is not None and pid != rec.get('native_pid')) or
+            (client.proc is not None and client.proc is not rec.get('proc'))):
+        rec.update(proc=None, native_pid=None)
+        rec.pop('native_process', None)
+        rec.pop('native_identity', None)
+    rec.update(client=client, active=True, _starting_client_registered=True)
+    if client.proc is not None:
+        rec['proc'] = client.proc
+    elif not rec.get('native_pid'):
+        rec['proc'] = None
+    if pid is not None:
+        rec['native_pid'] = pid
+    if getattr(client, 'native_identity', None):
+        rec['native_identity'] = dict(client.native_identity)
+    _RUNTIME.recorder = rec
+    if rec.get('native_pid'):
+        # PID publication must precede identity probing and IPC connect waits.
+        # A WMI launch reports its PID before create-time/exe can be queried.
+        _bind_recording_native_owner(rec)
+        if capture_identity or not getattr(client, 'wmi_launched', False) or rec.get('native_identity'):
+            _libobs_capture_process_owner(rec)
+
+
+def _libobs_capture_process_owner(rec: dict) -> None:
+    """WMI has no Popen handle; retain a PID-reuse-aware owner before cleanup."""
+    previous = rec.get('native_process')
+    if previous is not None and previous.pid == rec.get('native_pid'):
+        return
+    rec.pop('native_process', None)
+    if rec.get('proc') is None:
+        import psutil
+        identity = rec.get('native_identity')
+        if getattr(rec['client'], 'wmi_launched', False) and not identity:
+            raise RuntimeError('native_process_identity_unavailable')
+        owner = psutil.Process(int(rec['native_pid']))
+        created = owner.create_time()  # psutil terminate/kill reject PID reuse
+        if identity and (identity.get('pid') != owner.pid or identity.get('create_time') != created):
+            raise RuntimeError('native_process_identity_changed')
+        if Path(owner.exe()).resolve() != Path(rec['client'].exe).resolve():
+            raise RuntimeError('native_process_executable_mismatch')
+        rec['native_process'] = owner
+
+
+def _libobs_publish_state(rec: dict) -> None:
+    """Persist an already-owned native handle, including failed-start cleanup."""
+    _atomic_write_json(_recording_state_path(), {
+        'pid': rec.get('native_pid') or getattr(rec.get('proc'), 'pid', None), 'dir': str(rec['dir']),
+        'started': rec['started'], 'backend': 'libobs', 'identity': rec['identity'],
+        'client_pid': rec['config']['client_pid'], 'run_id': rec['identity'].get('run_id'),
+        'recording_run_id': rec['recording_run_id'], 'manifest': str(rec['manifest']),
+        'config': rec['config'], 'restart_count': rec.get('restart_count', 0),
+        'runs': rec.get('runs', []), 'start_cleanup_pending': bool(rec.get('start_cleanup_pending')),
+        'recording_failed': rec.get('recording_failed'),
+        'native_identity': rec.get('native_identity'),
+    })
+
+
+def _libobs_owned_process_exited(rec: dict) -> bool:
+    proc = rec.get('proc') or rec.get('native_process')
+    if proc is not None:
+        return proc.poll() is not None if hasattr(proc, 'poll') else not proc.is_running()
+    import psutil
+    if not rec.get('native_pid') or not psutil.pid_exists(int(rec['native_pid'])):
+        return True
+    identity = rec.get('native_identity')
+    if identity:
+        owner = psutil.Process(int(identity['pid']))
+        return owner.create_time() != identity['create_time']
+    return False
+
+
+def _libobs_abort_start(rec: dict, reason: str, *, restart_owned: bool = False,
+                        failure_code: str | None = None) -> dict:
+    """Rollback a launched but unpublished recording without abandoning its PID.
+
+    A failed close is not proof of exit. Keep the run active and its persistent
+    lock until a later stop can confirm termination, even if evidence I/O fails.
+    """
+    failure_code = failure_code or rec.get('cleanup_failure_code') or 'native_start_failed'
+    pending_code = failure_code.removesuffix('_failed') + '_cleanup_pending'
+    rec.update(stop_requested=True, recording_failed=reason, start_cleanup_pending=True,
+               cleanup_failure_code=failure_code)
+    event = rec.get('watchdog_stop')
+    if event is not None:
+        event.set()
+    errors = []
+    restart_lock = rec.get('restart_lock')
+    acquired = False
+    if restart_lock is not None and not restart_owned:
+        acquired = restart_lock.acquire(timeout=5.0)
+        if not acquired:
+            return {'ok': False, 'backend': 'libobs', 'partial': True,
+                    'error': pending_code, 'detail': reason,
+                    'dir': str(rec['dir']), 'retryable': True,
+                    'process_exit_confirmed': False, 'cleanup_errors': ['restart_lock_timeout']}
+    client = rec.get('client')
+    proc = rec.get('proc') or rec.get('native_process')
+
+    try:
+        if client is not None:
+            client.close(force=True)
+    except Exception as exc:
+        errors.append(f'close: {type(exc).__name__}: {exc}')
+    exited = False
+    try:
+        exited = _libobs_owned_process_exited(rec)
+    except Exception as exc:
+        errors.append(f'poll: {type(exc).__name__}: {exc}')
+    if not exited and proc is not None:
+        # close() can discard its own process reference even when terminate
+        # failed. This run retains the original owner handle for bounded retry.
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception as exc:
+            errors.append(f'terminate: {type(exc).__name__}: {exc}')
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception as kill_exc:
+                errors.append(f'kill: {type(kill_exc).__name__}: {kill_exc}')
+        try:
+            exited = _libobs_owned_process_exited(rec)
+        except Exception:
+            exited = False
+    if acquired:
+        restart_lock.release()
+    out = Path(rec['dir'])
+    _libobs_mark_run_failed(out, reason)
+    result = {'ok': False, 'backend': 'libobs', 'partial': True, 'dir': str(out),
+              'error': failure_code if exited else pending_code,
+              'detail': reason, 'retryable': not exited, 'cleanup_errors': errors,
+              'pid': rec.get('native_pid') or getattr(proc, 'pid', None), 'process_exit_confirmed': exited,
+              'recording_run_id': rec.get('recording_run_id'),
+              'runs': list(rec.get('runs') or []), 'restart_count': rec.get('restart_count', 0)}
+    if exited:
+        try:
+            state = _read_recording_state()
+            if state.get('dir') == str(out):
+                _recording_state_path().unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(f'state cleanup: {exc}')
+        _release_recording_lock()
+        rec.update(client=None, proc=None, active=False, backend=None,
+                   start_cleanup_pending=False, last_stop_result=result,
+                   last_stop_token=rec.get('run_token'))
+    else:
+        rec['active'] = True
+        try:
+            _libobs_publish_state(rec)
+        except Exception as exc:
+            errors.append(f'pending state: {type(exc).__name__}: {exc}')
+    try:
+        _atomic_write_json(out / 'obs-result.json', result)
+    except Exception as exc:
+        errors.append(f'failure evidence: {type(exc).__name__}: {exc}')
+    return result
+
+
 def _recording_start_libobs(fps: int, height: int, crf: int,
                             rollover_seconds: float, max_segment_gb: float = 1.5,
                             audio_framed: str = "", audio_framed_live: bool = False) -> dict:
-    """Start the native libobs IPC recorder (experimental S3b path)."""
+    """Start the current native libobs IPC recorder with verified session audio."""
     if int(fps) != 60 or int(height) != 1080 or float(crf) != 10.0:
         return {'ok': False, 'error': 'unsupported_native_recording_parameters',
                 'fps': int(fps), 'height': int(height), 'crf': float(crf),
@@ -6562,31 +6842,6 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
     except Exception as exc:  # noqa: BLE001
         _release_recording_lock()
         return {'ok': False, 'error': f'manifest_create: {type(exc).__name__}: {exc}'}
-    try:
-        client, prep = _libobs_start_client(
-            out, client_pid=int(client_pid),
-            audio_raw=(audio_raw if framed_path is None else None),
-            audio_framed=framed_path,
-            audio_framed_live=bool(audio_framed_live),
-            audio_sdl_sha256=audio['audio_sdl_sha256'],
-            max_time_sec=int(rollover_seconds) if rollover_seconds else 900,
-            max_size_mb=_size_cap_mb(max_segment_gb),
-            overlay_path=overlay_path)
-        run_manifest.transition_run('recording')
-    except Exception as exc:  # noqa: BLE001
-        try:
-            if 'run_manifest' in locals() and run_manifest.data.get('state') == 'preparing':
-                run_manifest.transition_run('failed', reason=str(exc))
-        except Exception:
-            pass
-        _release_recording_lock()
-        return {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'dir': str(out)}
-    identity.update({'recording_started_at': time.time(), 'backend': 'libobs',
-                     'recording_run_id': recording_run_id,
-                     'segment_id': f"{identity.get('run_id')}/obs-{stamp}",
-                     'output_dir': str(out), 'obs_pid': client.pid,
-                     'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0})
-    _atomic_write_json(out / 'identity.json', identity)
     config = {'fps': int(fps), 'height': int(height), 'crf': int(crf),
               'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0,
               'client_pid': int(client_pid), 'audio_raw': str(audio_raw) if audio_raw else '',
@@ -6599,8 +6854,8 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
               'overlay_path': str(overlay_path)}
     # A run owns its dictionary and locks for its entire lifetime. Old stop
     # waiters/watchdogs must never observe a later run through clear()/update().
-    rec = {'proc': client.proc, 'dir': out, 'started': time.time(),
-                'backend': 'libobs', 'client': client,
+    rec = {'proc': None, 'dir': out, 'started': time.time(),
+                'backend': 'libobs', 'client': None,
                 'manifest': manifest_dir / 'manifest.json',
                 'recording_run_id': recording_run_id,
                 'config': config, 'identity': identity, 'active': True,
@@ -6608,21 +6863,43 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
                 'watchdog_stop': threading.Event(), 'restart_lock': threading.Lock(),
                 'stop_lock': threading.Lock(), 'last_stop_result': None,
                 'last_stop_token': None, 'run_token': uuid.uuid4().hex,
-                'runs': [_libobs_run_snapshot(out, 'recording') |
-                          {'recording_run_id': recording_run_id}]}
-    _RUNTIME.recorder = rec
-    _atomic_write_json(_recording_state_path(),
-                       {'pid': client.pid, 'dir': str(out),
-                        'started': time.time(), 'backend': 'libobs', 'identity': identity,
-                        'client_pid': client_pid, 'run_id': identity.get('run_id'),
-                        'recording_run_id': recording_run_id,
-                        'manifest': str(manifest_dir / 'manifest.json'),
-                        'restart_count': 0, 'runs': rec['runs']})
-    watchdog = threading.Thread(target=_libobs_watchdog, args=(rec,), daemon=True,
-                                name='obs-recorder-watchdog')
-    rec['watchdog'] = watchdog
-    watchdog.start()
-    _overlay('event', f'libobs 录制开始 {fps}fps/{height}p')
+                'runs': []}
+    try:
+        client, prep = _libobs_start_client(
+            out, client_pid=int(client_pid), audio_raw=audio_raw,
+            audio_framed=framed_path, audio_framed_live=bool(audio_framed_live),
+            audio_sdl_sha256=audio['audio_sdl_sha256'],
+            pending_owner=rec,
+            max_time_sec=config['max_time_sec'], max_size_mb=config['max_size_mb'],
+            overlay_path=overlay_path)
+        # Own the returned process BEFORE any fallible manifest/evidence write.
+        # Admission remains held until either full publication or safe rollback.
+        rec.update(proc=client.proc, client=client, native_pid=client.pid)
+        _RUNTIME.recorder = rec
+        _libobs_capture_process_owner(rec)
+        _bind_recording_native_owner(rec)
+        run_manifest.transition_run('recording')
+        identity.update({'recording_started_at': time.time(), 'backend': 'libobs',
+                         'recording_run_id': recording_run_id,
+                         'segment_id': f"{identity.get('run_id')}/obs-{stamp}",
+                         'output_dir': str(out), 'obs_pid': client.pid,
+                         'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0})
+        _atomic_write_json(out / 'identity.json', identity)
+        rec['runs'] = [_libobs_run_snapshot(out, 'recording') |
+                       {'recording_run_id': recording_run_id}]
+        _libobs_publish_state(rec)
+        watchdog = threading.Thread(target=_libobs_watchdog, args=(rec,), daemon=True,
+                                    name='obs-recorder-watchdog')
+        rec['watchdog'] = watchdog
+        watchdog.start()
+        _overlay('event', f'libobs 录制开始 {fps}fps/{height}p')
+    except Exception as exc:  # noqa: BLE001
+        reason = f'{type(exc).__name__}: {exc}'
+        if rec.get('client') is not None:
+            return _libobs_abort_start(rec, reason)
+        _libobs_mark_run_failed(out, reason)
+        _release_recording_lock()
+        return {'ok': False, 'error': reason, 'dir': str(out)}
     return {'ok': True, 'backend': 'libobs', 'dir': str(out),
             'pid': client.pid,
             'client_pid': client_pid, 'session_id': prep.get('session_id'),
@@ -6681,22 +6958,30 @@ def _libobs_recover_state(record: dict) -> dict:
             manifest_state = pm.get('state')
     except (OSError, ValueError):
         pass
-    # A fresh MCP has a different PID; the previous writer's stale lock must not block
-    # recovery forever, but a live owner's lock is never removed.
+    # Serialize stale recovery with every claimant. A new owner must not have
+    # its state/lock removed by recovery that began from the previous run.
+    from auto_heros3.recording.lock_guard import RecordingLockBusy, recording_lock_guard
     lock_cleaned = False
     try:
-        lock = json.loads(_recording_lock_path().read_text(encoding='utf-8'))
-        owner = lock.get('mcp_pid')
-        if owner and not _pid_alive(owner):
-            _recording_lock_path().unlink()
-            lock_cleaned = True
+        with recording_lock_guard(_recording_lock_path()):
+            current = _read_recording_state()
+            if current and (current.get('dir') != record.get('dir') or current.get('pid') != record.get('pid')):
+                return {'ok': False, 'backend': 'libobs', 'error': 'recording_run_changed', 'retryable': True}
+            if _pid_alive(record.get('pid')):
+                return {'ok': False, 'backend': 'libobs', 'partial': True,
+                        'error': 'native_recovery_pending', 'retryable': True, 'dir': str(out)}
+            try:
+                lock = json.loads(_recording_lock_path().read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                lock = {}
+            owner = lock.get('mcp_pid')
+            if owner and owner != os.getpid() and _pid_alive(owner):
+                return {'ok': False, 'error': 'recording_owned_by_other', 'lock_owner': lock}
+            _recording_state_path().unlink(missing_ok=True)
+            lock_cleaned = _release_recording_lock_guarded(allow_dead_owner=True)
+    except RecordingLockBusy:
+        return {'ok': False, 'backend': 'libobs', 'error': 'recording_lock_busy', 'retryable': True}
     except (OSError, ValueError):
-        pass
-    if not lock_cleaned:
-        _release_recording_lock()
-    try:
-        _recording_state_path().unlink()
-    except OSError:
         pass
     _RUNTIME.recorder.update({'proc': None, 'dir': None, 'backend': None, 'client': None})
     return {'ok': False, 'backend': 'libobs', 'recovered': True, 'partial': True,
@@ -6759,6 +7044,8 @@ def _probe_native_media(path: Path) -> dict:
 
 def _recording_stop_libobs(rec: dict | None = None) -> dict:
     rec = _RUNTIME.recorder if rec is None else rec
+    if rec.get('start_cleanup_pending'):
+        return _libobs_abort_start(rec, rec.get('recording_failed') or 'failed start cleanup retry')
     rec['stop_requested'] = True
     stop_event = rec.get('watchdog_stop')
     if stop_event is not None:
@@ -6823,29 +7110,8 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
         client.shutdown()
         client.close()
     except Exception as exc:  # noqa: BLE001
-        try:
-            client.close(force=True)
-        except Exception:
-            pass
-        if restart_lock is not None and restart_lock.locked():
-            try:
-                restart_lock.release()
-            except RuntimeError:
-                pass
-        if out:
-            _libobs_mark_run_failed(Path(out), f'native_stop_failed: {type(exc).__name__}: {exc}')
-            runs.append(_libobs_run_snapshot(Path(out), 'failed') |
-                        {'recording_run_id': rec.get('recording_run_id')})
-        try:
-            _recording_state_path().unlink()
-        except OSError:
-            pass
-        _release_recording_lock()
-        rec.update({'proc': None, 'dir': None, 'backend': None, 'client': None,
-                    'active': False})
-        return {'ok': False, 'backend': 'libobs', 'partial': True, 'dir': str(out),
-                'error': f'{type(exc).__name__}: {exc}', 'runs': runs,
-                'restart_count': int(rec.get('restart_count') or 0)}
+        return _libobs_abort_start(rec, f'native_stop_failed: {type(exc).__name__}: {exc}',
+                                   restart_owned=True, failure_code='native_stop_failed')
     finally:
         if restart_lock is not None and restart_lock.locked():
             try:
@@ -6868,8 +7134,8 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
                 path = found[0]
         d['name'] = name
         d['path'] = str(path)
-        d['bytes'] = int(d.get('size_bytes') or d.get('bytes') or
-                         (path.stat().st_size if path.exists() else 0))
+        d['bytes'] = (path.stat().st_size if path.is_file() else
+                      int(d.get('size_bytes') or d.get('bytes') or 0))
         return d
 
     current_files = [_resolve_file(x, Path(out)) for x in files]
@@ -6899,6 +7165,15 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
             m.transition_segment(seg_id, 'validating')
             probe = _probe_native_media(path)
             item['validation'] = probe
+            if cap_bytes and size > cap_bytes:
+                m.transition_segment(seg_id, 'partial', reason='size_cap_exceeded',
+                                     path=str(path), bytes=size, validation=probe)
+                item['state'] = 'partial'
+                segment_states.append('partial')
+                validation_errors.append({'index': idx, 'path': str(path),
+                                          'error': 'size_cap_exceeded', 'bytes': size,
+                                          'cap_bytes': cap_bytes})
+                continue
             if not stop.get('checks_ok'):
                 m.transition_segment(seg_id, 'partial', reason='native_checks_failed',
                                      path=str(path), bytes=size, validation=probe)
@@ -7056,6 +7331,7 @@ def _recording_stop_libobs(rec: dict | None = None) -> dict:
 
 
 @mcp.tool()
+@_recording_start_admission
 def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
                     rollover_seconds: float = 0.0,
                     backend: str = 'libobs',
@@ -7068,7 +7344,9 @@ def recording_start(fps: int = 60, height: int = 1080, crf: int = 10,
     It only captures frames and never issues game commands.
 
     fps: target frame rate (default 60).  height: canvas height, 768 (1366x768) or
-    1080 (1920x1080).  crf: x264 quality; 10 is visually near-lossless, 0 = lossless.
+    1080 (1920x1080). crf controls legacy x264 quality; 0 is lossless.
+    Native uses fixed 8 Mbps CBR and accepts only the compatibility defaults
+    fps=60, height=1080, crf=10; native crf=10 is not a near-lossless CRF claim.
     Frames are streamed straight into the encoder - no intermediate files to clean up.
     backend='libobs' is the default native path. Manual fallback: set
     AUTO_HEROS3_AUDIO_DRIVER=disk and restart
@@ -7216,7 +7494,26 @@ def recording_stop() -> dict:
     state file exists, the recorder is stopped through its STOP file / process identity instead
     of failing, so a long recording is never orphaned.
     """
+    if not _RECORDING_ADMISSION_LOCK.acquire(blocking=False):
+        return {'ok': False, 'error': 'recording_start_in_progress' if _RECORDING_PREPARING
+                else 'recording_stop_in_progress', 'retryable': True}
     rec = _RUNTIME.recorder
+    native_run = (rec.get('client') is not None or rec.get('backend') == 'libobs' or
+                  (rec.get('run_token') is not None and rec.get('stop_lock') is not None))
+    if native_run:
+        # Native cleanup is bound to this captured run and already serializes
+        # with its own stop_lock. Let concurrent callers join that same result.
+        _RECORDING_ADMISSION_LOCK.release()
+        return _recording_stop_admitted(rec)
+    try:
+        # Legacy cleanup still mutates shared state. Keep starts excluded until
+        # its persistent files and final evidence have all been handled.
+        return _recording_stop_admitted(rec)
+    finally:
+        _RECORDING_ADMISSION_LOCK.release()
+
+
+def _recording_stop_admitted(rec: dict) -> dict:
     # The native run marker survives teardown until the next start. A caller
     # arriving between cleanup and cache publication must still join stop_lock.
     native_run = rec.get('run_token') is not None and rec.get('stop_lock') is not None

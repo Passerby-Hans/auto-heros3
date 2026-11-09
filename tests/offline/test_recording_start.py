@@ -153,13 +153,13 @@ def test_launched_client_publication_failure():
     from auto_heros3.recording.recording_manifest import RecordingManifest
     for point in ('manifest', 'identity.json', 'recording.json', 'snapshot', 'watchdog'):
         with NativeEnv() as env:
-            original_write = M._atomic_write_json
+            original_write = M.os.replace
             original_transition = RecordingManifest.transition_run
 
-            def failed_write(path, data):
-                if Path(path).name == point:
+            def failed_write(src, dst):
+                if Path(dst).name == point:
                     raise OSError(f'injected {point} publication failure')
-                return original_write(path, data)
+                return original_write(src, dst)
 
             def failed_transition(manifest, state, **kwargs):
                 if state == 'recording':
@@ -174,7 +174,7 @@ def test_launched_client_publication_failure():
                 elif point == 'snapshot':
                     faults.enter_context(patch.object(M, '_libobs_run_snapshot', side_effect=OSError('injected snapshot')))
                 else:
-                    faults.enter_context(patch.object(M, '_atomic_write_json', failed_write))
+                    faults.enter_context(patch.object(M.os, 'replace', failed_write))
                 result = M.recording_start(audio_framed=str(env.framed))
             check(f'{point} post-launch failure is explicit', not result['ok']
                   and result['error'] == 'native_start_failed' and result['process_exit_confirmed'])
@@ -191,15 +191,15 @@ def test_launched_client_publication_failure():
 def test_unconfirmed_failed_start_exit_retains_owner():
     from test_native_stop import FakeClient
     with NativeEnv() as env:
-        original = M._atomic_write_json
+        original = M.os.replace
 
-        def failed_identity(path, data):
-            if Path(path).name == 'identity.json':
+        def failed_identity(src, dst):
+            if Path(dst).name == 'identity.json':
                 raise OSError('injected post-launch identity failure')
-            return original(path, data)
+            return original(src, dst)
 
         with patch.object(FakeClient, 'close', side_effect=OSError('injected terminate denied')):
-            with patch.object(M, '_atomic_write_json', failed_identity):
+            with patch.object(M.os, 'replace', failed_identity):
                 failed = M.recording_start(audio_framed=str(env.framed))
             rec = M._RUNTIME.recorder
             check('unconfirmed exit is an explicit retryable partial',
@@ -379,7 +379,7 @@ def test_spawn_callback_persists_before_connect_returns():
             entered, proceed = threading.Event(), threading.Event()
             process = FakeProc()
             wmi_alive = [False]
-            original_write, original_exists = M._atomic_write_json, __import__('psutil').pid_exists
+            original_write, original_exists = M.os.replace, __import__('psutil').pid_exists
 
             class ConnectingClient:
                 def __init__(self, exe, *, on_spawn=None, **kwargs):
@@ -411,10 +411,11 @@ def test_spawn_callback_persists_before_connect_returns():
                     wmi_alive[0] = False
                     self.proc = self.native_pid = None
 
-            def failed_publish(path, data):
-                if mode == 'publish_failure' and Path(path).name == 'recording.lock' and data.get('native_pid'):
+            def failed_publish(src, dst):
+                if (mode == 'publish_failure' and Path(dst).name == 'recording.lock'
+                        and json.loads(Path(src).read_text()).get('native_pid')):
                     raise OSError('injected spawn ownership persistence failure')
-                return original_write(path, data)
+                return original_write(src, dst)
 
             verified = {'recorder_exe': env.env.root / 'recorder.exe',
                         'outputs_module': env.env.root / 'outputs.dll', 'obs_dir': env.env.root,
@@ -423,7 +424,7 @@ def test_spawn_callback_persists_before_connect_returns():
                         'checkpoint_sha256': 'b' * 64, 'artifacts': {}}
             results = []
             with patch.object(M, '_libobs_start_client', real_start), \
-                    patch.object(M, '_atomic_write_json', failed_publish), \
+                    patch.object(M.os, 'replace', failed_publish), \
                     patch.object(native_artifacts, 'load_native_artifacts', return_value=verified), \
                     patch.object(obs_backend, 'ObsRecorder', ConnectingClient), \
                     patch('psutil.pid_exists', side_effect=lambda pid: wmi_alive[0] if pid == 424243 else original_exists(pid)):

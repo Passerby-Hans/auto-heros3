@@ -260,15 +260,16 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
     游戏窗口以 WGC 捕获，右侧显示思考/操作。容器 60fps 不代表 60 个不同游戏画面，沿用 basic-60 合同。
     默认每 900 秒或接近 1.5GB 分段；在闭 GOP 关键帧切换，实际切点和 TIME/SIZE 原因进入原生证据。
     1.5GB 指十进制最终 MP4 上限；触发预留 2%，封口后仍逐段校验，超限标 partial，不能当成功。
-    音频默认为私有 **SDL a3capture → 带 QPC/样本索引/CRC 的文件 → native source → AAC**，
-    不打开物理播放端点，不修改 Windows 音量或静音。若游戏音量为 0，session 临时提升到 30/40，
+    音频默认为私有 **SDL a3capture → 带 QPC/样本索引/CRC 的共享内存实时流 → native source → AAC**，
+    同一 PCM 独立归档为 framed 文件，磁盘写入不承担实时送音。不打开物理播放端点，
+    不修改 Windows 音量或静音。若游戏音量为 0，session 临时提升到 30/40，
     session_stop 逐字节恢复设置。音频源绑定当前 session，缺 ready、错误 DLL 或旧会话身份会明确拒绝。
     首次使用需安装/构建本机验证的 native checkpoint，见 `platform/obs-recorder/NOTICE.md`。
     手动回退：设置 `AUTO_HEROS3_AUDIO_DRIVER=disk`，结束并重新启动 session，再调用
     `recording_start(backend='legacy')`（legacy 需要 `ffmpeg`）。不在同一次录制中自动切换后端。
 11. 结束：`session_stop()`（只关闭本会话拥有的客户端）。
 
-> 游戏由 MCP server 自动以**屏幕外**窗口（虚拟桌面之外，如 -1600,0）、**仅向采集文件输出游戏声音**的方式启动，不抢你的鼠标和焦点。
+> 游戏由 MCP server 自动以**屏幕外**窗口（虚拟桌面之外，如 -1600,0）、**仅向录制链路输出游戏声音**的方式启动，不抢你的鼠标和焦点。
 > 想用命令行调试也可以：
 > `python -X utf8 tools\vcmi_act.py start --map Maps/Arrogance`，随后 `state` / `do "end_turn"` / `shot` / `stop`。
 
@@ -654,8 +655,9 @@ In your MCP client:
     Rollover defaults to 900 seconds or approaching 1.5GB at closed-GOP keyframes; native evidence records
     the presentation boundary and TIME/SIZE reason. The decimal final-MP4 cap has a 2% trigger reserve;
     finalized files are checked and any excess is partial, never successful.
-    Private **SDL a3capture → QPC/sample-index/CRC framed file → native source → AAC** captures audio
-    without opening physical playback endpoints or changing Windows mute/volume. Zero game volume is
+    Private **SDL a3capture → QPC/sample-index/CRC shared-memory live ring → native source → AAC** captures audio.
+    The same PCM is archived independently in a framed file; disk writes do not drive live delivery.
+    This path opens no physical playback endpoint and does not change Windows mute/volume. Zero game volume is
     temporarily raised to 30/40 and settings are restored byte-for-byte on session_stop. Audio selection
     follows the current session; missing readiness, mismatched DLLs and old session identity fail closed.
     Native use requires the locally verified checkpoint described in `platform/obs-recorder/NOTICE.md`.

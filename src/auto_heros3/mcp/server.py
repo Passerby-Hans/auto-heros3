@@ -460,6 +460,30 @@ def _atomic_write_json(path: Path, data) -> None:
         pass
 
 
+def _recording_write_json(path: Path, data) -> None:
+    """Publish critical recorder ownership/evidence, propagating every I/O error.
+
+    Callers own rollback: a failed write is never evidence that a spawned host
+    exited. Use a unique sibling so cleanup removes only this attempt's file.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp-' + uuid.uuid4().hex)
+    created = False
+    try:
+        with tmp.open('xb') as handle:
+            created = True
+            handle.write(json.dumps(data, ensure_ascii=False, sort_keys=True).encode('utf-8'))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if created:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 @contextmanager
 def _file_lock(name: str, timeout: float = 10.0):
     """Cross-process writer lock (O_EXCL lock file) for read-modify-replace sections.
@@ -6267,7 +6291,7 @@ def _bind_recording_native_owner(rec: dict) -> None:
             raise RuntimeError('recording_lock_owner_changed')
         owner.update(native_pid=rec.get('native_pid') or getattr(rec.get('proc'), 'pid', None),
                      dir=str(rec['dir']), recording_run_id=rec['recording_run_id'])
-        _atomic_write_json(_recording_lock_path(), owner)
+        _recording_write_json(_recording_lock_path(), owner)
 
 
 def _read_recording_state() -> dict:
@@ -6326,7 +6350,7 @@ def _libobs_start_client(out: Path, *, client_pid: int, audio_raw: Path,
                                    'session uses a different SDL checkpoint; restart the session')
     # Persist exactly which verified bytes this run was about to launch. These
     # hashes describe build identity, not a successful media acceptance result.
-    _atomic_write_json(Path(out) / 'native-artifacts.json', {
+    _recording_write_json(Path(out) / 'native-artifacts.json', {
         'source_commit': artifacts['source_commit'],
         'checkpoint_path': str(artifacts['checkpoint_path']),
         'checkpoint_sha256': artifacts['checkpoint_sha256'],
@@ -6780,7 +6804,7 @@ def _libobs_capture_process_owner(rec: dict) -> None:
 
 def _libobs_publish_state(rec: dict) -> None:
     """Persist an already-owned native handle, including failed-start cleanup."""
-    _atomic_write_json(_recording_state_path(), {
+    _recording_write_json(_recording_state_path(), {
         'pid': rec.get('native_pid') or getattr(rec.get('proc'), 'pid', None), 'dir': str(rec['dir']),
         'started': rec['started'], 'backend': 'libobs', 'identity': rec['identity'],
         'client_pid': rec['config']['client_pid'], 'run_id': rec['identity'].get('run_id'),
@@ -6995,7 +7019,7 @@ def _recording_start_libobs(fps: int, height: int, crf: int,
                          'segment_id': f"{identity.get('run_id')}/obs-{stamp}",
                          'output_dir': str(out), 'obs_pid': client.pid,
                          'rollover_seconds': float(rollover_seconds) if rollover_seconds else 0.0})
-        _atomic_write_json(out / 'identity.json', identity)
+        _recording_write_json(out / 'identity.json', identity)
         rec['runs'] = [_libobs_run_snapshot(out, 'recording') |
                        {'recording_run_id': recording_run_id}]
         _libobs_publish_state(rec)

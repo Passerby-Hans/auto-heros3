@@ -1659,6 +1659,19 @@ bool StopOutput(State& s)
     s.output_total_frames = obs_output_get_total_frames(s.output);
     s.output_frames_dropped = obs_output_get_frames_dropped(s.output);
 
+    // Let the framed source publish one more packet so the final AAC frame
+    // reaches the same stop target as the last video frame.  This is a
+    // source-driven drain, not a fixed sleep.
+    if (s.framed_audio_enabled) {
+        const uint64_t drain_deadline = os_gettime_ns() + 100000000ULL;
+        while (os_gettime_ns() < drain_deadline) {
+            const a3::FramedAudioStats st = a3::GetFramedAudioStats();
+            if (st.last_timestamp_ns > 0 &&
+                st.last_timestamp_ns + 5000000ULL >= os_gettime_ns())
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
     // ---- stop: mp4_output finalises the current segment on the next packet --
     s.t_stop_request_ns = os_gettime_ns();
     obs_output_stop(s.output);

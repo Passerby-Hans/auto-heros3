@@ -206,6 +206,12 @@ void ReaderThread(FramedAudioData* d)
                     fail(err, err);
                     break;
                 }
+                static bool test_late_pending = false;
+                if (test_late_pending) {
+                    stats.late_packets++;
+                    fail("late_budget_exceeded", "injected after first submitted packet");
+                    break;
+                }
                 const bool planned_ok = timeline.PlannedMatches(packet.header, &err);
                 if (!planned_ok) {
                     fail("timeline_planned", err);
@@ -263,6 +269,8 @@ void ReaderThread(FramedAudioData* d)
                     const char* delay_text = std::getenv("A3_FRAMED_TEST_DELAY_AFTER_FIRST_MS");
                     if (delay_text && *delay_text) {
                         test_delayed = true;
+                        if (std::getenv("A3_FRAMED_TEST_FORCE_LATE") != nullptr)
+                            test_late_pending = true;
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(std::atoi(delay_text)));
                     }

@@ -14,14 +14,15 @@ FLAG_LAST = 2
 
 
 def make_packet(seq: int, start: int, frames: int, payload: bytes,
-                qpc: int, flags: int, capture_id: int) -> bytes:
+                qpc: int, flags: int, capture_id: int,
+                capture_epoch_qpc: int = 1000000000) -> bytes:
     h = bytearray(HEADER)
     struct.pack_into("<4sHHIQIIIHHIQQ", h, 0, b"A3AP", 1, HEADER, flags,
                      capture_id, 1, seq, 44100, 2, 1, len(payload),
                      start, frames)
     struct.pack_into("<QQQQQQQIIII", h, 56, qpc, qpc,
-                     qpc + frames * 10000000 // 44100, 10000000, 1000000000,
-                     0, 0, 0, 0, 0, 0)
+                     qpc + frames * 10000000 // 44100, 10000000,
+                     capture_epoch_qpc, 0, 0, 0, 0, 0, 0)
     struct.pack_into("<I", h, 116, zlib.crc32(payload) & 0xFFFFFFFF)
     struct.pack_into("<I", h, 112, 0)
     struct.pack_into("<I", h, 112, zlib.crc32(h) & 0xFFFFFFFF)

@@ -53,7 +53,9 @@
 ### 安装
 
 > 目前**仅支持 Windows 10/11 x64**：屏幕外窗口抓帧、进程静音、单写者租约都依赖 Win32 API。Linux / macOS 未验证。
-> 本仓库**不包含 VCMI 二进制**，也**不包含任何原版游戏数据**。
+> 本仓库**不包含 VCMI 二进制**，也**不包含任何原版游戏数据**；OBS/libobs 运行库与私有录制产物
+> （`platform/obs-recorder/build-media/`、`platform/obs-recorder/bin/`、`platform/sdl-capture-patch/stage/`）
+> 同样不入库，需按对应 README 本地构建/部署。
 
 #### 0. 环境要求
 
@@ -349,6 +351,15 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 - **[VCMI](https://vcmi.eu/)**（[GitHub](https://github.com/vcmi/vcmi)，**GPL-2.0-or-later**）—
   英雄无敌 3 的开源引擎重实现。本项目在其 1.7.5 源码上打最小补丁并在本地构建
   （补丁源在 [`platform/vcmi-patch/`](platform/vcmi-patch/)，保留出处与许可证）。
+- **[OBS Studio / libobs](https://obsproject.com/)**（[GitHub](https://github.com/obsproject/obs-studio)，
+  **GPL-2.0-or-later**）— 自有原生录制器链接 **libobs 32.1.0** 并选择性加载其模块
+  （win-capture/WGC、obs-x264、obs-ffmpeg/AAC、obs-outputs 等）；不启动 OBS 界面、不使用 OBS 场景配置。
+  `platform/obs-recorder/custom-output/` 是 OBS Studio 32.1.0 `plugins/obs-outputs` 的衍生修改，
+  按 GPL-2.0-or-later 分发；对应源码、修改与许可证声明见 `platform/obs-recorder/NOTICE.md`
+  与 `platform/obs-recorder/custom-output/README.md`。
+- **[SDL2](https://www.libsdl.org/)**（[GitHub](https://github.com/libsdl-org/SDL)，**zlib license**）—
+  游戏音频 `a3capture`：在 SDL 2.32.10 的音频输出路径上打私有补丁
+  （`platform/sdl-capture-patch/`），把 PCM 送入共享内存实时链路；私有补丁源码与构建锁随仓库保留。
 - **[Model Context Protocol / MCP](https://modelcontextprotocol.io/)** — 本项目的 agent 接入协议。
   服务端基于 **[官方 Python SDK](https://github.com/modelcontextprotocol/python-sdk)**（**MIT**，
   `mcp==2.3.0`）实现；SDK 文档见 [py.sdk.modelcontextprotocol.io](https://py.sdk.modelcontextprotocol.io/)。
@@ -379,9 +390,11 @@ VCMI 本体及其衍生补丁遵循 GPL-2.0-or-later；原版游戏数据不在�
 
 本项目以 **GPL-2.0-or-later**（GNU General Public License v2.0 或更高版本）发布，完整文本见 [LICENSE](LICENSE)。
 
-原因：`platform/vcmi-patch/` 是 VCMI（GPL-2.0-or-later）的衍生补丁，按 GPL 要求以同一许可证分发；
-为保持一致，仓库内的原创代码也在同一许可证下发布。第三方组件保留各自许可证
-（VCMI：GPL-2.0-or-later；MCP Python SDK：MIT 等）。
+原因：`platform/vcmi-patch/` 是 VCMI（GPL-2.0-or-later）的衍生补丁，
+`platform/obs-recorder/custom-output/` 是 OBS Studio 32.1.0 `plugins/obs-outputs` 的衍生修改，
+均按 GPL 要求以同一许可证分发；为保持一致，仓库内的原创代码也在同一许可证下发布。
+第三方组件保留各自许可证（VCMI、OBS Studio/libobs、x264：GPL-2.0-or-later；SDL2：zlib；
+MCP Python SDK：MIT 等）。
 
 ---
 
@@ -441,7 +454,10 @@ Magic III* engine — into a game that an **LLM agent can play as a real player*
 
 > **Windows 10/11 x64 only** for now: off-screen capture, process muting and the single-writer lease rely on
 > Win32 APIs. Linux/macOS are untested.
-> This repository ships **no VCMI binaries** and **no original game data**.
+> This repository ships **no VCMI binaries** and **no original game data**; the OBS/libobs runtime and the
+> private recording artifacts (`platform/obs-recorder/build-media/`, `platform/obs-recorder/bin/`,
+> `platform/sdl-capture-patch/stage/`) are not committed either — build/deploy them locally as described in
+> the corresponding READMEs.
 
 #### 0. Requirements
 
@@ -761,6 +777,15 @@ This project was designed and implemented with reference to (and use of) the fol
 - **[VCMI](https://vcmi.eu/)** ([GitHub](https://github.com/vcmi/vcmi), **GPL-2.0-or-later**) — the
   open-source Heroes III engine. This project patches its 1.7.5 sources with a minimal bridge and builds them
   locally (patch source: [`platform/vcmi-patch/`](platform/vcmi-patch/); attribution and license are kept).
+- **[OBS Studio / libobs](https://obsproject.com/)** ([GitHub](https://github.com/obsproject/obs-studio),
+  **GPL-2.0-or-later**) — the native recorder links **libobs 32.1.0** and selectively loads its modules
+  (win-capture/WGC, obs-x264, obs-ffmpeg/AAC, obs-outputs, …); it never starts the OBS frontend or uses OBS
+  scene profiles. `platform/obs-recorder/custom-output/` is a derivative of OBS Studio 32.1.0
+  `plugins/obs-outputs`, distributed under GPL-2.0-or-later; corresponding sources, modifications and
+  license notices are in `platform/obs-recorder/NOTICE.md` and `custom-output/README.md`.
+- **[SDL2](https://www.libsdl.org/)** ([GitHub](https://github.com/libsdl-org/SDL), **zlib license**) —
+  the game-audio `a3capture` path patches SDL 2.32.10's audio output (`platform/sdl-capture-patch/`) to feed
+  PCM into the shared-memory live stream; the private patch sources and build lock ship with the repository.
 - **[Model Context Protocol / MCP](https://modelcontextprotocol.io/)** — the agent-facing protocol used here.
   The server is built on the **[official Python SDK](https://github.com/modelcontextprotocol/python-sdk)**
   (**MIT**, `mcp==2.3.0`); SDK docs: [py.sdk.modelcontextprotocol.io](https://py.sdk.modelcontextprotocol.io/).
@@ -795,7 +820,8 @@ distributed by this project.
 This project is released under **GPL-2.0-or-later** (GNU General Public License v2.0 or any later version);
 the full text is in [LICENSE](LICENSE).
 
-Rationale: `platform/vcmi-patch/` is a derivative patch of VCMI (GPL-2.0-or-later) and must be distributed
-under the same license; to stay consistent, the original code in this repository is released under the same
-license as well. Third-party components keep their own licenses (VCMI: GPL-2.0-or-later; MCP Python SDK: MIT;
-etc.).
+Rationale: `platform/vcmi-patch/` is a derivative patch of VCMI (GPL-2.0-or-later) and
+`platform/obs-recorder/custom-output/` is a derivative of OBS Studio 32.1.0 `plugins/obs-outputs`; both must
+be distributed under the same license, and to stay consistent the original code in this repository is
+released under the same license as well. Third-party components keep their own licenses (VCMI,
+OBS Studio/libobs, x264: GPL-2.0-or-later; SDL2: zlib; MCP Python SDK: MIT; etc.).

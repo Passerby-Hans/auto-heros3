@@ -23,6 +23,9 @@
 > 与 2026-10-28 干净局（day 68，墙钟 41m27s；无作弊、无读档、无调试资源、无外部攻略、单 LLM 玩家，
 > 452 条动作来源全为 LLM，3 段 1080p 全程录像独立审计 PASS）。**
 > 披露：固定图已被反复游玩（地图熟悉度已披露），单局 ≠ 跨地图胜率；**盲图 / 多图的正式公平验收仍未完成**。
+> 录制：默认已切换为自有 native **libobs / a3capture / shared_memory** 链路（2026-11-09 完成默认推广；
+> 2026-11-10 真实 VCMI 90 分钟长录复核通过），显式 `legacy`/`disk` 回退保留；离线回归
+> **46 套 / 1529 项断言** 全部通过（2026-11-10 复核 1529/1529）。
 
 ### 已实现能力
 
@@ -39,7 +42,7 @@
 | 探索 | 黑幕边界 BFS 探索：整层一次只读 probe + 沿边界逐格开雾 | `explore_toward` `path_preview` |
 | 对话 | 阻塞对话框转 `query` / `answer`，不弹阻塞 UI | `game_events` `game_act` |
 | 界面 | 城镇/酒馆/英雄装备界面（真实窗口）/ 控件树 / 模拟点击 / 关窗（观众可见） | `game_act` `ui_tree` |
-| 证据 | 存档/读档（身份核验）、事件、账本、离屏录像（演示默认 1080p60） | `save_game` `load_game` `recording_*` |
+| 证据 | 存档/读档（身份核验）、事件、账本、离屏录像：默认 native libobs，1920×1080/60 + H.264 8Mbps + AAC 44.1k 双声道，900s/1.5GB 分片与故障恢复 | `save_game` `load_game` `recording_*` |
 | 记忆 | 玩家/对局/长期记忆（带 revision 的 CAS 写入） | `memory_read` `memory_write` |
 
 > **寻路注意**：客户端寻路把**未揭开的黑幕格**判为 `BLOCKED`（VCMI `PathfinderUtil.h`），
@@ -66,7 +69,7 @@
 | CMake | 较新版本 |
 | Ninja | 较新版本 |
 | Conan | 2.x（装在独立 venv） |
-| ffmpeg | 可选：录屏编码需要 |
+| ffmpeg | 可选：仅 legacy 录制后端与部分诊断需要；默认 native 录制不需要 |
 | MCP 客户端 | 任意支持 stdio 的 MCP host |
 
 > VCMI 官方预编译依赖包由 v142 编译；本项目实测以 MSVC 14.51（v143 及以上）链接通过，ABI 兼容。
@@ -89,7 +92,7 @@ uv sync --frozen
 
 - 不要用手工 `pip install` 的旧六包清单覆盖冻结环境；需要变更依赖时修改 `pyproject.toml` 后重新 `uv lock`。
 - 核对：`uv sync --frozen --dry-run` 应报告无需变更；`uv lock --check` 应通过。
-- `pycaw` 用于进程级静音；缺失时只会跳过静音。`process-audio-capture` 用于录制游戏进程音频（WASAPI process loopback）。
+- `pycaw` 用于进程级静音；缺失时只会跳过静音。默认游戏录音走 **SDL a3capture → 共享内存 → native**；`process-audio-capture`（WASAPI process loopback）仅保留为历史/诊断路径。
 
 > 可选（逆向/手册/OCR 研究工具）已纳入 lock；如只需最小 MCP 服务器，仍建议保留同一冻结环境以保证可复现。
 
@@ -264,7 +267,7 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
     同一 PCM 独立归档为 framed 文件，磁盘写入不承担实时送音。不打开物理播放端点，
     不修改 Windows 音量或静音。若游戏音量为 0，session 临时提升到 30/40，
     session_stop 逐字节恢复设置。音频源绑定当前 session，缺 ready、错误 DLL 或旧会话身份会明确拒绝。
-    首次使用需安装/构建本机验证的 native checkpoint，见 `platform/obs-recorder/NOTICE.md`。
+    首次使用需安装/构建本机验证的 native checkpoint，见 `platform/obs-recorder/README.md` 与 `NOTICE.md`。
     手动回退：设置 `AUTO_HEROS3_AUDIO_DRIVER=disk`，结束并重新启动 session，再调用
     `recording_start(backend='legacy')`（legacy 需要 `ffmpeg`）。不在同一次录制中自动切换后端。
 11. 结束：`session_stop()`（只关闭本会话拥有的客户端）。
@@ -278,6 +281,9 @@ DeepSeek Harness（DSH）：在它的 MCP 客户端配置里填同样的 stdio �
 ```text
 platform/vcmi-patch/            唯一补丁源（AgentBridge C++ + apply.py）
 platform/memory_templates/      LLM 玩家记忆模板（PLAYER / CURRENT / long_term）
+platform/obs-recorder/          libobs 原生录制器（源码/构建/私有产物清单；不启动 OBS 界面）
+platform/sdl-capture-patch/     a3capture 的 SDL2 私有补丁与部署
+platform/audio-protocol/        a3 音频共享内存协议、framing 与 A/V 验收工具
 src/auto_heros3/                实现包（MCP server、runtime context、recorder、投影、动作表、探索）
 tools/mcp_server_v2.py          MCP 入口兼容壳（module alias → src/auto_heros3/mcp/server.py）
 tools/vcmi_agent.py             客户端驱动兼容壳（→ src/auto_heros3/runtime/vcmi_agent.py）
@@ -286,8 +292,8 @@ tools/vcmi_overlay_recorder.py  离屏录屏兼容壳（→ src/auto_heros3/reco
 tools/fog_path.py               黑幕边界 BFS 探索器兼容壳（→ src/auto_heros3/exploration/fog_path.py）
 tools/fog_path_live.py          实机黑幕探索演示 CLI
 tools/fog_battle.py             战斗机械执行器（演示/诊断用；正式对局由 LLM 决策）
-tests/offline/                  离线回归套件（30 套，统一入口 tools/run_offline_suite.py）
-tests/live/                     隔离 live 套件（7 套；tools/test_*.py 保留兼容入口）
+tests/offline/                  离线回归套件（46 套 / 1529 断言，统一入口 tools/run_offline_suite.py）
+tests/live/                     隔离 live 套件（11 套；tools/test_*.py 保留兼容入口）
 tools/bridge_contract.json      锁定客户端 sha256 / protocol / 冻结行为
 agent/h3/                       Track A 零售版逆向（历史保留，当前主轨不使用）
 var/                            运行期状态、证据、录像（部分目录不入 git）
@@ -298,8 +304,9 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 
 - MCP 自检：`.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   （打印能力清单并做一次租约 acquire/release；不会启动游戏）。
-- 离线回归：`tests/offline/` 共 **30 套 / 974 项断言**，统一入口一次跑完（显式白名单，7 个 live
-  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-11-02 复核 **974/974 PASS**）：
+- 离线回归：`tests/offline/` 共 **46 套 / 1529 项断言**，统一入口一次跑完（显式白名单，11 个 live
+  套件默认跳过），输出 `N/N checks passed` 且退出码 0 表示通过（2026-11-10 复核 **1529/1529 PASS**；
+  含 native 录制媒体/停止/故障注入套件）：
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
@@ -313,10 +320,11 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
 
 ### 状态与路线图
 
-- 已有：打补丁的 VCMI 1.7.5 客户端（协议 2、已固定哈希）、标准 MCP 工具面（**34 个工具**，
+- 已有：打补丁的 VCMI 1.7.5 客户端（协议 2、已固定哈希）、标准 MCP 工具面（**37 个工具**，
   含探索 operation/cancel 合同）、
   英雄/战斗/法术/神器观察、冒险与战斗施法、黑幕边界探索、存档/读档身份核验、事件持久化、
-  离屏录屏、玩家/对局记忆、单写者租约与"诚实状态"合同。
+  离屏录像（默认 native libobs：1080p60 + AAC 44.1k，900s/1.5GB 分片与恢复）、玩家/对局记忆、
+  单写者租约与"诚实状态"合同。
 - 对局结果：
   - 2026-10-25 辅助测试档 WIN（外部 wiki + 子代理，**不作为公平证据**）；
   - 2026-10-26 正式候选局 WIN（day 28，固定图、未注入旧局坐标/外部攻略；
@@ -324,7 +332,7 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
   - **2026-10-28 干净局 WIN**：`Maps/Key to Victory`（Easy / 红 Castle / 随机英雄 / 金币奖励），
     day 68 胜利，墙钟 **41m27s**；无作弊、无读档、无调试资源、无外部攻略，单 LLM 玩家，
     **452 条动作来源全为 `llm`**；3 段 1920×1080 全程录像独立审计 **3/3 PASS**。
-    本地证据：`var/runs/clean-1080p-20261028-1419/`（录像已打包为单个 ZIP）。
+    本地证据：`var/recordings/`（三段源视频 + `_meta/` 中的 manifest、三段审计与 WIN 证据）。
   - 边界：以上胜局均为**固定图**（地图熟悉度已披露），单局 ≠ 跨地图胜率；
     **盲图 / 多图的正式公平验收仍未完成**。
 - 路线图：
@@ -332,7 +340,7 @@ doc/                            工程文档 / HANDOVER / LOG（本地维护，�
   2. 战斗 AI 改进（集火 / 风筝 / 撤退判断；当前由 LLM 依据 `battle_actions` 决策）；
   3. 法术与神器：换装/背包操作、两阶段法术（传送/牺牲）目标序列；
   4. 覆盖更多真实 UI（造船厂、任务窗、魔法行会、市场窗口）；
-  5. 演示成片（默认 1080p60）与可复现实验。
+  5. 录制收尾：真实游戏内容逐事件 A/V、任意播放器兼容、断电恢复与自动中途 fallback；演示成片与可复现实验。
 
 ### 参考项目与致谢
 
@@ -400,6 +408,10 @@ Magic III* engine — into a game that an **LLM agent can play as a real player*
 > segments).**
 > Disclosure: the fixed map has been played repeatedly (map familiarity disclosed); one game is not a
 > cross-map win rate, and the **blind-map / multi-map formal acceptance is still pending**.
+> Recorder: the default is now our own native **libobs / a3capture / shared_memory** pipeline (default
+> promotion completed 2026-11-09; a real 90-minute VCMI recording was reviewed and accepted 2026-11-10);
+> the explicit `legacy`/`disk` fallback is retained; offline regression **46 suites / 1529 assertions** all
+> pass (re-checked 2026-11-10: 1529/1529).
 
 ### Features
 
@@ -416,7 +428,7 @@ Magic III* engine — into a game that an **LLM agent can play as a real player*
 | Explore | shroud-border BFS exploration: one read-only whole-level probe + reveal tile by tile | `explore_toward` `path_preview` |
 | Dialogs | blocking dialogs become `query` / `answer` | `game_events` `game_act` |
 | UI | town/tavern/hero-equipment screens (real windows) / widget tree / simulated clicks / close window (visible to spectators) | `game_act` `ui_tree` |
-| Evidence | save/load (identity-checked), events, ledger, off-screen recording (1080p60 by default for demos) | `save_game` `load_game` `recording_*` |
+| Evidence | save/load (identity-checked), events, ledger, off-screen recording (default native libobs: 1920×1080/60 + H.264 8Mbps + AAC 44.1k stereo, 900s/1.5GB rollover and crash recovery) | `save_game` `load_game` `recording_*` |
 | Memory | player / game / long-term memory (CAS writes with revisions) | `memory_read` `memory_write` |
 
 > **Pathfinding caveat**: the client pathfinder treats every **never-revealed shroud tile** as `BLOCKED`
@@ -445,7 +457,7 @@ Magic III* engine — into a game that an **LLM agent can play as a real player*
 | CMake | a recent version |
 | Ninja | a recent version |
 | Conan | 2.x (in a separate venv) |
-| ffmpeg | optional; required for video recording |
+| ffmpeg | optional; only the legacy recording backend and some diagnostics need it (the default native recorder does not) |
 | MCP client | any stdio-capable MCP host |
 
 > VCMI's official prebuilt dependencies were compiled with v142; this project builds and links with MSVC
@@ -471,6 +483,8 @@ uv sync --frozen
   `pyproject.toml` and re-lock if dependencies must change.
 - Verify with `uv sync --frozen --dry-run` (no changes) and `uv lock --check`.
 - `pycaw` provides per-process muting; if it is missing, muting is simply skipped.
+- The default game-audio path is **SDL a3capture → shared memory → native**; `process-audio-capture`
+  (WASAPI process loopback) is kept only for legacy/diagnostic use.
 
 > Optional reverse-engineering / manual / OCR tooling is part of the same lock. Keep the frozen
 > environment for reproducibility even if you only need the MCP server.
@@ -660,7 +674,8 @@ In your MCP client:
     This path opens no physical playback endpoint and does not change Windows mute/volume. Zero game volume is
     temporarily raised to 30/40 and settings are restored byte-for-byte on session_stop. Audio selection
     follows the current session; missing readiness, mismatched DLLs and old session identity fail closed.
-    Native use requires the locally verified checkpoint described in `platform/obs-recorder/NOTICE.md`.
+    Native use requires the locally verified checkpoint described in `platform/obs-recorder/README.md`
+    and `NOTICE.md`.
     Manual fallback: set `AUTO_HEROS3_AUDIO_DRIVER=disk`, stop and restart the game session, then call
     `recording_start(backend='legacy')` (requires `ffmpeg`). A run never silently changes backends.
 11. Finish with `session_stop()` (only closes the client owned by this session).
@@ -674,6 +689,9 @@ In your MCP client:
 ```text
 platform/vcmi-patch/            single patch source (AgentBridge C++ + apply.py)
 platform/memory_templates/      LLM player memory templates (PLAYER / CURRENT / long_term)
+platform/obs-recorder/          native libobs recorder (sources / build / private artifact manifest; no OBS UI)
+platform/sdl-capture-patch/     private SDL2 patch and deployment for a3capture
+platform/audio-protocol/        a3 shared-memory audio protocol, framing and A/V verification tools
 src/auto_heros3/                implementation package (MCP server, runtime context, recorder, projections, action table, exploration)
 tools/mcp_server_v2.py          MCP entry compatibility shim (module alias → src/auto_heros3/mcp/server.py)
 tools/vcmi_agent.py             client driver compatibility shim (→ src/auto_heros3/runtime/vcmi_agent.py)
@@ -682,8 +700,8 @@ tools/vcmi_overlay_recorder.py  off-screen recorder compatibility shim (→ src/
 tools/fog_path.py               shroud-border BFS explorer compatibility shim (→ src/auto_heros3/exploration/fog_path.py)
 tools/fog_path_live.py          live shroud-exploration demo CLI
 tools/fog_battle.py             mechanical battle executor (demo/diagnostics; real games are LLM-decided)
-tests/offline/                  offline regression suites (30; unified entry tools/run_offline_suite.py)
-tests/live/                     isolated live suites (7; tools/test_*.py kept as compatibility entries)
+tests/offline/                  offline regression suites (46 suites / 1529 assertions; unified entry tools/run_offline_suite.py)
+tests/live/                     isolated live suites (11; tools/test_*.py kept as compatibility entries)
 tools/bridge_contract.json      pinned client sha256 / protocol / frozen behaviour
 agent/h3/                       Track A retail-binary reverse engineering (kept for reference; unused by the main track)
 var/                            runtime state, evidence, recordings (parts excluded from git)
@@ -694,9 +712,10 @@ doc/                            engineering docs / handover / log (kept locally,
 
 - MCP self-test: `.\.venv\Scripts\python.exe -X utf8 tools\mcp_server_v2.py --selftest`
   (prints the capability list and does one lease acquire/release; it does not start the game).
-- Offline regression: **30 suites / 974 assertions** under `tests/offline/`, run through the explicit
-  whitelist entry (7 live suites are skipped by default); it prints `N/N checks passed` and exits 0 on
-  success (re-checked 2026-11-02: **974/974 PASS**):
+- Offline regression: **46 suites / 1529 assertions** under `tests/offline/`, run through the explicit
+  whitelist entry (11 live suites are skipped by default); it prints `N/N checks passed` and exits 0 on
+  success (re-checked 2026-11-10: **1529/1529 PASS**, including the native recorder media/stop/fault
+  injection suites):
 
   ```powershell
   .\.venv\Scripts\python.exe -X utf8 tools\run_offline_suite.py
@@ -712,9 +731,10 @@ doc/                            engineering docs / handover / log (kept locally,
 ### Status and roadmap
 
 - Available now: a patched VCMI 1.7.5 client (protocol 2, pinned hash), a standard MCP tool surface
-  (**34 tools**, including the explore operation/cancel contract), hero/battle/spell/artifact observation, adventure and battle spellcasting, shroud-border
-  exploration, identity-checked save/load, persisted events, off-screen recording, player/game memory,
-  single-writer lease and an honest status contract.
+  (**37 tools**, including the explore operation/cancel contract), hero/battle/spell/artifact observation,
+  adventure and battle spellcasting, shroud-border exploration, identity-checked save/load, persisted
+  events, off-screen recording (default native libobs: 1080p60 + AAC 44.1k, 900s/1.5GB rollover and
+  recovery), player/game memory, single-writer lease and an honest status contract.
 - Game results:
   - 2026-10-25 an *assisted* test-slot win (external map wiki + a sub-agent; **not** fair-play evidence);
   - 2026-10-26 a formal-candidate WIN (day 28, fixed map, no old-coordinate/external-guide injection;
@@ -722,8 +742,8 @@ doc/                            engineering docs / handover / log (kept locally,
   - **2026-10-28 clean-game WIN**: `Maps/Key to Victory` (Easy / red Castle / random hero / gold bonus),
     victory on day 68, wall clock **41m27s**; no cheats, no load/save-scumming, no debug resources, no
     external guides, a single LLM player; **all 452 ledger actions from `llm`**; 3 full 1920×1080 recording
-    segments independently audited **3/3 PASS**. Local evidence: `var/runs/clean-1080p-20261028-1419/`
-    (recordings packaged as one ZIP).
+    segments independently audited **3/3 PASS**. Local evidence: `var/recordings/` (the three source
+    videos plus the `_meta/` manifest, segment audit and WIN evidence).
   - Boundary: all those wins are **fixed-map** games (map familiarity disclosed); one game is not a
     cross-map win rate, and the **blind-map / multi-map fair-play acceptance is still pending**.
 - Roadmap:
@@ -731,7 +751,8 @@ doc/                            engineering docs / handover / log (kept locally,
   2. better battle AI (focus fire / kiting / retreat decisions; currently the LLM decides from `battle_actions`);
   3. spells and artifacts: equipment/backpack actions and two-stage spell (Teleport/Sacrifice) target sequences;
   4. more real UI coverage (shipyard, quest windows, mage guild, market window);
-  5. demo videos (1080p60 by default) and reproducible experiments.
+  5. recording wrap-up: per-event A/V on real game content, arbitrary-player compatibility, power-loss
+     recovery and automatic mid-run fallback; demo videos and reproducible experiments.
 
 ### References and acknowledgements
 
